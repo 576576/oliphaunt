@@ -22,6 +22,10 @@ import {
   DEFAULT_PUBLICATION_LOCK,
   loadPublicationLock,
 } from "./publication-lock.mjs";
+import {
+  registryRetryDelaySeconds,
+  registryStatusRetryable,
+} from "./registry-http-retry.mjs";
 import { ROOT, compareText, loadGraph } from "./release-graph.mjs";
 import { validateRegistryReceiptEvidence } from "./registry-integrity.mjs";
 import { validateGithubAttestationReceipt } from "./verify_github_release_attestations.mjs";
@@ -61,8 +65,14 @@ const RETRY_DELAYS_MILLISECONDS = [5_000, 10_000, 20_000, 30_000, 45_000, 60_000
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 64 * 1024 * 1024;
 const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
+const MAX_CRATES_IO_METADATA_BYTES = 1024 * 1024;
+const CRATES_IO_API = "https://crates.io/api/v1";
+const CRATES_IO_FEATURE_ATTEMPTS = 4;
+const CRATES_IO_REQUEST_TIMEOUT_MILLISECONDS = 20_000;
+const CRATES_IO_USER_AGENT = "oliphaunt-public-consumer-smoke (https://github.com/f0rr0/oliphaunt)";
 const SHA256_RE = /^[0-9a-f]{64}$/u;
 const FULL_SHA_RE = /^[0-9a-f]{40}$/u;
+const EXACT_RUST_TOOLCHAIN_RE = /^[1-9][0-9]*\.[0-9]+\.[0-9]+$/u;
 
 class PublicCommandError extends Error {
   constructor(message, { retryable = false } = {}) {
@@ -353,6 +363,78 @@ export function sanitizedPublicEnvironment(overrides = {}, inherited = process.e
   return { ...env, ...overrides };
 }
 
+function publicCargoToolchainEnvironment(inherited = process.env, {
+  root = ROOT,
+} = {}) {
+  const manifestFile = path.join(root, "rust-toolchain.toml");
+  let manifest;
+  try {
+    const stat = lstatSync(manifestFile);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error("manifest is not a regular non-symlink file");
+    }
+    manifest = Bun.TOML.parse(readFileSync(manifestFile, "utf8"));
+  } catch (cause) {
+    throw error(`cannot load the pinned Cargo consumer toolchain from ${manifestFile}: ${cause.message}`);
+  }
+  const toolchain = manifest?.toolchain?.channel;
+  if (typeof toolchain !== "string" || !EXACT_RUST_TOOLCHAIN_RE.test(toolchain)) {
+    throw error("rust-toolchain.toml must pin an exact stable Rust toolchain for public Cargo consumers");
+  }
+
+  const configuredRustupHome = typeof inherited.RUSTUP_HOME === "string"
+    ? inherited.RUSTUP_HOME.trim()
+    : "";
+  const inheritedHome = typeof inherited.HOME === "string" && inherited.HOME.trim() !== ""
+    ? inherited.HOME.trim()
+    : typeof inherited.USERPROFILE === "string"
+      ? inherited.USERPROFILE.trim()
+      : "";
+  const rustupHome = configuredRustupHome !== ""
+    ? configuredRustupHome
+    : inheritedHome === ""
+      ? ""
+      : path.join(inheritedHome, ".rustup");
+  if (
+    rustupHome === ""
+    || !path.isAbsolute(rustupHome)
+    || /[\0\r\n]/u.test(rustupHome)
+  ) {
+    throw error("public Cargo consumers require an absolute installed RUSTUP_HOME");
+  }
+  let canonicalRustupHome;
+  try {
+    const stat = lstatSync(rustupHome);
+    if (!stat.isDirectory()) throw new Error("path is not a directory");
+    canonicalRustupHome = realpathSync(rustupHome);
+  } catch (cause) {
+    throw error(`public Cargo consumer RUSTUP_HOME is unavailable at ${rustupHome}: ${cause.message}`);
+  }
+  return {
+    RUSTUP_HOME: canonicalRustupHome,
+    RUSTUP_TOOLCHAIN: toolchain,
+  };
+}
+
+export function publicCargoEnvironment(consumerRoot, inherited = process.env, {
+  repositoryRoot = ROOT,
+} = {}) {
+  if (
+    typeof consumerRoot !== "string"
+    || !path.isAbsolute(consumerRoot)
+    || /[\0\r\n]/u.test(consumerRoot)
+  ) {
+    throw error("public Cargo consumer root must be an absolute path");
+  }
+  return sanitizedPublicEnvironment({
+    ...publicCargoToolchainEnvironment(inherited, { root: repositoryRoot }),
+    CARGO_HOME: path.join(consumerRoot, "cargo-home"),
+    CARGO_NET_GIT_FETCH_WITH_CLI: "true",
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse",
+    HOME: path.join(consumerRoot, "cargo-user-home"),
+  }, inherited);
+}
+
 function commandText(command, args) {
   return [command, ...args].map((part) => /[^A-Za-z0-9_./:@=+-]/u.test(part) ? JSON.stringify(part) : part).join(" ");
 }
@@ -564,6 +646,156 @@ function tomlString(value) {
   return JSON.stringify(value);
 }
 
+export function cargoEntryFeatureNames(metadata, carrier) {
+  const artifacts = Array.isArray(carrier?.artifacts)
+    ? carrier.artifacts.filter(({ path: artifactPath }) => typeof artifactPath === "string" && artifactPath.endsWith(".crate"))
+    : [];
+  if (
+    metadata === null
+    || Array.isArray(metadata)
+    || typeof metadata !== "object"
+    || artifacts.length !== 1
+    || !SHA256_RE.test(artifacts[0].sha256 ?? "")
+    || !Number.isSafeInteger(artifacts[0].size)
+    || artifacts[0].size <= 0
+    || metadata.version?.crate !== carrier?.name
+    || metadata.version?.num !== carrier?.version
+    || metadata.version?.checksum !== artifacts[0].sha256
+    || metadata.version?.crate_size !== artifacts[0].size
+    || metadata.version?.yanked !== false
+  ) {
+    throw error(`${carrier?.id ?? "Cargo entry"} crates.io version metadata does not match its exact frozen carrier`);
+  }
+  const merged = new Map();
+  for (const [label, table] of [
+    ["features", metadata.version.features],
+    ["features2", metadata.version.features2 ?? {}],
+  ]) {
+    if (table === null || Array.isArray(table) || typeof table !== "object") {
+      throw error(`${carrier.id} crates.io ${label} must be a feature table`);
+    }
+    for (const [name, members] of Object.entries(table)) {
+      if (
+        typeof name !== "string"
+        || name.length === 0
+        || /[\0\r\n]/u.test(name)
+        || !Array.isArray(members)
+        || members.some((member) => typeof member !== "string" || member.length === 0 || /[\0\r\n]/u.test(member))
+      ) {
+        throw error(`${carrier.id} crates.io metadata contains an invalid Cargo feature declaration`);
+      }
+      const prior = merged.get(name);
+      if (prior !== undefined && stableJson(prior) !== stableJson(members)) {
+        throw error(`${carrier.id} crates.io features and features2 disagree for ${name}`);
+      }
+      merged.set(name, members);
+    }
+  }
+  // Cargo resolves target-specific dependencies for every target into the
+  // lockfile, but it deliberately omits optional dependencies whose features
+  // are not enabled. Resolve every public opt-in feature so the anonymous lock
+  // probe covers the complete frozen carrier closure. The crates.io checksum
+  // above binds this feature metadata to the same immutable .crate bytes
+  // already proven by the exhaustive registry receipt.
+  return [...merged.keys()].filter((name) => name !== "default").sort(compareText);
+}
+
+async function boundedResponseJson(response, label) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const bytes = Number(declared);
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MAX_CRATES_IO_METADATA_BYTES) {
+      await response.body?.cancel?.().catch(() => {});
+      throw error(`${label} returned an invalid or oversized Content-Length`);
+    }
+  }
+  const reader = response.body?.getReader?.();
+  if (reader === undefined) {
+    throw error(`${label} returned no bounded response body`);
+  }
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_CRATES_IO_METADATA_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw error(`${label} response exceeds ${MAX_CRATES_IO_METADATA_BYTES} bytes`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+  } catch (cause) {
+    throw error(`${label} returned invalid JSON: ${cause.message}`);
+  }
+}
+
+async function cratesIoEntryFeatureNames(carrier, deadlineMilliseconds, signal) {
+  const crate = encodeURIComponent(carrier.name);
+  const version = encodeURIComponent(carrier.version);
+  const url = `${CRATES_IO_API}/crates/${crate}/${version}`;
+  let lastFailure = "";
+  for (let attempt = 0; attempt < CRATES_IO_FEATURE_ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) throw error(`${carrier.id} crates.io feature lookup was cancelled`);
+    const remaining = deadlineMilliseconds - Date.now();
+    if (remaining <= 0) throw error(`shared public-consumer deadline reached before resolving ${carrier.id} features`);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.min(remaining, CRATES_IO_REQUEST_TIMEOUT_MILLISECONDS),
+    );
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    let retryHeaders;
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": CRATES_IO_USER_AGENT,
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        return cargoEntryFeatureNames(await boundedResponseJson(response, carrier.id), carrier);
+      }
+      retryHeaders = response.headers;
+      await response.body?.cancel?.().catch(() => {});
+      if (!registryStatusRetryable(response.status)) {
+        throw new PublicCommandError(`${TOOL}: crates.io returned HTTP ${response.status} for exact carrier ${carrier.id}`);
+      }
+      lastFailure = `HTTP ${response.status}`;
+    } catch (cause) {
+      if (cause instanceof PublicCommandError || (cause instanceof Error && cause.message.startsWith(`${TOOL}:`))) {
+        throw cause;
+      }
+      if (signal?.aborted) throw error(`${carrier.id} crates.io feature lookup was cancelled`);
+      lastFailure = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
+    if (attempt + 1 < CRATES_IO_FEATURE_ATTEMPTS) {
+      const seconds = registryRetryDelaySeconds({
+        attempt,
+        baseSeconds: 1,
+        headers: retryHeaders,
+      });
+      await boundedRetryDelay(Math.ceil(seconds * 1_000), deadlineMilliseconds, signal);
+    }
+  }
+  throw new PublicCommandError(
+    `${TOOL}: failed to resolve checksum-bound crates.io features for ${carrier.id}: ${lastFailure}`,
+    { retryable: true },
+  );
+}
+
 export function validateCargoResolution(lockText, carriers, requiredCarrierIds = carriers.map(({ id }) => id)) {
   let parsed;
   try {
@@ -601,21 +833,18 @@ async function runCargoSurface({ lock, surface, root, deadlineMilliseconds, sign
   mkdirSync(home, { recursive: true });
   const carriers = carrierRows(lock, surface);
   const byId = new Map(carriers.map((carrier) => [carrier.id, carrier]));
-  const env = sanitizedPublicEnvironment({
-    CARGO_HOME: home,
-    CARGO_NET_GIT_FETCH_WITH_CLI: "true",
-    CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse",
-    HOME: path.join(root, "cargo-user-home"),
-  });
+  const env = publicCargoEnvironment(root);
   const entries = [];
   const rows = [];
   for (const [index, entryCarrierId] of surface.entryCarrierIds.entries()) {
     const carrier = byId.get(entryCarrierId);
+    const features = await cratesIoEntryFeatureNames(carrier, deadlineMilliseconds, signal);
+    const featureClause = features.length === 0 ? "" : `, features = ${tomlString(features)}`;
     const consumer = path.join(directory, `entry-${String(index).padStart(3, "0")}`);
     mkdirSync(path.join(consumer, "src"), { recursive: true });
     writeFileSync(
       path.join(consumer, "Cargo.toml"),
-      `[package]\nname = "oliphaunt-public-consumer-smoke-${String(index).padStart(3, "0")}"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\nlocked_entry = { package = ${tomlString(carrier.name)}, version = ${tomlString(`=${carrier.version}`)} }\n`,
+      `[package]\nname = "oliphaunt-public-consumer-smoke-${String(index).padStart(3, "0")}"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\nlocked_entry = { package = ${tomlString(carrier.name)}, version = ${tomlString(`=${carrier.version}`)}${featureClause} }\n`,
     );
     writeFileSync(path.join(consumer, "src/lib.rs"), "// dependency resolution only; immutable receipts prove target payload bytes.\n");
     await runBoundedCommand("cargo", ["generate-lockfile"], { cwd: consumer, env, deadlineMilliseconds, signal });
@@ -629,7 +858,7 @@ async function runCargoSurface({ lock, surface, root, deadlineMilliseconds, sign
   }
   return {
     surface: "cargo",
-    mode: "anonymous-public-independent-entry-resolution-no-compile",
+    mode: "anonymous-public-independent-entry-all-feature-resolution-no-compile",
     registry: "https://crates.io",
     ...resolvedSurfaceCoverage(surface, entries, rows),
     receiptCoveredWithoutPayloadFetchCarrierIds: surface.carrierIds,
@@ -1219,6 +1448,7 @@ async function main(argv) {
   const registryEvidence = validateRegistryReceiptEvidence(args.registryReceipts, lock, {
     products: plan.products,
     ecosystems: REGISTRY_ECOSYSTEMS,
+    receiptMode: "sealed",
   });
   const githubFile = boundedRegularJson(args.githubReceipt, MAX_RECEIPT_BYTES, "GitHub release receipt");
   const githubReceipt = validateGithubAttestationReceipt(githubFile.value, lock, { repo: plan.repository });

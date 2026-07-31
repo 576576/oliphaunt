@@ -7,6 +7,8 @@ import test from "node:test";
 
 import {
   PUBLIC_CONSUMER_EVIDENCE_SCHEMA,
+  cargoEntryFeatureNames,
+  publicCargoEnvironment,
   publicConsumerEvidence,
   publicConsumerPlan,
   runBoundedCommand,
@@ -231,6 +233,102 @@ checksum = "${"d".repeat(64)}"
   assert.throws(() => validateJsrResolution({ version: "5", jsr: {} }, jsrCarrier), /omitted from clean resolution/u);
 });
 
+test("selects every opt-in Cargo entry feature for exhaustive carrier resolution", () => {
+  const entry = carrier("cargo:facade", "alpha", 1);
+  entry.artifacts = [{
+    path: "target/cargo/facade-1.2.3.crate",
+    sha256: "d".repeat(64),
+    size: 1,
+  }];
+  assert.deepEqual(cargoEntryFeatureNames({
+    version: {
+      crate: "facade",
+      num: "1.2.3",
+      checksum: "d".repeat(64),
+      crate_size: 1,
+      yanked: false,
+      features: {
+        wasix: ["dep:facade-wasix"],
+        default: ["native"],
+        native: ["dep:facade-linux"],
+      },
+      features2: {
+        "wasix-aot-x86_64-unknown-linux-gnu": ["dep:facade-wasix", "dep:facade-aot-linux"],
+      },
+    },
+  }, entry), [
+    "native",
+    "wasix",
+    "wasix-aot-x86_64-unknown-linux-gnu",
+  ]);
+  assert.throws(
+    () => cargoEntryFeatureNames({
+      version: {
+        crate: "facade",
+        num: "9.9.9",
+        checksum: "d".repeat(64),
+        crate_size: 1,
+        yanked: false,
+        features: {},
+      },
+    }, entry),
+    /metadata does not match/u,
+  );
+  assert.throws(
+    () => cargoEntryFeatureNames({
+      version: {
+        crate: "facade",
+        num: "1.2.3",
+        checksum: "d".repeat(64),
+        crate_size: 1,
+        yanked: false,
+        features: { broken: [null] },
+      },
+    }, entry),
+    /invalid Cargo feature declaration/u,
+  );
+  assert.throws(
+    () => cargoEntryFeatureNames({
+      version: {
+        crate: "facade",
+        num: "1.2.3",
+        checksum: "d".repeat(64),
+        crate_size: 2,
+        yanked: false,
+        features: {},
+      },
+    }, entry),
+    /metadata does not match/u,
+  );
+  assert.throws(
+    () => cargoEntryFeatureNames({
+      version: {
+        crate: "facade",
+        num: "1.2.3",
+        checksum: "d".repeat(64),
+        crate_size: 1,
+        yanked: true,
+        features: {},
+      },
+    }, entry),
+    /metadata does not match/u,
+  );
+  assert.throws(
+    () => cargoEntryFeatureNames({
+      version: {
+        crate: "facade",
+        num: "1.2.3",
+        checksum: "d".repeat(64),
+        crate_size: 1,
+        yanked: false,
+        features: { wasix: ["dep:facade-wasix"] },
+        features2: { wasix: ["dep:substituted"] },
+      },
+    }, entry),
+    /features and features2 disagree/u,
+  );
+});
+
 test("public probes discard inherited credentials and package-manager substitution settings", () => {
   const env = sanitizedPublicEnvironment({
     NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/",
@@ -251,6 +349,72 @@ test("public probes discard inherited credentials and package-manager substituti
     PATH: "/usr/bin",
     NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/",
   });
+});
+
+test("clean Cargo consumers retain only the exact installed Rust toolchain context", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "oliphaunt-public-cargo-toolchain-test-"));
+  try {
+    const consumerHome = path.join(root, "consumer-home");
+    const cargoHome = path.join(root, "cargo-home");
+    mkdirSync(consumerHome, { recursive: true });
+    mkdirSync(cargoHome, { recursive: true });
+    const env = publicCargoEnvironment(root, {
+      ...process.env,
+      CARGO_REGISTRY_TOKEN: "must-not-survive",
+      CARGO_SOURCE_CRATES_IO_REPLACE_WITH: "must-not-survive",
+      RUSTUP_TOOLCHAIN: "nightly",
+    });
+    assert.equal(env.CARGO_HOME, cargoHome);
+    assert.equal(env.HOME, path.join(root, "cargo-user-home"));
+    assert.equal(env.RUSTUP_TOOLCHAIN, "1.93.1");
+    assert.notEqual(env.RUSTUP_HOME, path.join(env.HOME, ".rustup"));
+    assert.equal(env.CARGO_REGISTRY_TOKEN, undefined);
+    assert.equal(env.CARGO_SOURCE_CRATES_IO_REPLACE_WITH, undefined);
+    writeFileSync(
+      path.join(root, "Cargo.toml"),
+      '[package]\nname = "clean-cargo-toolchain-probe"\nversion = "0.0.0"\nedition = "2021"\n',
+    );
+    mkdirSync(path.join(root, "src"));
+    writeFileSync(path.join(root, "src", "lib.rs"), "");
+    await runBoundedCommand("cargo", ["generate-lockfile"], {
+      cwd: root,
+      env,
+      deadlineMilliseconds: Date.now() + 30_000,
+    });
+    assert.equal(existsSync(path.join(root, "Cargo.lock")), true);
+    const version = await runBoundedCommand("cargo", ["--version"], {
+      cwd: root,
+      env,
+      deadlineMilliseconds: Date.now() + 30_000,
+    });
+    assert.match(version.stdout, /^cargo 1\.93\.1\b/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cargo consumer toolchain context fails closed on unpinned or unavailable inputs", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "oliphaunt-public-cargo-toolchain-policy-test-"));
+  try {
+    const rustupHome = path.join(root, "rustup");
+    mkdirSync(rustupHome, { recursive: true });
+    writeFileSync(path.join(root, "rust-toolchain.toml"), '[toolchain]\nchannel = "stable"\n');
+    assert.throws(
+      () => publicCargoEnvironment(path.join(root, "consumer"), { RUSTUP_HOME: rustupHome }, { repositoryRoot: root }),
+      /must pin an exact stable Rust toolchain/u,
+    );
+    writeFileSync(path.join(root, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.93.1"\n');
+    assert.throws(
+      () => publicCargoEnvironment(
+        path.join(root, "consumer"),
+        { RUSTUP_HOME: path.join(root, "missing") },
+        { repositoryRoot: root },
+      ),
+      /RUSTUP_HOME is unavailable/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("builds canonical lock/receipt-bound evidence and writes it immutably", () => {
