@@ -192,6 +192,17 @@ fi
       --prefix="$ICU_PREFIX"
     icu_wasix_config_ready
     icu_pkgdata_opts="-O $ICU_BUILD_DIR/data/icupkg.inc -w"
+    icu_data_name="$(
+      awk -F' = ' '$1 == "ICUDATA_NAME" { print $2; exit }' \
+        "$ICU_BUILD_DIR/config/Makefile.inc"
+    )"
+    if [[ ! "$icu_data_name" =~ ^icudt[0-9]+[a-z]+$ ]]; then
+      echo "invalid ICU data name in $ICU_BUILD_DIR/config/Makefile.inc: $icu_data_name" >&2
+      exit 1
+    fi
+    # ICU 76.1 does not order genrb after cnvalias.icu. Complete the alias
+    # file before parallel data generators can map a partially written file.
+    make -j1 -C data "out/build/$icu_data_name/cnvalias.icu" PKGDATA_OPTS="$icu_pkgdata_opts"
     make -j"$JOBS" PKGDATA_OPTS="$icu_pkgdata_opts"
     icu_prepare_files_data_install_dirs
     make install PKGDATA_OPTS="$icu_pkgdata_opts"

@@ -359,6 +359,18 @@ oliphaunt_icu_build_target() {
         --disable-layoutex \
         --prefix="$prefix"
     local icu_pkgdata_opts="-O $target_build_dir/data/icupkg.inc -w"
+    local icu_data_name
+    icu_data_name="$(
+      awk -F' = ' '$1 == "ICUDATA_NAME" { print $2; exit }' \
+        "$target_build_dir/config/Makefile.inc"
+    )"
+    if [[ ! "$icu_data_name" =~ ^icudt[0-9]+[a-z]+$ ]]; then
+      echo "invalid ICU data name in $target_build_dir/config/Makefile.inc: $icu_data_name" >&2
+      return 1
+    fi
+    # ICU 76.1 does not order genrb after cnvalias.icu. Complete the alias
+    # file before parallel data generators can map a partially written file.
+    make -j1 -C data "out/build/$icu_data_name/cnvalias.icu" PKGDATA_OPTS="$icu_pkgdata_opts"
     make -j"$jobs" PKGDATA_OPTS="$icu_pkgdata_opts"
     oliphaunt_icu_prepare_files_data_install_dirs "$target_build_dir" "$prefix"
     make install PKGDATA_OPTS="$icu_pkgdata_opts"

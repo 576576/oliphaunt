@@ -11,6 +11,14 @@ BlessTupleDesc
 BlockSampler_HasMore
 BlockSampler_Init
 BlockSampler_Next
+BufFileClose
+BufFileCreateFileSet
+BufFileExportFileSet
+BufFileOpenFileSet
+BufFileReadExact
+BufFileSeek
+BufFileTell
+BufFileWrite
 BufferBlocks
 BufferDescriptors
 BufferGetBlockNumber
@@ -30,10 +38,13 @@ CheckIndexCompatible
 CheckTableNotInUse
 CheckXidAlive
 CommandCounterIncrement
+ConditionVariableBroadcast
 ConditionVariableCancelSleep
 ConditionVariableInit
+ConditionVariablePrepareToSleep
 ConditionVariableSignal
 ConditionVariableSleep
+ConditionVariableTimedSleep
 ConditionalLockBuffer
 ConditionalLockRelationOid
 CopyErrorData
@@ -171,6 +182,7 @@ InstrEndLoop
 Int64GetDatum
 InterruptPending
 InvalidObjectAddress
+IsTransactionState
 IsValidJsonNumber
 ItemPointerCompare
 ItemPointerEquals
@@ -241,6 +253,7 @@ ProcDiePending
 ProcessCopyOptions
 ProcessInterrupts
 ProcessStartupPacket
+ProcessUtility_hook
 PushActiveSnapshot
 PushCopiedSnapshot
 QueryCancelPending
@@ -264,6 +277,7 @@ RelationGetIndexScan
 RelationGetNumberOfBlocksInFork
 RelationIdGetRelation
 RelationIsVisible
+RelationTruncate
 ReleaseAllPlanCacheRefsInOwner
 ReleaseBuffer
 ReleaseCachedPlan
@@ -337,6 +351,8 @@ SearchSysCacheList
 SetConfigOption
 SetTuplestoreDestReceiverParams
 SetUserIdAndSecContext
+SharedFileSetAttach
+SharedFileSetInit
 ShmemInitStruct
 SnapshotAnyData
 SplitIdentifierString
@@ -568,7 +584,6 @@ dshash_find
 dshash_find_or_insert
 dshash_get_hash_table_handle
 dshash_memcmp
-dshash_memcpy
 dshash_memhash
 dshash_release_lock
 dshash_seq_init
@@ -628,6 +643,7 @@ ferror
 fflush
 fgets
 fileno
+find_all_inheritors
 find_coercion_pathway
 find_inheritance_children
 find_nonnullable_rels
@@ -802,6 +818,7 @@ list_make1_impl
 list_make2_impl
 list_make3_impl
 list_member_int
+list_member_oid
 list_sort
 llround
 log
@@ -971,6 +988,8 @@ pg_sprintf
 pg_strcasecmp
 pg_strfold
 pg_strong_random
+pg_strtoint32
+pg_usleep
 pg_utf_mblen_private
 pg_verifymbstr
 pg_vfprintf
@@ -1034,6 +1053,7 @@ relation_openrv
 remove_nulling_relids
 repalloc
 repalloc0
+repalloc_huge
 reservoir_get_next_S
 reservoir_init_selection_state
 resetStringInfo
@@ -1072,6 +1092,7 @@ standard_ExecutorEnd
 standard_ExecutorFinish
 standard_ExecutorRun
 standard_ExecutorStart
+standard_ProcessUtility
 standard_planner
 stat
 std_typanalyze
