@@ -22,6 +22,7 @@ import {
 import { resolvePinnedJsrInvocation } from "./jsr-cli.mjs";
 import {
   DEFAULT_PUBLICATION_LOCK,
+  assertJsrPublicationNormalizationAdmissions,
   assertLockedArtifactSet,
   assertLockedProductArtifacts,
   assertPublicationLockSource,
@@ -1188,6 +1189,10 @@ async function publishTypescriptJsr(headRef, { version: versionOverride, source:
   } catch (error) {
     throw error instanceof Error ? error : new Error(String(error));
   }
+  // This is deliberately before the existence check and the one permitted
+  // immutable-version mutation. A future Deno sloppy-import rewrite cannot be
+  // discovered only after JSR has accepted the public version.
+  assertJsrPublicationNormalizationAdmissions(ACTIVE_PUBLICATION_LOCK);
   const wasPublished = productRegistryPublished(product, "jsr");
   let reconciledMutationFailure = false;
   if (wasPublished) {
@@ -1516,6 +1521,9 @@ async function publishNormalRegistryPlan(products, headRef) {
     return;
   }
   requireNormalRegistryProductInputs(products);
+  // Admit every selected JSR source before executing the first registry
+  // operation, not merely when the dependency-ordered executor reaches JSR.
+  assertJsrPublicationNormalizationAdmissions(ACTIVE_PUBLICATION_LOCK);
   const carrierProducts = [...new Set(
     plan.operations.flatMap((operation) => operation.products),
   )].sort(compareText);

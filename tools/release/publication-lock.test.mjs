@@ -156,7 +156,12 @@ function mavenFixture(root, group, artifact, version) {
 function jsrFixture(root, name, version) {
   const directory = path.join(root, "jsr");
   mkdirSync(directory, { recursive: true });
-  writeFileSync(path.join(directory, "jsr.json"), `${JSON.stringify({ name, version, exports: "./mod.ts" }, null, 2)}\n`);
+  writeFileSync(path.join(directory, "jsr.json"), `${JSON.stringify({
+    name,
+    version,
+    exports: "./mod.ts",
+    publish: { include: ["jsr.json", "mod.ts"] },
+  }, null, 2)}\n`);
   writeFileSync(path.join(directory, "mod.ts"), "export const fixture = true;\n");
   return directory;
 }
@@ -717,6 +722,54 @@ describe("publication artifact discovery and freezing", () => {
     const tampered = structuredClone(lock);
     tampered.carriers[0].artifacts[0].size += 1;
     expect(() => validatePublicationLock(tampered)).toThrow(/Digest mismatch|digest mismatch|packageEnvelopeDigest/u);
+  });
+
+  test("freeze rejects rewrite-prone JSR source without an exact immutable normalization record", () => {
+    const root = temporaryDirectory();
+    const catalog = loadPublicationCatalog("publication-lock.test", { products: ["oliphaunt-js"] });
+    const version = catalog.products[0].version;
+    npmFixture(root, "@oliphaunt/ts", version);
+    const jsr = jsrFixture(root, "@oliphaunt/ts", version);
+    writeFileSync(path.join(jsr, "dep.ts"), "export const fixture = true;\n");
+    writeFileSync(path.join(jsr, "mod.ts"), "export { fixture } from './dep.js';\n");
+    const config = JSON.parse(readFileSync(path.join(jsr, "jsr.json"), "utf8"));
+    config.publish.include.push("dep.ts");
+    writeFileSync(path.join(jsr, "jsr.json"), `${JSON.stringify(config, null, 2)}\n`);
+
+    const candidate = buildPublicationCandidate({
+      products: ["oliphaunt-js"],
+      artifactRoots: [root],
+    });
+    expect(candidate.missing).toEqual([]);
+    expect(() => freezePublicationCandidate(candidate)).toThrow(
+      /rewrite-prone.*without an exact pre-recorded publish normalization/u,
+    );
+  });
+
+  test("structural lock verification remains valid after registry payload handoff cleanup", () => {
+    const root = temporaryDirectory();
+    const catalog = loadPublicationCatalog("publication-lock.test", { products: ["oliphaunt-js"] });
+    const version = catalog.products[0].version;
+    npmFixture(root, "@oliphaunt/ts", version);
+    const jsr = jsrFixture(root, "@oliphaunt/ts", version);
+    const lock = freezePublicationCandidate(buildPublicationCandidate({
+      products: ["oliphaunt-js"],
+      artifactRoots: [root],
+    }));
+    const lockFile = path.join(root, "publication-lock.json");
+    writeFileSync(lockFile, `${JSON.stringify(lock, null, 2)}\n`);
+    rmSync(jsr, { force: true, recursive: true });
+
+    const result = spawnSync(process.execPath, [
+      "tools/release/publication-lock.mjs",
+      "verify",
+      "--lock",
+      lockFile,
+      "--head-ref",
+      "HEAD",
+    ], { cwd: path.resolve(import.meta.dir, "../.."), encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("publication lock verified");
   });
 
   test("projects broad artifact roots through the full catalog onto selected products", () => {

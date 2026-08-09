@@ -43,6 +43,7 @@ import {
   extensionCarrierLegalFileInventory,
 } from "./extension-upstream-licenses.mjs";
 import { readCanonicalTarGzipEntries } from "./portable-archive.mjs";
+import { expectedJsrPublishedManifest } from "./jsr-publish-normalization.mjs";
 
 export { validateSelectionNeutralSwiftSourceCarrier };
 
@@ -1819,7 +1820,35 @@ export function freezePublicationCandidate(candidate) {
   };
   delete frozen.missing;
   frozen.lockDigest = digestValue(withoutDigest(frozen));
+  assertJsrPublicationNormalizationAdmissions(frozen);
   return frozen;
+}
+
+export function assertJsrPublicationNormalizationAdmissions(lock) {
+  const admitted = [];
+  for (const carrier of lock.carriers.filter(({ ecosystem }) => ecosystem === "jsr")) {
+    if (carrier.artifacts.length !== 1) {
+      throw error(`${carrier.id} must freeze exactly one JSR source-directory envelope`);
+    }
+    const artifact = carrier.artifacts[0];
+    const directory = path.resolve(ROOT, artifact.path);
+    let metadata;
+    try {
+      metadata = lstatSync(directory);
+    } catch (cause) {
+      throw error(`${carrier.id} frozen JSR source is missing: ${artifact.path}: ${cause.message}`);
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw error(`${carrier.id} frozen JSR artifact must be a non-symlink directory: ${artifact.path}`);
+    }
+    const observed = directoryEnvelope(directory);
+    if (observed.sha256 !== artifact.sha256 || observed.size !== artifact.size) {
+      throw error(`${carrier.id} frozen JSR source bytes do not match the publication lock: ${artifact.path}`);
+    }
+    const files = expectedJsrPublishedManifest({ carrier, directory, lock });
+    admitted.push({ carrierId: carrier.id, fileCount: Object.keys(files).length });
+  }
+  return admitted;
 }
 
 function assertHash(value, context) {

@@ -128,11 +128,26 @@ describe("real publication consumes frozen artifacts", () => {
     expect(jsr).toContain("reconciledMutationFailure");
     expect(jsr).not.toContain("run(TOOL");
     expect(jsr).not.toContain("fail(");
+    const jsrAdmission = jsr.indexOf("assertJsrPublicationNormalizationAdmissions(ACTIVE_PUBLICATION_LOCK)");
+    expect(jsrAdmission).toBeGreaterThan(-1);
+    expect(jsrAdmission).toBeLessThan(jsr.indexOf("const wasPublished"));
+    expect(jsrAdmission).toBeLessThan(jsr.indexOf("mutateOnceAndRequireExactState"));
     expect(maven).toContain("verifyReleaseTagOrThrow");
     expect(maven).toContain("requireProductRegistryPublishedOrThrow");
     expect(maven).not.toContain("run(TOOL");
     expect(maven).not.toContain("fail(");
     expect(carrier).not.toContain("process.exit");
     expect(carrier).not.toContain("fail(");
+  });
+
+  test("admits all selected JSR sources before the normal registry executor can mutate", () => {
+    const plan = publisher.slice(
+      publisher.indexOf("async function publishNormalRegistryPlan"),
+      publisher.indexOf("function jsonOutput"),
+    );
+    const admission = plan.indexOf("assertJsrPublicationNormalizationAdmissions(ACTIVE_PUBLICATION_LOCK)");
+    expect(admission).toBeGreaterThan(-1);
+    expect(admission).toBeLessThan(plan.indexOf("verifyReleaseTag(product, headRef)"));
+    expect(admission).toBeLessThan(plan.indexOf("executeNormalPublicationPlan({"));
   });
 });
