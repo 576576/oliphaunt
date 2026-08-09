@@ -13,6 +13,7 @@ import {
   verifyLockedRegistryIntegrity,
   writeRegistryReceiptEvidence,
 } from "./registry-integrity.mjs";
+import { createCratesIoReadGate } from "./registry-http-retry.mjs";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const sha = (bytes, algorithm, encoding = "hex") => createHash(algorithm).update(bytes).digest(encoding);
@@ -72,10 +73,16 @@ test("proves Cargo checksum and npm SRI against frozen archive bytes and rejects
     assert.equal(npm.registryProof.digest, sha(npmBytes, "sha512", "base64"));
     assert.equal(npm.registryProof.url, "https://registry.npmjs.org/%40example%2Falpha/1.0.0");
     assert.ok(requestedUrls.includes("https://registry.npmjs.org/%40example%2Falpha/1.0.0"));
+    const cargoReadStarts = [];
     const bulk = await verifyLockedRegistryIntegrity(lock, {
       products: ["alpha"], ecosystems: ["cargo", "npm"], fetchImpl: goodFetch, concurrency: 2,
+      cratesIoReadGate: {
+        beforeRequest: async (label) => cargoReadStarts.push(label),
+        defer: () => {},
+      },
     });
     assert.deepEqual(bulk.map((receipt) => receipt.id), ["cargo:alpha", "npm:@example/alpha"]);
+    assert.deepEqual(cargoReadStarts, ["https://crates.io/api/v1/crates/alpha/1.0.0"]);
     assert.deepEqual(validateLockedRegistryReceipts(lock, {
       products: ["alpha"],
       ecosystems: ["cargo", "npm"],
@@ -124,6 +131,64 @@ test("proves Cargo checksum and npm SRI against frozen archive bytes and rejects
     };
     await verifyLockedCarrierIntegrity(lock, "cargo:alpha", { fetchImpl: rateLimitedThenGood });
     assert.equal(rateLimitedAttempts, 2);
+
+    let authoritativeRetryAttempts = 0;
+    const authoritativeDeferrals = [];
+    const authoritativeRetryGate = {
+      beforeRequest: async () => {},
+      defer: (seconds) => authoritativeDeferrals.push(seconds),
+    };
+    await verifyLockedCarrierIntegrity(lock, "cargo:alpha", {
+      cratesIoReadGate: authoritativeRetryGate,
+      fetchImpl: async () => {
+        authoritativeRetryAttempts += 1;
+        if (authoritativeRetryAttempts === 1) {
+          return {
+            ok: false,
+            status: 429,
+            headers: { get: (name) => name === "retry-after" ? "45" : null },
+            body: { cancel: async () => {} },
+          };
+        }
+        return Response.json({ version: { checksum: sha(crateBytes, "sha256") } });
+      },
+    });
+    assert.equal(authoritativeRetryAttempts, 2);
+    assert.deepEqual(authoritativeDeferrals, [45]);
+
+    let excessiveRetryAttempts = 0;
+    await assert.rejects(
+      () => verifyLockedCarrierIntegrity(lock, "cargo:alpha", {
+        cratesIoReadGate: {
+          beforeRequest: async () => {},
+          defer: () => assert.fail("an excessive Retry-After must fail before deferring the read gate"),
+        },
+        fetchImpl: async () => {
+          excessiveRetryAttempts += 1;
+          return {
+            ok: false,
+            status: 429,
+            headers: { get: (name) => name === "retry-after" ? "601" : null },
+            body: { cancel: async () => {} },
+          };
+        },
+      }),
+      /bounded 600s retry-delay budget/u,
+    );
+    assert.equal(excessiveRetryAttempts, 1);
+
+    let logicalNowSeconds = 1_000;
+    const sharedGateSleeps = [];
+    const sharedGate = createCratesIoReadGate({
+      nowImpl: () => logicalNowSeconds,
+      sleepImpl: async (milliseconds) => {
+        sharedGateSleeps.push(milliseconds);
+        logicalNowSeconds += milliseconds / 1000;
+      },
+    });
+    await verifyLockedCarrierIntegrity(lock, "cargo:alpha", { fetchImpl: goodFetch, cratesIoReadGate: sharedGate });
+    await verifyLockedCarrierIntegrity(lock, "cargo:alpha", { fetchImpl: goodFetch, cratesIoReadGate: sharedGate });
+    assert.deepEqual(sharedGateSleeps, [250]);
 
     let notFoundAttempts = 0;
     const notFound = async () => {

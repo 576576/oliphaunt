@@ -43,7 +43,7 @@ function parseProducts(raw) {
 
 export function classifyLedgerRequirement(rows) {
   const requiring = rows
-    .filter((row) => row.published > 0 && row.tagState === "missing")
+    .filter((row) => row.queryState !== "skipped-exact-tag" && row.published > 0 && row.tagState === "missing")
     .map(({ product, ecosystem, published }) => ({ product, ecosystem, published }))
     .sort((left, right) => compareText(`${left.product}:${left.ecosystem}`, `${right.product}:${right.ecosystem}`));
   const conflicting = rows.filter((row) => row.tagState === "wrong");
@@ -75,6 +75,56 @@ function tagState(product, version, headCommit) {
   return result.stdout === headCommit ? "exact" : "wrong";
 }
 
+export function collectLedgerRows({ lock, lockFile, products, headCommit }, {
+  carriersFor = lockedCarriers,
+  queryPublication = query,
+  resolveTagState = tagState,
+} = {}) {
+  const rows = [];
+  for (const product of products) {
+    const productRow = lock.products.find((entry) => entry.id === product);
+    if (productRow === undefined) fail(`publication lock omits selected product ${product}`);
+    const currentTagState = resolveTagState(product, productRow.version, headCommit);
+    if (currentTagState === "wrong") {
+      fail(`current product tag points at another commit: ${product}`);
+    }
+    if (currentTagState !== "exact" && currentTagState !== "missing") {
+      fail(`product tag state for ${product} is invalid: ${JSON.stringify(currentTagState)}`);
+    }
+    for (const ecosystem of ["cargo", "npm"]) {
+      const carriers = carriersFor(lock, { product, ecosystem });
+      if (carriers.length === 0) continue;
+      if (currentTagState === "exact") {
+        rows.push({
+          product,
+          ecosystem,
+          published: null,
+          missing: null,
+          queryState: "skipped-exact-tag",
+          tagState: currentTagState,
+        });
+        continue;
+      }
+      if (typeof lockFile !== "string" || lockFile.length === 0) {
+        fail("publication lock path is required before a registry query");
+      }
+      const result = queryPublication(lockFile, product, ecosystem);
+      if (!Array.isArray(result.published) || !Array.isArray(result.missing)) {
+        fail(`registry query returned invalid publication lists for ${product}/${ecosystem}`);
+      }
+      rows.push({
+        product,
+        ecosystem,
+        published: result.published.length,
+        missing: result.missing.length,
+        queryState: "queried",
+        tagState: currentTagState,
+      });
+    }
+  }
+  return rows;
+}
+
 function main() {
   const lockFile = path.resolve(ROOT, process.env.PUBLICATION_LOCK_PATH || "target/release/publication-lock.json");
   const products = parseProducts(process.env.PRODUCTS_JSON || "");
@@ -83,23 +133,7 @@ function main() {
   if (lock.source.commit !== headCommit) {
     fail(`publication lock source ${lock.source.commit} does not match ${headCommit}`);
   }
-  const rows = [];
-  for (const product of products) {
-    const productRow = lock.products.find((entry) => entry.id === product);
-    if (productRow === undefined) fail(`publication lock omits selected product ${product}`);
-    for (const ecosystem of ["cargo", "npm"]) {
-      const carriers = lockedCarriers(lock, { product, ecosystem });
-      if (carriers.length === 0) continue;
-      const result = query(lockFile, product, ecosystem);
-      rows.push({
-        product,
-        ecosystem,
-        published: result.published?.length ?? 0,
-        missing: result.missing?.length ?? 0,
-        tagState: tagState(product, productRow.version, headCommit),
-      });
-    }
-  }
+  const rows = collectLedgerRows({ lock, lockFile, products, headCommit });
   const state = classifyLedgerRequirement(rows);
   const output = process.env.GITHUB_OUTPUT;
   if (output) {

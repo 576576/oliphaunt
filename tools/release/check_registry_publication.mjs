@@ -9,6 +9,7 @@ import {
 import { extensionRegistryPackageEntries } from "./extension-registry-packages.mjs";
 import { loadPublicationLock, lockedCarriers } from "./publication-lock.mjs";
 import {
+  retryAfterSeconds,
   registryRetryDelaySeconds,
   registryStatusRetryable,
 } from "./registry-http-retry.mjs";
@@ -23,6 +24,9 @@ const REQUEST_ATTEMPTS = Math.max(1, Number.parseInt(process.env.OLIPHAUNT_REGIS
 const REQUEST_RETRY_DELAY_SECONDS = Math.max(0, Number.parseFloat(process.env.OLIPHAUNT_REGISTRY_QUERY_RETRY_DELAY || "1.0") || 0);
 const REQUEST_TIMEOUT_MS = 20_000;
 const DEADLINE_CLEANUP_RESERVE_MS = 5_000;
+export const CRATES_IO_READ_INTERVAL_SECONDS = 1;
+export const CRATES_IO_READ_RETRY_BUDGET_SECONDS = 10 * 60;
+export const CRATES_IO_RATE_LIMIT_FALLBACK_SECONDS = 60;
 const MAX_REGISTRY_JSON_BYTES = 8 * 1024 * 1024;
 const REGISTRY_TARGETS = new Set(["crates-io", "npm", "jsr", "maven-central"]);
 const REGISTRY_KINDS = new Set(["crates", "npm", "jsr", "maven"]);
@@ -550,23 +554,49 @@ async function requestJson(url, label, { fetchImpl = fetch } = {}) {
   throw lastError ?? new Error(`failed to query ${label}`);
 }
 
-async function urlExistsViaGet(url) {
-  return urlExists(url, { method: "GET", allowMethodFallback: false });
+async function urlExistsViaGet(url, options = {}) {
+  return urlExists(url, { ...options, method: "GET", allowMethodFallback: false });
 }
 
-async function urlExists(url, { method = "HEAD", allowMethodFallback = true } = {}) {
+export function cratesIoReadRetryDelaySeconds({ headers, status, attempt, now = Date.now() }) {
+  if (status === 429) {
+    const requested = retryAfterSeconds(headers, now);
+    if (requested !== null) return requested;
+    return Math.min(300, CRATES_IO_RATE_LIMIT_FALLBACK_SECONDS * (2 ** attempt));
+  }
+  return registryRetryDelaySeconds({ headers, attempt, now });
+}
+
+export async function urlExists(url, {
+  method = "HEAD",
+  allowMethodFallback = true,
+  fetchImpl = fetch,
+  sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  nowImpl = () => Date.now(),
+  beforeRequestSeconds = 0,
+  retryBudgetSeconds = null,
+  retryDelayImpl = ({ headers, attempt, now }) =>
+    registryRetryDelaySeconds({ headers, attempt, baseSeconds: REQUEST_RETRY_DELAY_SECONDS, now }),
+  retryContext = `registry retry for ${url}`,
+} = {}) {
   let lastError;
+  let retryDelaySpentSeconds = 0;
   for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
     let retryHeaders;
+    let retryStatus;
     try {
-      const response = await fetch(url, {
+      await boundedRegistrySleep(beforeRequestSeconds, `registry read pacing for ${url}`, {
+        nowImpl,
+        sleepImpl,
+      });
+      const response = await fetchImpl(url, {
         method,
         headers: {
           Accept: "application/json",
           "User-Agent": USER_AGENT,
         },
         redirect: "follow",
-        signal: AbortSignal.timeout(registryRequestTimeoutMilliseconds(`registry request for ${url}`)),
+        signal: AbortSignal.timeout(registryRequestTimeoutMilliseconds(`registry request for ${url}`, { nowImpl })),
       });
       if (response.ok) {
         await response.body?.cancel?.().catch(() => {});
@@ -578,7 +608,15 @@ async function urlExists(url, { method = "HEAD", allowMethodFallback = true } = 
       }
       if (response.status === 405 && method === "HEAD" && allowMethodFallback) {
         await response.body?.cancel?.().catch(() => {});
-        return urlExistsViaGet(url);
+        return urlExistsViaGet(url, {
+          fetchImpl,
+          sleepImpl,
+          nowImpl,
+          beforeRequestSeconds,
+          retryBudgetSeconds,
+          retryDelayImpl,
+          retryContext,
+        });
       }
       const error = new RegistryHttpError(response.status, url);
       const headers = response.headers;
@@ -587,6 +625,7 @@ async function urlExists(url, { method = "HEAD", allowMethodFallback = true } = 
         fail(`registry returned HTTP ${response.status} for ${url}`);
       }
       retryHeaders = headers;
+      retryStatus = response.status;
       lastError = error;
     } catch (error) {
       lastError = error;
@@ -598,11 +637,25 @@ async function urlExists(url, { method = "HEAD", allowMethodFallback = true } = 
       }
     }
     if (attempt + 1 < REQUEST_ATTEMPTS) {
-      await boundedRegistrySleep(registryRetryDelaySeconds({
+      const delaySeconds = retryDelayImpl({
         headers: retryHeaders,
+        status: retryStatus,
         attempt,
-        baseSeconds: REQUEST_RETRY_DELAY_SECONDS,
-      }), `registry retry for ${url}`);
+        now: nowImpl(),
+      });
+      if (!Number.isFinite(delaySeconds) || delaySeconds < 0) {
+        throw new RegistryResponseError(`${retryContext} requested an invalid delay`);
+      }
+      if (
+        retryBudgetSeconds !== null
+        && delaySeconds > retryBudgetSeconds - retryDelaySpentSeconds
+      ) {
+        throw new RegistryResponseError(
+          `${retryContext} exceeds its bounded ${retryBudgetSeconds}s retry-delay budget`,
+        );
+      }
+      retryDelaySpentSeconds += delaySeconds;
+      await boundedRegistrySleep(delaySeconds, retryContext, { nowImpl, sleepImpl });
     }
   }
   if (lastError instanceof RegistryHttpError) {
@@ -611,9 +664,23 @@ async function urlExists(url, { method = "HEAD", allowMethodFallback = true } = 
   fail(`failed to query registry URL ${url}: ${lastError}`);
 }
 
-async function cratesioUrlExists(url, label) {
+export async function cratesioUrlExists(url, label, {
+  fetchImpl = fetch,
+  sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  nowImpl = () => Date.now(),
+} = {}) {
   try {
-    return await urlExists(url, { method: "GET", allowMethodFallback: false });
+    return await urlExists(url, {
+      method: "GET",
+      allowMethodFallback: false,
+      fetchImpl,
+      sleepImpl,
+      nowImpl,
+      beforeRequestSeconds: CRATES_IO_READ_INTERVAL_SECONDS,
+      retryBudgetSeconds: CRATES_IO_READ_RETRY_BUDGET_SECONDS,
+      retryDelayImpl: cratesIoReadRetryDelaySeconds,
+      retryContext: `crates.io existence retry for ${label}`,
+    });
   } catch (error) {
     if (error instanceof RegistryHttpError && error.status === 404) {
       return false;

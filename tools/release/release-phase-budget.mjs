@@ -17,7 +17,11 @@ export const REGISTRY_JOB_HARD_WINDOW_SECONDS = 350 * 60;
 export const REGISTRY_JOB_CLEANUP_SECONDS = 10 * 60;
 export const REGISTRY_EXACT_INPUT_TRANSFER_ALLOWANCE_SECONDS = 70 * 60;
 export const REGISTRY_SETUP_ALLOWANCE_SECONDS = 45 * 60;
-export const REGISTRY_INPUT_VALIDATION_ALLOWANCE_SECONDS = 25 * 60;
+// Includes the six-minute crates.io inventory gate: 440 paced reads take about
+// 110 seconds without throttling and retain a bounded three-minute 429 delay
+// budget. The phase still preserves an independent two-minute hard-window
+// margin and the job's ten-minute runner/action cleanup reserve.
+export const REGISTRY_INPUT_VALIDATION_ALLOWANCE_SECONDS = 28 * 60;
 // At crates.io's documented default version bucket, the current exact carrier
 // scale completes in under 174 minutes including the executor reserve. A
 // 190-minute lane admits that graph while retaining the existing conservative

@@ -1,6 +1,9 @@
 import process from "node:process";
 
 import {
+  CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
+  createCratesIoReadGate,
+  retryAfterSeconds,
   registryRetryDelaySeconds,
   registryStatusRetryable,
 } from "./registry-http-retry.mjs";
@@ -9,6 +12,10 @@ import {
   CRATES_IO_TRUSTED_TOKEN_DEFAULT_BATCH_SIZE,
   CRATES_IO_TRUSTED_TOKEN_MAX_BATCH_AGE_MS,
 } from "./crates-io-trusted-publishing.mjs";
+export {
+  CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
+  createCratesIoReadGate,
+};
 export {
   RegistryPublicationDeferredError,
   isRegistryPublicationDeferredError,
@@ -53,10 +60,11 @@ export const NORMAL_REGISTRY_EXECUTOR_RESERVE_SECONDS = 10 * 60;
 
 const DEFAULT_CRATES_IO_API = "https://crates.io/api/v1";
 const USER_AGENT = "oliphaunt-bootstrap-capacity/1; https://github.com/f0rr0/oliphaunt";
-const REQUEST_ATTEMPTS = 5;
+const REQUEST_ATTEMPTS = 8;
 const REQUEST_TIMEOUT_MS = 30_000;
 const DEADLINE_RESERVE_MS = 5_000;
-const MAX_READ_RETRY_DELAY_SECONDS = 30;
+const MAX_READ_RETRY_DELAY_BUDGET_SECONDS = 3 * 60;
+const MAX_RATE_LIMIT_RETRY_DELAY_SECONDS = 5 * 60;
 const MINIMUM_MUTATION_WINDOW_SECONDS = 15 * 60;
 const MAX_PLANNING_SECONDS_PER_CARRIER = 60 * 60;
 const MAX_RESERVE_SECONDS = 6 * 60 * 60;
@@ -185,17 +193,23 @@ async function closeResponse(response) {
 async function crateResourceExists(resourceSegments, label, {
   apiBase,
   fetchImpl,
-  sleepImpl,
   nowImpl,
   deadlineEpochSeconds,
+  readGate,
 }) {
   const resource = resourceSegments.map((segment) => encodeURIComponent(segment)).join("/");
   const url = `${apiBase.replace(/\/+$/u, "")}/crates/${resource}`;
   let lastFailure = null;
+  let retryDelaySpentSeconds = 0;
   for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
     try {
       const remainingMilliseconds = (deadlineEpochSeconds - nowImpl()) * 1000 - DEADLINE_RESERVE_MS;
       if (remainingMilliseconds <= 0) {
+        throw error(`read-only existence check for ${label} cannot start before the registry mutation deadline`);
+      }
+      await readGate.beforeRequest(label, deadlineEpochSeconds);
+      const requestRemainingMilliseconds = (deadlineEpochSeconds - nowImpl()) * 1000 - DEADLINE_RESERVE_MS;
+      if (requestRemainingMilliseconds <= 0) {
         throw error(`read-only existence check for ${label} cannot start before the registry mutation deadline`);
       }
       const response = await fetchImpl(url, {
@@ -204,7 +218,7 @@ async function crateResourceExists(resourceSegments, label, {
           "User-Agent": USER_AGENT,
         },
         redirect: "error",
-        signal: AbortSignal.timeout(Math.max(1, Math.min(REQUEST_TIMEOUT_MS, remainingMilliseconds))),
+        signal: AbortSignal.timeout(Math.max(1, Math.min(REQUEST_TIMEOUT_MS, requestRemainingMilliseconds))),
       });
       if (response.status === 200) {
         await closeResponse(response);
@@ -222,10 +236,14 @@ async function crateResourceExists(resourceSegments, label, {
       if (!retryable || attempt + 1 >= REQUEST_ATTEMPTS) {
         break;
       }
-      const delaySeconds = registryRetryDelaySeconds({ headers, attempt, now: nowImpl() * 1000 });
-      if (delaySeconds > MAX_READ_RETRY_DELAY_SECONDS) {
+      const requestedDelaySeconds = retryAfterSeconds(headers, nowImpl() * 1000);
+      const delaySeconds = requestedDelaySeconds
+        ?? (status === 429
+          ? Math.min(60 * (2 ** attempt), MAX_RATE_LIMIT_RETRY_DELAY_SECONDS)
+          : registryRetryDelaySeconds({ headers, attempt, now: nowImpl() * 1000 }));
+      if (delaySeconds > MAX_READ_RETRY_DELAY_BUDGET_SECONDS - retryDelaySpentSeconds) {
         throw error(
-          `read-only existence check for ${label} was rate limited until more than ${MAX_READ_RETRY_DELAY_SECONDS}s from now; retry the release later`,
+          `read-only existence check for ${label} exceeds its bounded ${MAX_READ_RETRY_DELAY_BUDGET_SECONDS}s retry-delay budget; retry the release later`,
         );
       }
       const delayMilliseconds = Math.ceil(delaySeconds * 1000);
@@ -233,9 +251,14 @@ async function crateResourceExists(resourceSegments, label, {
       if (delayMilliseconds >= retryRemainingMilliseconds) {
         throw error(`read-only existence check for ${label} cannot retry before the registry mutation deadline`);
       }
-      await sleepImpl(delayMilliseconds);
+      retryDelaySpentSeconds += delaySeconds;
+      readGate.defer(delaySeconds);
     } catch (cause) {
-      if (cause instanceof Error && cause.message.startsWith("crates-io-bootstrap-capacity:")) {
+      if (
+        cause instanceof Error
+        && (cause.message.startsWith("crates-io-bootstrap-capacity:")
+          || cause.message.startsWith("registry-http-retry:"))
+      ) {
         throw cause;
       }
       lastFailure = cause instanceof Error ? cause.message : String(cause);
@@ -243,12 +266,18 @@ async function crateResourceExists(resourceSegments, label, {
         break;
       }
       const delaySeconds = registryRetryDelaySeconds({ attempt, now: nowImpl() * 1000 });
+      if (delaySeconds > MAX_READ_RETRY_DELAY_BUDGET_SECONDS - retryDelaySpentSeconds) {
+        throw error(
+          `read-only existence check for ${label} exceeds its bounded ${MAX_READ_RETRY_DELAY_BUDGET_SECONDS}s retry-delay budget; retry the release later`,
+        );
+      }
       const delayMilliseconds = Math.ceil(delaySeconds * 1000);
       const retryRemainingMilliseconds = (deadlineEpochSeconds - nowImpl()) * 1000 - DEADLINE_RESERVE_MS;
       if (delayMilliseconds >= retryRemainingMilliseconds) {
         throw error(`read-only existence check for ${label} cannot retry before the registry mutation deadline`);
       }
-      await sleepImpl(delayMilliseconds);
+      retryDelaySpentSeconds += delaySeconds;
+      readGate.defer(delaySeconds);
     }
   }
   throw error(`cannot determine whether Cargo identity ${label} exists on crates.io: ${lastFailure ?? "unknown response"}`);
@@ -259,7 +288,7 @@ export async function inspectCratesIoBootstrapNames({
   apiBase = process.env.CRATES_IO_API ?? DEFAULT_CRATES_IO_API,
   fetchImpl = fetch,
   sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-  nowImpl = () => Math.floor(Date.now() / 1000),
+  nowImpl = () => Date.now() / 1000,
   deadlineEpochSeconds,
   concurrency = 8,
 }) {
@@ -270,6 +299,7 @@ export async function inspectCratesIoBootstrapNames({
     throw error("existence-check concurrency must be an integer from 1 through 32");
   }
   const names = selectedCargoNames(plan);
+  const readGate = createCratesIoReadGate({ nowImpl, sleepImpl });
   const observed = new Array(names.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, names.length) }, async () => {
@@ -280,9 +310,9 @@ export async function inspectCratesIoBootstrapNames({
       observed[index] = await crateResourceExists([names[index]], names[index], {
         apiBase,
         fetchImpl,
-        sleepImpl,
         nowImpl,
         deadlineEpochSeconds,
+        readGate,
       });
     }
   });
@@ -299,7 +329,7 @@ export async function inspectCratesIoVersionState({
   apiBase = process.env.CRATES_IO_API ?? DEFAULT_CRATES_IO_API,
   fetchImpl = fetch,
   sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-  nowImpl = () => Math.floor(Date.now() / 1000),
+  nowImpl = () => Date.now() / 1000,
   deadlineEpochSeconds,
   concurrency = 8,
 }) {
@@ -310,6 +340,7 @@ export async function inspectCratesIoVersionState({
     throw error("existence-check concurrency must be an integer from 1 through 32");
   }
   const identities = selectedCargoIdentities(plan);
+  const readGate = createCratesIoReadGate({ nowImpl, sleepImpl });
   const observed = new Array(identities.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, identities.length) }, async () => {
@@ -322,9 +353,9 @@ export async function inspectCratesIoVersionState({
       const versionExists = await crateResourceExists([identity.name, identity.version], label, {
         apiBase,
         fetchImpl,
-        sleepImpl,
         nowImpl,
         deadlineEpochSeconds,
+        readGate,
       });
       if (versionExists) {
         observed[index] = "published";
@@ -333,9 +364,9 @@ export async function inspectCratesIoVersionState({
       const nameExists = await crateResourceExists([identity.name], identity.name, {
         apiBase,
         fetchImpl,
-        sleepImpl,
         nowImpl,
         deadlineEpochSeconds,
+        readGate,
       });
       observed[index] = nameExists ? "pending-version" : "missing-name";
     }

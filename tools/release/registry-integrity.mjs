@@ -13,6 +13,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 
+import { createCratesIoReadGate } from "./registry-http-retry.mjs";
 import { loadPublicationLock } from "./publication-lock.mjs";
 import { ROOT, compareText } from "./release-graph.mjs";
 import {
@@ -30,13 +31,16 @@ const USER_AGENT = "oliphaunt-release-integrity (https://github.com/f0rr0/olipha
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "target"]);
 const SUPPORTED_ECOSYSTEMS = new Set(["cargo", "npm", "maven", "jsr"]);
 const RETRYABLE_HTTP_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
-const REQUEST_ATTEMPTS = 6;
+const REQUEST_ATTEMPTS = 8;
 const REQUEST_TIMEOUT_MS = 45_000;
 const DEADLINE_RESERVE_MS = 5_000;
-const MAX_RETRY_DELAY_MS = 30_000;
+const MAX_TRANSIENT_RETRY_DELAY_MS = 30_000;
+const MAX_RATE_LIMIT_RETRY_DELAY_MS = 5 * 60_000;
+const MAX_RETRY_DELAY_BUDGET_MS = 10 * 60_000;
 const MAX_METADATA_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_REGISTRY_RECEIPT_EVIDENCE_BYTES = 64 * 1024 * 1024;
 export const REGISTRY_RECEIPT_EVIDENCE_SCHEMA = "oliphaunt-registry-integrity-receipts-v1";
+const DEFAULT_CRATES_IO_READ_GATE = createCratesIoReadGate();
 
 class RegistryHttpError extends Error {
   constructor(url, status, retryAfter) {
@@ -48,16 +52,23 @@ class RegistryHttpError extends Error {
 
 class RegistryResponseError extends Error {}
 
-function mutationDeadlineRemainingMilliseconds(context) {
+function mutationDeadlineEpochSeconds() {
   const raw = process.env.REGISTRY_MUTATION_DEADLINE_EPOCH?.trim();
   if (!raw) return null;
   if (!/^[1-9][0-9]*$/u.test(raw)) {
     throw new RegistryResponseError("REGISTRY_MUTATION_DEADLINE_EPOCH must be a positive Unix timestamp");
   }
-  const deadline = Number(raw) * 1000;
-  if (!Number.isSafeInteger(deadline)) {
+  const deadline = Number(raw);
+  if (!Number.isSafeInteger(deadline) || !Number.isSafeInteger(deadline * 1000)) {
     throw new RegistryResponseError("REGISTRY_MUTATION_DEADLINE_EPOCH exceeds the safe timestamp range");
   }
+  return deadline;
+}
+
+function mutationDeadlineRemainingMilliseconds(context) {
+  const deadlineEpochSeconds = mutationDeadlineEpochSeconds();
+  if (deadlineEpochSeconds === null) return null;
+  const deadline = deadlineEpochSeconds * 1000;
   const remaining = deadline - Date.now() - DEADLINE_RESERVE_MS;
   if (remaining <= 0) {
     throw new RegistryResponseError(`${context} refused because the shared registry mutation deadline has been reached`);
@@ -140,15 +151,18 @@ function requireLockedFile(artifact, suffix, carrier) {
 function retryAfterMilliseconds(value) {
   if (typeof value !== "string" || value.trim().length === 0) return null;
   const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds * 1000), MAX_RETRY_DELAY_MS);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return null;
-  return Math.min(Math.max(0, timestamp - Date.now()), MAX_RETRY_DELAY_MS);
+  return Math.max(0, timestamp - Date.now());
 }
 
 function retryDelay(attempt, cause) {
   if (cause instanceof RegistryHttpError && cause.retryAfter !== null) return cause.retryAfter;
-  const exponential = Math.min(500 * (2 ** attempt), MAX_RETRY_DELAY_MS);
+  if (cause instanceof RegistryHttpError && cause.status === 429) {
+    return Math.min(60_000 * (2 ** attempt), MAX_RATE_LIMIT_RETRY_DELAY_MS);
+  }
+  const exponential = Math.min(500 * (2 ** attempt), MAX_TRANSIENT_RETRY_DELAY_MS);
   return Math.round(exponential * (0.75 + Math.random() * 0.5));
 }
 
@@ -200,13 +214,22 @@ async function boundedResponseBytes(response, maximum, context) {
   return Buffer.concat(chunks, size);
 }
 
-async function request(url, accept, fetchImpl, consume) {
+function cratesIoRequest(url) {
+  return url.startsWith(`${CRATES_IO_API.replace(/\/+$/u, "")}/`);
+}
+
+async function request(url, accept, fetchImpl, consume, cratesIoReadGate = null) {
   let last;
   let usedAttempts = 0;
+  let retryDelaySpentMilliseconds = 0;
   for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
     usedAttempts = attempt + 1;
     const controller = new AbortController();
-    const deadlineRemaining = mutationDeadlineRemainingMilliseconds(`registry request for ${url}`);
+    let deadlineRemaining = mutationDeadlineRemainingMilliseconds(`registry request for ${url}`);
+    if (cratesIoReadGate !== null && cratesIoRequest(url)) {
+      await cratesIoReadGate.beforeRequest(url, mutationDeadlineEpochSeconds());
+      deadlineRemaining = mutationDeadlineRemainingMilliseconds(`registry request for ${url}`);
+    }
     const timeoutMs = deadlineRemaining === null
       ? REQUEST_TIMEOUT_MS
       : Math.max(1, Math.min(REQUEST_TIMEOUT_MS, deadlineRemaining));
@@ -228,11 +251,20 @@ async function request(url, accept, fetchImpl, consume) {
       last = cause;
       if (attempt + 1 >= REQUEST_ATTEMPTS || !retryable(cause)) break;
       const delay = retryDelay(attempt, cause);
+      const retryDelayRemainingMilliseconds = MAX_RETRY_DELAY_BUDGET_MS - retryDelaySpentMilliseconds;
+      if (delay > retryDelayRemainingMilliseconds) {
+        throw error(`registry retry for ${url} exceeds its bounded 600s retry-delay budget`);
+      }
       const retryRemaining = mutationDeadlineRemainingMilliseconds(`registry retry for ${url}`);
       if (retryRemaining !== null && delay >= retryRemaining) {
         throw error(`registry retry for ${url} cannot complete before the shared registry mutation deadline`);
       }
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      retryDelaySpentMilliseconds += delay;
+      if (cratesIoReadGate !== null && cratesIoRequest(url)) {
+        cratesIoReadGate.defer(delay / 1000);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     } finally {
       clearTimeout(timeout);
     }
@@ -240,7 +272,7 @@ async function request(url, accept, fetchImpl, consume) {
   throw error(`${last instanceof Error ? last.message : String(last)} after ${usedAttempts} attempt(s)`);
 }
 
-async function requestJson(url, fetchImpl) {
+async function requestJson(url, fetchImpl, cratesIoReadGate = null) {
   return request(url, "application/json", fetchImpl, async (response) => {
     const bytes = await boundedResponseBytes(response, MAX_METADATA_RESPONSE_BYTES, url);
     try {
@@ -248,7 +280,7 @@ async function requestJson(url, fetchImpl) {
     } catch (cause) {
       throw new RegistryResponseError(`registry returned invalid JSON for ${url}: ${cause.message}`);
     }
-  });
+  }, cratesIoReadGate);
 }
 
 async function responseSha256(response, maximum, context) {
@@ -320,9 +352,9 @@ function expectedCargoReceipt(carrier) {
   };
 }
 
-async function cargoReceipt(carrier, fetchImpl) {
+async function cargoReceipt(carrier, fetchImpl, cratesIoReadGate) {
   const receipt = expectedCargoReceipt(carrier);
-  const metadata = await requestJson(receipt.registryProof.url, fetchImpl);
+  const metadata = await requestJson(receipt.registryProof.url, fetchImpl, cratesIoReadGate);
   const observed = metadata?.version?.checksum;
   if (observed !== receipt.registryProof.digest) {
     throw error(`${carrier.id} registry checksum mismatch: locked=${receipt.registryProof.digest}, registry=${String(observed)}`);
@@ -788,10 +820,13 @@ export function validateRegistryReceiptEvidence(file, lock, {
   return evidence;
 }
 
-export async function verifyLockedCarrierIntegrity(lock, carrierId, { fetchImpl = fetch } = {}) {
+export async function verifyLockedCarrierIntegrity(lock, carrierId, {
+  fetchImpl = fetch,
+  cratesIoReadGate = DEFAULT_CRATES_IO_READ_GATE,
+} = {}) {
   const carrier = lock.carriers.find((entry) => entry.id === carrierId);
   if (carrier === undefined) throw error(`publication lock has no carrier ${carrierId}`);
-  if (carrier.ecosystem === "cargo") return cargoReceipt(carrier, fetchImpl);
+  if (carrier.ecosystem === "cargo") return cargoReceipt(carrier, fetchImpl, cratesIoReadGate);
   if (carrier.ecosystem === "npm") return npmReceipt(carrier, fetchImpl);
   if (carrier.ecosystem === "maven") return mavenReceipt(carrier, fetchImpl);
   if (carrier.ecosystem === "jsr") return jsrReceipt(carrier, lock, fetchImpl);
@@ -804,6 +839,7 @@ export async function verifyLockedRegistryIntegrity(lock, {
   carrierIds,
   fetchImpl = fetch,
   concurrency = Number(process.env.REGISTRY_INTEGRITY_CONCURRENCY ?? 8),
+  cratesIoReadGate = DEFAULT_CRATES_IO_READ_GATE,
 } = {}) {
   if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 32) {
     throw error(`concurrency must be an integer from 1 through 32, got ${JSON.stringify(concurrency)}`);
@@ -816,7 +852,10 @@ export async function verifyLockedRegistryIntegrity(lock, {
       const index = next;
       next += 1;
       if (index >= carriers.length) return;
-      receipts[index] = await verifyLockedCarrierIntegrity(lock, carriers[index].id, { fetchImpl });
+      receipts[index] = await verifyLockedCarrierIntegrity(lock, carriers[index].id, {
+        fetchImpl,
+        cratesIoReadGate,
+      });
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, carriers.length) }, worker));

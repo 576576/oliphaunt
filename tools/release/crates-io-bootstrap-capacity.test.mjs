@@ -5,6 +5,7 @@ import {
   CRATES_IO_DEFAULT_NEW_CRATE_BURST,
   CRATES_IO_DEFAULT_VERSION_BURST,
   CRATES_IO_NEW_CRATE_REFILL_SECONDS,
+  CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
   REGISTRY_BOOTSTRAP_DEFAULT_CARGO_SECONDS_PER_CARRIER,
   REGISTRY_BOOTSTRAP_DEFAULT_NPM_SECONDS_PER_CARRIER,
   REGISTRY_BOOTSTRAP_DEFAULT_RECONCILIATION_SECONDS_PER_CARRIER,
@@ -18,6 +19,7 @@ import {
   cratesIoCapacitySummary,
   cratesIoVersionCapacitySummary,
   cratesIoTokenBucketSchedule,
+  createCratesIoReadGate,
   inspectCratesIoBootstrapNames,
   inspectCratesIoVersionState,
 } from "./crates-io-bootstrap-capacity.mjs";
@@ -34,6 +36,35 @@ function cargoPlan(names) {
 }
 
 describe("crates.io release capacity gates", () => {
+  test("shares one paced read-start and Retry-After barrier across concurrent workers", async () => {
+    let now = 1_000;
+    const sleeps = [];
+    const starts = [];
+    const gate = createCratesIoReadGate({
+      nowImpl: () => now,
+      sleepImpl: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds / 1000;
+      },
+    });
+
+    await Promise.all(["first", "second", "third"].map(async (label) => {
+      starts.push(await gate.beforeRequest(label, 2_000));
+    }));
+    gate.defer(2);
+    await Promise.all(["after-limit-1", "after-limit-2"].map(async (label) => {
+      starts.push(await gate.beforeRequest(label, 2_000));
+    }));
+
+    expect(starts).toEqual([1_000, 1_000.25, 1_000.5, 1_002.5, 1_002.75]);
+    expect(sleeps).toEqual([
+      CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
+      CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
+      2_000,
+      CRATES_IO_READ_START_INTERVAL_MILLISECONDS,
+    ]);
+  });
+
   test("normal capacity preflight inventories every mutable registry surface and reuses complete ledger receipts", () => {
     const source = readFileSync(
       new URL("../../.github/scripts/check-crates-io-publish-capacity.mjs", import.meta.url),
@@ -515,12 +546,52 @@ describe("crates.io release capacity gates", () => {
     expect(inventory.missingNames).toEqual(["retry-me"]);
     expect(sleeps).toEqual([2_000]);
 
-    await expect(inspectCratesIoBootstrapNames({
+    let rateLimitedCalls = 0;
+    let rateLimitedNow = 1_000;
+    const rateLimitedSleeps = [];
+    const rateLimitedInventory = await inspectCratesIoBootstrapNames({
       plan: cargoPlan(["later"]),
       deadlineEpochSeconds: 10_000,
+      nowImpl: () => rateLimitedNow,
+      sleepImpl: async (milliseconds) => {
+        rateLimitedSleeps.push(milliseconds);
+        rateLimitedNow += milliseconds / 1000;
+      },
+      fetchImpl: async () => {
+        rateLimitedCalls += 1;
+        return rateLimitedCalls === 1
+          ? new Response("", { status: 429, headers: { "Retry-After": "60" } })
+          : new Response("", { status: 404 });
+      },
+    });
+    expect(rateLimitedInventory.missingNames).toEqual(["later"]);
+    expect(rateLimitedSleeps).toEqual([60_000]);
+
+    await expect(inspectCratesIoBootstrapNames({
+      plan: cargoPlan(["too-late"]),
+      deadlineEpochSeconds: 10_000,
       nowImpl: () => 1_000,
-      fetchImpl: async () => new Response("", { status: 429, headers: { "Retry-After": "60" } }),
-    })).rejects.toThrow(/retry the release later/u);
+      fetchImpl: async () => new Response("", { status: 429, headers: { "Retry-After": "181" } }),
+    })).rejects.toThrow(/bounded 180s retry-delay budget/u);
+
+    let sustainedCalls = 0;
+    let sustainedNow = 1_000;
+    const sustainedSleeps = [];
+    await expect(inspectCratesIoBootstrapNames({
+      plan: cargoPlan(["sustained"]),
+      deadlineEpochSeconds: 10_000,
+      nowImpl: () => sustainedNow,
+      sleepImpl: async (milliseconds) => {
+        sustainedSleeps.push(milliseconds);
+        sustainedNow += milliseconds / 1000;
+      },
+      fetchImpl: async () => {
+        sustainedCalls += 1;
+        return new Response("", { status: 429 });
+      },
+    })).rejects.toThrow(/bounded 180s retry-delay budget/u);
+    expect(sustainedCalls).toBe(3);
+    expect(sustainedSleeps).toEqual([60_000, 120_000]);
 
     let deadlineCalls = 0;
     await expect(inspectCratesIoBootstrapNames({

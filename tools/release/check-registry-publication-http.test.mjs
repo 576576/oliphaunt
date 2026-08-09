@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  CRATES_IO_RATE_LIMIT_FALLBACK_SECONDS,
+  CRATES_IO_READ_INTERVAL_SECONDS,
+  CRATES_IO_READ_RETRY_BUDGET_SECONDS,
   boundedRegistrySleep,
+  cratesioUrlExists,
   jsrManagementPackageExists,
   readBoundedRegistryJson,
   registryRequestTimeoutMilliseconds,
@@ -66,6 +70,87 @@ describe("registry publication HTTP response boundary", () => {
       if (previousDeadline === undefined) delete process.env.REGISTRY_MUTATION_DEADLINE_EPOCH;
       else process.env.REGISTRY_MUTATION_DEADLINE_EPOCH = previousDeadline;
     }
+  });
+
+  test("paces every crates.io existence read and honors Retry-After before retrying", async () => {
+    let calls = 0;
+    let now = 1_000_000;
+    const sleeps = [];
+    const exists = await cratesioUrlExists(
+      "https://crates.example.test/api/v1/crates/example/1.0.0",
+      "example 1.0.0",
+      {
+        nowImpl: () => now,
+        sleepImpl: async (milliseconds) => {
+          sleeps.push(milliseconds);
+          now += milliseconds;
+        },
+        fetchImpl: async () => {
+          calls += 1;
+          return calls === 1
+            ? new Response("", { status: 429, headers: { "Retry-After": "2" } })
+            : new Response("", { status: 200 });
+        },
+      },
+    );
+
+    expect(exists).toBe(true);
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([
+      CRATES_IO_READ_INTERVAL_SECONDS * 1000,
+      2_000,
+      CRATES_IO_READ_INTERVAL_SECONDS * 1000,
+    ]);
+  });
+
+  test("uses a conservative bounded crates.io 429 fallback and never retries before an excessive Retry-After", async () => {
+    let calls = 0;
+    let now = 1_000_000;
+    const fallbackSleeps = [];
+    await expect(cratesioUrlExists(
+      "https://crates.example.test/api/v1/crates/absent/1.0.0",
+      "absent 1.0.0",
+      {
+        nowImpl: () => now,
+        sleepImpl: async (milliseconds) => {
+          fallbackSleeps.push(milliseconds);
+          now += milliseconds;
+        },
+        fetchImpl: async () => {
+          calls += 1;
+          return calls === 1
+            ? new Response("", { status: 429 })
+            : new Response("", { status: 404 });
+        },
+      },
+    )).resolves.toBe(false);
+    expect(fallbackSleeps).toEqual([
+      CRATES_IO_READ_INTERVAL_SECONDS * 1000,
+      CRATES_IO_RATE_LIMIT_FALLBACK_SECONDS * 1000,
+      CRATES_IO_READ_INTERVAL_SECONDS * 1000,
+    ]);
+
+    calls = 0;
+    const excessiveSleeps = [];
+    await expect(cratesioUrlExists(
+      "https://crates.example.test/api/v1/crates/later/1.0.0",
+      "later 1.0.0",
+      {
+        nowImpl: () => 1_000_000,
+        sleepImpl: async (milliseconds) => excessiveSleeps.push(milliseconds),
+        fetchImpl: async () => {
+          calls += 1;
+          return new Response("", {
+            status: 429,
+            headers: { "Retry-After": String(CRATES_IO_READ_RETRY_BUDGET_SECONDS + 1) },
+          });
+        },
+      },
+    )).rejects.toThrow(
+      `exceeds its bounded ${CRATES_IO_READ_RETRY_BUDGET_SECONDS}s retry-delay budget`,
+    );
+    expect(calls).toBe(1);
+    expect(excessiveSleeps).toEqual([CRATES_IO_READ_INTERVAL_SECONDS * 1000]);
   });
 
   test("detects a zero-version JSR identity through the credential-free management endpoint", async () => {

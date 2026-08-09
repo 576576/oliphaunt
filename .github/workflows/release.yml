@@ -2463,7 +2463,7 @@ jobs:
 
       - name: Reprove all-registry publication capacity immediately before registry mutation
         id: reprove_registry_capacity
-        timeout-minutes: 3
+        timeout-minutes: 6
         env:
           PRODUCTS_JSON: ${{ steps.registry_inputs.outputs.products_json }}
         run: bun .github/scripts/check-crates-io-publish-capacity.mjs
