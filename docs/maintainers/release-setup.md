@@ -134,6 +134,13 @@ only the live `manage-release-drafts.mjs verify --state staged` read at that
 boundary and rejects staging or promotion there.
 Dry-run and publish share one YAML-anchored step list but remain separate
 permission and environment boundaries.
+For same-version recovery, the read-only dry-run validates every public release
+that is visible to its token and every selected product tag. A GitHub-staged
+boundary additionally requires the complete exact-source tag set and replays
+the pinned failed-run staging artifact; the later `publish` rerun alone uses its
+content-write token to require the complete live draft/public release set before
+any mutation. A hidden draft is therefore never misclassified as absent proof,
+and dry-run does not gain repository write capability merely to list drafts.
 
 The direct continuation DAG does not widen those boundaries.
 `dispatch-bootstrap-continuation` consumes only outputs from
@@ -504,10 +511,12 @@ Publishing is resumable but not cross-registry atomic. On failure, preserve and 
 A zero-owner release-control/test fix after partial immutable publication may
 instead use the documented same-version recovery. It keeps the original
 release commit/tree, exact pinned payload CI inventory, approved lock/capsule,
-and terminal ledger as the publication source. A later current-main controller
-receives fresh full CI and an approved control-equivalence dry-run, but supplies
-only workflow/transport/OIDC/pacing code. Lock replay must be byte-identical to
-the original, including source and lock digest; tags/releases/assets remain
+recorded immutable boundary, and any required terminal ledger as the
+publication source. A later current-main controller receives fresh
+recovery-control CI and an approved control-equivalence dry-run, but supplies
+only workflow/transport/OIDC/pacing code. The original complete payload CI is
+still reverified independently. Lock replay must be byte-identical to the
+original, including source and lock digest; tags/releases/assets remain
 source-bound. Recovery bootstrap and continuations are disabled, and an
 interruption is resumed through an idempotent root `publish` rerun. No matching
 public immutable identity is uploaded again. Use

@@ -2199,8 +2199,10 @@ function assertNormalStageConditions(workflow) {
           '--head-ref "$RELEASE_HEAD_SHA"',
         )
         && productDryRun.env?.CI_RUN_ID
-          === "${{ steps.ci_qualification.outputs.run_id }}",
-      `${jobId} product dry-run registry identity checks must use the verified release source while qualified replay remains controller-bound`,
+          === "${{ steps.release_artifact_source.outputs.ci_run_id }}"
+        && productDryRun.env?.CANDIDATE_MODE
+          === "${{ steps.verify_publication_candidate.outputs.mode }}",
+      `${jobId} product dry-run registry identity checks and qualified replay must use the verified payload source while controller qualification remains separate`,
     );
     for (const id of [
       "verify_oidc_identity",
@@ -3701,9 +3703,11 @@ function assertDryRunEvidence(workflow) {
   const recoveryModeCondition =
     "${{ steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}";
   const recoveryGithubStateCondition =
-    "${{ steps.release_plan.outputs.has_release_changes == 'true' && inputs.operation == 'publish-dry-run' && steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}";
+    "${{ steps.release_plan.outputs.has_release_changes == 'true' && (inputs.operation == 'publish-dry-run' || inputs.operation == 'publish') && steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}";
   const recoveryDryRunCondition =
     "${{ inputs.operation == 'publish-dry-run' && steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}";
+  const recoveryStagedDryRunTagCondition =
+    "${{ steps.release_plan.outputs.has_release_changes == 'true' && inputs.operation == 'publish-dry-run' && steps.verify_publication_candidate.outputs.mode == 'release-recovery' && steps.recovery_source.outputs.recovery_boundary_kind == 'github-staged' }}";
   const recoveryPublishCondition =
     "${{ steps.release_plan.outputs.has_release_changes == 'true' && inputs.operation == 'publish' && steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}";
 
@@ -3846,10 +3850,38 @@ function assertDryRunEvidence(workflow) {
     "same-version recovery must prove selected tags and releases are absent or exact-SHA resumable",
   );
   assertActiveTokens(recoveryGithubState, [
+    '[[ "${{ inputs.operation }}" == publish ]]',
     "recovery-preflight",
+    "recovery-staged-preflight",
     '--products-json "$PRODUCTS_JSON"',
     '--head-ref "$RELEASE_SOURCE_SHA"',
+    "--state staged",
   ], "same-version recovery resumable GitHub-state proof");
+
+  const recoveryStagedDryRunTags = stepById(
+    workflow,
+    "publish",
+    "require_recovery_staged_dry_run_tags",
+  );
+  invariant(
+    normalized(recoveryStagedDryRunTags.step.if) === recoveryStagedDryRunTagCondition
+      && recoveryStagedDryRunTags.step["continue-on-error"] === undefined
+      && recoveryStagedDryRunTags.step["timeout-minutes"] === 1
+      && sameSet(Object.keys(recoveryStagedDryRunTags.step.env ?? {}), [
+        "EXACT_TAG_COUNT",
+        "SELECTED_COUNT",
+      ])
+      && recoveryStagedDryRunTags.step.env?.EXACT_TAG_COUNT
+        === "${{ steps.verify_release_recovery_github_state.outputs.exact_tag_count }}"
+      && recoveryStagedDryRunTags.step.env?.SELECTED_COUNT
+        === "${{ steps.verify_release_recovery_github_state.outputs.selected_count }}"
+      && recoveryGithubState.index < recoveryStagedDryRunTags.index,
+    "read-only GitHub-staged recovery dry-run must require every exact source tag without requesting draft visibility",
+  );
+  assertActiveTokens(recoveryStagedDryRunTags, [
+    '[[ ! "$EXACT_TAG_COUNT" =~ ^[1-9][0-9]*$ || ! "$SELECTED_COUNT" =~ ^[1-9][0-9]*$ ]]',
+    '[[ "$EXACT_TAG_COUNT" != "$SELECTED_COUNT" ]]',
+  ], "read-only GitHub-staged recovery exact-tag proof");
 
   const controllerQualification = stepById(workflow, "publish", "ci_qualification");
   assertActiveTokens(controllerQualification, [
@@ -3987,6 +4019,34 @@ function assertDryRunEvidence(workflow) {
     "--artifact oliphaunt-publication-lock",
   ], "original same-version recovery lock download");
 
+  const stagedBoundary = stepById(
+    workflow,
+    "publish",
+    "verify_github_staged_recovery_boundary",
+  );
+  invariant(
+    normalized(stagedBoundary.step.if)
+      === "${{ steps.download_recovery_original_publication_lock.outcome == 'success' && steps.recovery_source.outputs.recovery_boundary_kind == 'github-staged' }}"
+      && stagedBoundary.step["continue-on-error"] === undefined
+      && stagedBoundary.step["timeout-minutes"] === 5
+      && sameSet(Object.keys(stagedBoundary.step.env ?? {}), [
+        "GH_TOKEN",
+        "RECOVERY_PROVENANCE_RECORD_JSON",
+      ])
+      && stagedBoundary.step.env?.GH_TOKEN === "${{ secrets.GITHUB_TOKEN }}"
+      && stagedBoundary.step.env?.RECOVERY_PROVENANCE_RECORD_JSON
+        === "${{ steps.recovery_source.outputs.record_json }}"
+      && recoveryDownload.index < stagedBoundary.index,
+    "GitHub-staged recovery must reverify its exact pinned failed-run boundary against the approved lock",
+  );
+  assertActiveTokens(stagedBoundary, [
+    'printf \'%s\\n\' "$RECOVERY_PROVENANCE_RECORD_JSON"',
+    "tools/release/verify-github-staged-recovery-boundary.mjs",
+    '--boundary "$RUNNER_TEMP/recovery-boundary.json"',
+    '--approved-lock "$RUNNER_TEMP/recovery-original-publication-lock/publication-lock.json"',
+    '--repo "$GITHUB_REPOSITORY"',
+  ], "pinned GitHub-staged recovery boundary");
+
   const controlApproval = stepById(
     workflow,
     "publish",
@@ -4123,12 +4183,14 @@ function assertDryRunEvidence(workflow) {
       && sameSet(Object.keys(recoveryPublication.step.env ?? {}), ["PRODUCTS_JSON"])
       && recoveryPublication.step.env?.PRODUCTS_JSON
         === "${{ steps.release_plan.outputs.products_json }}",
-    "same-version recovery must prove a nonempty exact public registry prefix",
+    "same-version recovery must prove its exact immutable GitHub-staged or public-registry boundary",
   );
   assertActiveTokens(recoveryPublication, [
     '--lock "$PUBLICATION_LOCK_PATH"',
     "--inventory target/release/recovery-registry-inventory.json",
+    '--immutable-github-tag-count "${{ steps.verify_release_recovery_github_state.outputs.exact_tag_count }}"',
     '--products-json "$PRODUCTS_JSON"',
+    '--recovery-boundary-kind "${{ steps.recovery_source.outputs.recovery_boundary_kind }}"',
     "--output target/release/recovery-evidence/publication-state.json",
     '--github-output "$GITHUB_OUTPUT"',
   ], "same-version recovery partial-publication proof");
@@ -4165,6 +4227,29 @@ function assertDryRunEvidence(workflow) {
     "same-version recovery must have one immutable bootstrap-ledger selector",
   );
   const [ledger] = ledgerDownload;
+  const ledgerRequirement = stepById(
+    workflow,
+    "publish",
+    "require_recovery_bootstrap_ledger",
+  );
+  invariant(
+    normalized(ledgerRequirement.step.if)
+      === "${{ steps.bootstrap_ledger_state.outputs.needs_ledger == 'true' && steps.verify_publication_candidate.outputs.mode == 'release-recovery' }}"
+      && ledgerRequirement.step["continue-on-error"] === undefined
+      && sameSet(Object.keys(ledgerRequirement.step.env ?? {}), [
+        "PINNED_BOOTSTRAP_LEDGER_REQUIRED",
+      ])
+      && ledgerRequirement.step.env?.PINNED_BOOTSTRAP_LEDGER_REQUIRED
+        === "${{ steps.recovery_source.outputs.bootstrap_ledger_required }}"
+      && stagedBoundary.index < ledgerRequirement.index
+      && ledgerRequirement.index < ledger.index,
+    "recovery must reject live bootstrap state that lacks an exact pinned source ledger",
+  );
+  assertActiveTokens(ledgerRequirement, [
+    '[[ "$PINNED_BOOTSTRAP_LEDGER_REQUIRED" != true ]]',
+    "Recovery requires bootstrap evidence",
+    "exit 1",
+  ], "conditional pinned bootstrap ledger requirement");
   invariant(
     normalized(ledger.step.if)
       === "${{ steps.bootstrap_ledger_state.outputs.needs_ledger == 'true' }}"
