@@ -686,9 +686,31 @@ fn selected_extension_aot_packages(
     local_extension_aot_package(package).into_iter().collect()
 }
 
+fn local_extension_product_roots(root: &Path, product: &str) -> [PathBuf; 4] {
+    let packaged = root.join("oliphaunt-extension-package-artifacts");
+    [
+        root.join(ARTIFACT_PRODUCT).join(product),
+        root.join(product),
+        packaged.join(ARTIFACT_PRODUCT).join(product),
+        packaged.join(product),
+    ]
+}
+
+fn find_local_extension_product_root(root: &Path, package: ExtensionPackage) -> Option<PathBuf> {
+    local_extension_product_roots(root, package.product)
+        .into_iter()
+        .find(|candidate| candidate.join("extension-artifacts.json").is_file())
+}
+
 fn local_extension_aot_package(package: ExtensionPackage) -> Option<SelectedExtensionAotPackage> {
     let root = PathBuf::from(env::var_os("OLIPHAUNT_WASIX_EXTENSION_ARTIFACT_ROOT")?);
-    let product_root = root.join(package.product);
+    let product_root = find_local_extension_product_root(&root, package).unwrap_or_else(|| {
+        panic!(
+            "local extension artifact root {} has no manifest for {}",
+            root.display(),
+            package.product,
+        )
+    });
     let product_manifest = product_root.join("extension-artifacts.json");
     let product_value: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(&product_manifest).unwrap_or_else(|error| {
@@ -938,43 +960,29 @@ fn find_local_extension_archive(
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by Cargo");
     let archive_name = format!("{}-{version}-wasix-portable.tar.zst", package.product);
     let roots = if let Some(path) = env::var_os("OLIPHAUNT_WASIX_EXTENSION_ARTIFACT_ROOT") {
-        // An explicit root binds qualification to exact same-run inputs. Do not
-        // silently fall back to stale workspace or package-cache artifacts.
+        // An explicit root takes precedence over workspace and package assets.
         vec![PathBuf::from(path)]
     } else {
         let mut roots = Vec::new();
         if let Some(repo_root) = repo_root {
             roots.push(repo_root.join("target/extension-artifacts"));
-            roots.push(
-                repo_root
-                    .join("target/local-registry-artifacts/oliphaunt-extension-package-artifacts"),
-            );
         }
         roots.push(manifest_dir.join("extension-artifacts"));
         roots
     };
 
     for root in roots {
-        for candidate in [
-            root.join(package.product)
-                .join("member-assets")
-                .join(package.sql_name)
-                .join(&archive_name),
-            root.join(package.product)
-                .join("release-assets")
-                .join(&archive_name),
-            root.join("oliphaunt-extension-package-artifacts")
-                .join(package.product)
-                .join("member-assets")
-                .join(package.sql_name)
-                .join(&archive_name),
-            root.join("oliphaunt-extension-package-artifacts")
-                .join(package.product)
-                .join("release-assets")
-                .join(&archive_name),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
+        for product_root in local_extension_product_roots(&root, package.product) {
+            for candidate in [
+                product_root
+                    .join("member-assets")
+                    .join(package.sql_name)
+                    .join(&archive_name),
+                product_root.join("release-assets").join(&archive_name),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }

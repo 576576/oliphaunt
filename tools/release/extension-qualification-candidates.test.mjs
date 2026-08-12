@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "../test/fd-backed-spawn-sync.mjs";
 
 import {
   extensionArtifactsNativeMatrix,
@@ -19,9 +20,9 @@ import {
   catalogRows,
   selectCatalogExtensions,
 } from "../../src/extensions/artifacts/native/tools/extension-artifact-packager.mjs";
-import { loadPublicationCatalog } from "./publication-catalog.mjs";
-
 const POSTGIS_PRODUCT = "oliphaunt-extension-postgis";
+const CONTRIB_PRODUCT = "oliphaunt-extension-contrib-pg18";
+const ROOT = path.resolve(import.meta.dirname, "../..");
 const NATIVE_TARGETS = [
   "android-arm64-v8a",
   "android-x86_64",
@@ -300,23 +301,22 @@ test("keeps live build matrices candidate-free and PostGIS public", () => {
   assert.equal(csv(wasix[0].extensions_csv).includes(POSTGIS_PRODUCT), true);
 });
 
-test("keeps PostGIS in every public publication and generated runtime surface", () => {
-  const catalog = loadPublicationCatalog("extension-qualification-candidates.test.mjs");
-  assert.equal(catalog.products.length, 18);
-  assert.equal(catalog.carriers.length, 186);
-  assert.equal(catalog.products.some(({ id }) => id === POSTGIS_PRODUCT), true);
-  assert.equal(catalog.carriers.filter(({ product }) => product === POSTGIS_PRODUCT).length, 17);
-
-  for (const file of [
-    "src/extensions/generated/mobile/static-extensions.tsv",
-    "src/extensions/generated/mobile/static-registry.json",
-    "src/extensions/generated/wasix/extensions.json",
-    "src/extensions/generated/sdk/js.json",
-    "src/extensions/generated/sdk/kotlin.json",
-    "src/extensions/generated/sdk/react-native.json",
-    "src/extensions/generated/sdk/rust.json",
-    "src/extensions/generated/sdk/swift.json",
-  ]) {
-    assert.match(readFileSync(file, "utf8"), /postgis/u, `${file} must expose public PostGIS support`);
-  }
+test("focused native contrib planning executes the packager selection contract", () => {
+  const [row] = extensionArtifactsNativeMatrix(
+    "linux-x64-gnu",
+    undefined,
+    new Set([CONTRIB_PRODUCT]),
+  ).include;
+  assert.equal(row.extensions_csv, CONTRIB_PRODUCT);
+  const selected = spawnSync(
+    path.join(ROOT, "tools/dev/bun.sh"),
+    [
+      "src/extensions/artifacts/native/tools/extension-artifact-packager.mjs",
+      "selected-sql-names",
+      row.extensions_csv,
+    ],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+  assert.equal(selected.status, 0, selected.stderr || selected.stdout);
+  assert.equal(selected.stdout.trim(), row.sql_names_csv);
 });

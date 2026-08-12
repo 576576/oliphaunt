@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "../test/fd-backed-spawn-sync.mjs";
 
 import { loadPublicationCatalog, resolveActualCarrier } from "./publication-catalog.mjs";
 import {
   exactExtensionProducts,
+  extensionReleaseProduct,
   extensionWasixAotMemberSqlNames,
 } from "./release-artifact-targets.mjs";
 import {
@@ -14,9 +14,16 @@ import {
   wasixExtensionPackageName,
 } from "./wasix-cargo-artifact-contract.mjs";
 
+function catalogForArtifactProducts(products) {
+  return loadPublicationCatalog("publication-catalog.test", {
+    products: [...new Set(products.map((product) =>
+      extensionReleaseProduct(product, "wasix", "publication-catalog.test")))],
+  });
+}
+
 test("the live publication catalog includes the independently versioned PostGIS product", () => {
   const catalog = loadPublicationCatalog("publication-catalog.test");
-  expect(catalog.products).toHaveLength(18);
+  expect(catalog.products).toHaveLength(17);
   expect(catalog.carriers).toHaveLength(186);
   expect(catalog.products.some(({ id }) => id === "oliphaunt-extension-postgis")).toBe(true);
   expect(catalog.carriers.filter(({ product }) => product === "oliphaunt-extension-postgis")).toHaveLength(17);
@@ -87,13 +94,14 @@ test("native tool target leaves admit exact payload parts while facades remain n
 describe("WASIX extension portable publication carriers", () => {
   test("assigns every independently versioned portable carrier an explicit canonical target", () => {
     const products = exactExtensionProducts("publication-catalog.test");
-    const catalog = loadPublicationCatalog("publication-catalog.test", { products });
+    const catalog = catalogForArtifactProducts(products);
     for (const product of products) {
+      const owner = extensionReleaseProduct(product, "wasix", "publication-catalog.test");
       const name = wasixExtensionPackageName(product);
       const carrier = catalog.carriers.find((candidate) => candidate.name === name);
       expect(carrier).toMatchObject({
         ecosystem: "cargo",
-        product,
+        product: owner,
         role: "portable-leaf",
         target: EXTENSION_PORTABLE_TARGET,
       });
@@ -116,36 +124,20 @@ describe("WASIX extension portable publication carriers", () => {
 describe("WASIX extension AOT publication carriers", () => {
   test("declares the exact host set only for products with native-module members", () => {
     const products = exactExtensionProducts("publication-catalog.test");
-    const catalog = loadPublicationCatalog("publication-catalog.test", { products });
+    const catalog = catalogForArtifactProducts(products);
     const expectedTargets = Object.keys(EXTENSION_AOT_PACKAGE_SUFFIXES).sort();
     for (const product of products) {
       const aotMembers = extensionWasixAotMemberSqlNames(product, "publication-catalog.test");
       const actualTargets = catalog.carriers
-        .filter((carrier) => carrier.product === product && carrier.ecosystem === "cargo" && carrier.role === "aot-leaf")
+        .filter((carrier) =>
+          carrier.ecosystem === "cargo"
+          && carrier.role === "aot-leaf"
+          && carrier.name.startsWith(`${product}-aot-`))
         .map((carrier) => carrier.target)
         .sort();
       expect(actualTargets, `${product} AOT members: ${aotMembers.join(", ") || "none"}`).toEqual(
         aotMembers.length === 0 ? [] : expectedTargets,
       );
-    }
-  });
-
-  test("keeps the bulk package-name query aligned with the publication catalog", () => {
-    const result = spawnSync(
-      process.execPath,
-      ["tools/release/release_graph_query.mjs", "wasix-extension-package-names"],
-      { cwd: import.meta.dir.replace(/\/tools\/release$/u, ""), encoding: "utf8" },
-    );
-    expect(result.status, result.stderr).toBe(0);
-    const rows = JSON.parse(result.stdout);
-    const products = exactExtensionProducts("publication-catalog.test");
-    const catalog = loadPublicationCatalog("publication-catalog.test", { products });
-    for (const row of rows) {
-      const expectedNames = catalog.carriers
-        .filter((carrier) => carrier.product === row.product && carrier.ecosystem === "cargo" && carrier.role === "aot-leaf")
-        .map((carrier) => carrier.name)
-        .sort();
-      expect(row.aotPackages.map(({ packageName }) => packageName).sort(), row.product).toEqual(expectedNames);
     }
   });
 

@@ -10,9 +10,13 @@ import path from "node:path";
 
 import { runMoon } from "../policy/moon.mjs";
 import { captureCommandOutput } from "../dev/capture-command-output.mjs";
+import { CONTRIB_CARRIERS_PATH } from "./contrib-carriers.mjs";
 import {
+  contribCarrierDescriptor,
   expectedAssets as expectedDesktopAssets,
+  extensionArtifactProductRoot,
   extensionMetadata,
+  extensionReleaseProduct,
   extensionSourceIdentity,
   extensionSqlNames,
 } from "./release-artifact-targets.mjs";
@@ -23,19 +27,6 @@ import {
 } from "./publication-lock.mjs";
 import { reserveGitHubCoreRequestSync } from "./github-core-request-journal.mjs";
 import { swiftExtensionCarrierAssetName } from "./ios-carrier-manifest.mjs";
-import {
-  RECOVERY_PROMOTION_PREDICATE_TYPE,
-  createRecoveryPromotionPredicate,
-  normalizeRecoveryPromotionController,
-  recoveryPromotionSubjectsFromLock,
-  validateRecoveryPromotionPredicateEnvelope,
-  validateRecoveryPromotionStatement,
-} from "./recovery-promotion-attestation.mjs";
-import {
-  isSameVersionRecoverySourcesDocument,
-  selectSameVersionRecoverySource,
-  validateSameVersionRecoverySource,
-} from "./same-version-recovery-source.mjs";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const PREFIX = "verify_github_release_attestations.mjs";
@@ -59,8 +50,6 @@ const GITHUB_RELEASE_FALLBACK_QUERY_CONCURRENCY = 1;
 const GH_ATTESTATION_VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
 const GH_ATTESTATION_VERIFY_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const GITHUB_ATTESTATION_RECEIPT_SCHEMA = "oliphaunt-github-release-attestation-receipt-v1";
-const GITHUB_RECOVERY_ATTESTATION_RECEIPT_SCHEMA =
-  "oliphaunt-github-release-attestation-receipt-v2";
 const SLSA_PROVENANCE_V1 = "https://slsa.dev/provenance/v1";
 const IN_TOTO_STATEMENT_V1 = "https://in-toto.io/Statement/v1";
 const GITHUB_RELEASE_ARTIFACT_ROLES = new Set([
@@ -85,6 +74,8 @@ const DESKTOP_TARGETS = new Set([
 const PUBLIC_EXTENSION_RELEASE_MANIFEST_KEYS = new Set([
   "schema",
   "product",
+  "releaseProduct",
+  "family",
   "version",
   "sqlName",
   "extensionClass",
@@ -105,6 +96,10 @@ const PUBLIC_EXTENSION_RELEASE_MANIFEST_KEYS = new Set([
   "desktopReleaseReady",
   "assets",
 ]);
+const EXTENSION_OWNERSHIP_KEYS = ["releaseProduct", "family"];
+const PUBLIC_EXTENSION_RELEASE_LEGACY_KEYS = new Set(
+  [...PUBLIC_EXTENSION_RELEASE_MANIFEST_KEYS].filter((key) => !EXTENSION_OWNERSHIP_KEYS.includes(key)),
+);
 
 const PUBLIC_EXTENSION_RELEASE_ASSET_KEYS = new Set([
   "name",
@@ -118,6 +113,8 @@ const PUBLIC_EXTENSION_RELEASE_ASSET_KEYS = new Set([
 const PUBLIC_EXTENSION_BUNDLE_MANIFEST_KEYS = new Set([
   "schema",
   "product",
+  "releaseProduct",
+  "family",
   "version",
   "extensionClass",
   "versioning",
@@ -126,6 +123,9 @@ const PUBLIC_EXTENSION_BUNDLE_MANIFEST_KEYS = new Set([
   "extensions",
   "assets",
 ]);
+const PUBLIC_EXTENSION_BUNDLE_LEGACY_KEYS = new Set(
+  [...PUBLIC_EXTENSION_BUNDLE_MANIFEST_KEYS].filter((key) => !EXTENSION_OWNERSHIP_KEYS.includes(key)),
+);
 const PUBLIC_EXTENSION_BUNDLE_MEMBER_KEYS = new Set([
   "sqlName",
   "createsExtension",
@@ -364,18 +364,46 @@ function liboliphauntWasixAssets(version) {
   return assets.sort(compareText);
 }
 
-async function expectedExtensionAssets(product, version) {
-  const releaseAssetRoot = path.join(ROOT, "target/extension-artifacts", product, "release-assets");
+async function productTagContains(product, version, relativePath) {
+  const tag = await productTag(product, version);
+  const tree = spawnSync("git", ["cat-file", "-e", `${tag}^{tree}`], {
+    cwd: ROOT,
+    stdio: "ignore",
+  });
+  if (tree.error || tree.status !== 0) {
+    fail(`cannot inspect exact product tag tree ${tag}`);
+  }
+  const entry = spawnSync("git", ["cat-file", "-e", `${tag}:${relativePath}`], {
+    cwd: ROOT,
+    stdio: "ignore",
+  });
+  if (entry.error) fail(`cannot inspect ${relativePath} in exact product tag tree ${tag}`);
+  return entry.status === 0;
+}
+
+async function expectedExtensionAssets(product, version, family = "combined") {
+  const rootFamily = family === "combined" ? "native" : family;
+  const releaseProduct = family === "combined"
+    ? product
+    : extensionReleaseProduct(product, family, PREFIX);
+  const releaseAssetRoot = path.join(
+    ROOT,
+    extensionArtifactProductRoot(product, rootFamily, "target/extension-artifacts", PREFIX),
+    "release-assets",
+  );
   const manifestPath = path.join(releaseAssetRoot, `${product}-${version}-manifest.json`);
   const manifest = await readJson(manifestPath);
-  const extensionAssets = await validateExtensionManifest(product, version, manifest, manifestPath);
+  const extensionAssets = await validateExtensionManifest(product, version, manifest, manifestPath, {
+    family,
+    releaseProduct,
+  });
   const names = extensionAssets.map((asset) => asset.name);
   names.push(
     `${product}-${version}-manifest.json`,
     `${product}-${version}-manifest.properties`,
-    swiftExtensionCarrierAssetName(product, version),
     `${product}-${version}-release-assets.sha256`,
   );
+  if (family !== "wasix") names.push(swiftExtensionCarrierAssetName(product, version));
   return [...new Set(names)].sort(compareText);
 }
 
@@ -385,10 +413,20 @@ async function expectedAssets(product, version) {
     return expectedExtensionAssets(product, version);
   }
   if (product === "liboliphaunt-native") {
-    return liboliphauntNativeAssets(version);
+    const assets = liboliphauntNativeAssets(version);
+    if (await productTagContains(product, version, CONTRIB_CARRIERS_PATH)) {
+      const contrib = contribCarrierDescriptor(PREFIX);
+      assets.push(...await expectedExtensionAssets(contrib.artifactProduct, version, "native"));
+    }
+    return [...new Set(assets)].sort(compareText);
   }
   if (product === "liboliphaunt-wasix") {
-    return liboliphauntWasixAssets(version);
+    const assets = liboliphauntWasixAssets(version);
+    if (await productTagContains(product, version, CONTRIB_CARRIERS_PATH)) {
+      const contrib = contribCarrierDescriptor(PREFIX);
+      assets.push(...await expectedExtensionAssets(contrib.artifactProduct, version, "wasix"));
+    }
+    return [...new Set(assets)].sort(compareText);
   }
   if (product === "oliphaunt-broker") {
     return expectedDesktopAssets(product, "broker-helper", version, PREFIX);
@@ -975,7 +1013,7 @@ function canonicalMemberSemantics(product, sqlName) {
     throw new Error(`${product} does not own extension SQL name ${JSON.stringify(sqlName)}`);
   }
   const row = canonicalExtensionRows().find((candidate) => candidate?.["sql-name"] === sqlName);
-  if (row === undefined || row["release-product"] !== product) {
+  if (row === undefined || row["artifact-product"] !== product) {
     throw new Error(`${product}/${sqlName} is absent from canonical generated extension metadata`);
   }
   const nativeModuleStem = typeof row["native-module-stem"] === "string" && row["native-module-stem"].length > 0
@@ -1054,13 +1092,39 @@ function assertCanonicalMemberSemantics(product, member, context) {
   assertCanonicalIosRegistration(member, expected, context);
 }
 
-export function assertCanonicalExtensionReleaseIdentity(product, version, manifest, context = "extension release manifest") {
+export function assertCanonicalExtensionReleaseIdentity(
+  product,
+  version,
+  manifest,
+  context = "extension release manifest",
+  { family = manifest?.family ?? "combined", releaseProduct = manifest?.releaseProduct ?? product } = {},
+) {
   if (manifest === null || Array.isArray(manifest) || typeof manifest !== "object") {
     throw new Error(`${context} must be an object`);
   }
+  const ownershipFieldCount = EXTENSION_OWNERSHIP_KEYS.filter((key) => manifest[key] !== undefined).length;
   const metadata = extensionMetadata(product, PREFIX);
+  if (ownershipFieldCount !== 0 && ownershipFieldCount !== EXTENSION_OWNERSHIP_KEYS.length) {
+    throw new Error(`${context} must declare releaseProduct and family together`);
+  }
+  if (metadata.versioning === "runtime-bound" && ownershipFieldCount !== EXTENSION_OWNERSHIP_KEYS.length) {
+    throw new Error(`${context} runtime-owned carrier must declare releaseProduct and family`);
+  }
+  if (!["native", "wasix", "combined"].includes(family)) {
+    throw new Error(`${context}.family must be native, wasix, or combined`);
+  }
+  const expectedReleaseProduct = family === "combined"
+    ? product
+    : extensionReleaseProduct(product, family, PREFIX);
+  if (releaseProduct !== expectedReleaseProduct) {
+    throw new Error(`${context}.releaseProduct differs from canonical ${family} ownership`);
+  }
   const expectedRoot = {
     product,
+    ...(ownershipFieldCount === EXTENSION_OWNERSHIP_KEYS.length ? {
+      releaseProduct: expectedReleaseProduct,
+      family,
+    } : {}),
     version,
     extensionClass: metadata.class,
     versioning: metadata.versioning,
@@ -1094,29 +1158,49 @@ export function assertCanonicalExtensionReleaseIdentity(product, version, manife
   throw new Error(`${context} has unsupported extension release manifest schema ${JSON.stringify(manifest.schema)}`);
 }
 
-async function validateExtensionManifest(product, version, manifest, context) {
+async function validateExtensionManifest(
+  product,
+  version,
+  manifest,
+  context,
+  { family = manifest?.family, releaseProduct = manifest?.releaseProduct } = {},
+) {
   try {
-    assertCanonicalExtensionReleaseIdentity(product, version, manifest, context);
+    assertCanonicalExtensionReleaseIdentity(product, version, manifest, context, {
+      family,
+      releaseProduct,
+    });
   } catch (error) {
     fail(error.message);
   }
   const seen = new Set();
   if (manifest.schema === "oliphaunt-extension-release-manifest-v1") {
-    validateKeySet(manifest, PUBLIC_EXTENSION_RELEASE_MANIFEST_KEYS, context);
+    validateKeySet(
+      manifest,
+      manifest.releaseProduct === undefined
+        ? PUBLIC_EXTENSION_RELEASE_LEGACY_KEYS
+        : PUBLIC_EXTENSION_RELEASE_MANIFEST_KEYS,
+      context,
+    );
     validateExtensionAssets(manifest.assets, context, seen);
     return manifest.assets;
   }
   if (manifest.schema !== "oliphaunt-extension-release-manifest-v2") {
     fail(`${context} has unsupported extension release manifest schema ${JSON.stringify(manifest.schema)}`);
   }
-  validateKeySet(manifest, PUBLIC_EXTENSION_BUNDLE_MANIFEST_KEYS, context);
+  validateKeySet(
+    manifest,
+    manifest.releaseProduct === undefined
+      ? PUBLIC_EXTENSION_BUNDLE_LEGACY_KEYS
+      : PUBLIC_EXTENSION_BUNDLE_MANIFEST_KEYS,
+    context,
+  );
   if (!Array.isArray(manifest.extensions) || manifest.extensions.length < 2) {
     fail(`${context}.extensions must be a non-empty bundle member array`);
   }
-  const config = await productConfig(product);
-  const expectedSqlNames = config.extension_sql_names;
+  const expectedSqlNames = extensionSqlNames(product, PREFIX);
   const actualSqlNames = manifest.extensions.map((member) => member?.sqlName);
-  if (!Array.isArray(expectedSqlNames) || stableStringify(actualSqlNames) !== stableStringify(expectedSqlNames)) {
+  if (stableStringify(actualSqlNames) !== stableStringify(expectedSqlNames)) {
     fail(`${context}.extensions must exactly match the sorted release bundle member set`);
   }
   const carriers = validateBundleCarrierAssets(manifest.assets, context, expectedSqlNames.length);
@@ -1764,7 +1848,6 @@ function normalizeAttestationSubjects(subjects, context) {
   if (!Array.isArray(subjects) || subjects.length === 0) {
     throw new Error(`${context} must contain a non-empty subject array`);
   }
-  const names = new Set();
   const keys = new Set();
   const normalized = [];
   for (const [index, subject] of subjects.entries()) {
@@ -1782,10 +1865,9 @@ function normalizeAttestationSubjects(subjects, context) {
     assertKeySet(subject.digest, ["sha256"], `${subjectContext}.digest`);
     const sha256 = requireSha256(subject.digest.sha256, `${subjectContext}.digest.sha256`);
     const key = `${subject.name}\0${sha256}`;
-    if (names.has(subject.name) || keys.has(key)) {
-      throw new Error(`${context} contains duplicate or ambiguous subject ${subject.name}`);
+    if (keys.has(key)) {
+      throw new Error(`${context} contains duplicate subject ${subject.name}/${sha256}`);
     }
-    names.add(subject.name);
     keys.add(key);
     normalized.push({ name: subject.name, sha256 });
   }
@@ -1821,15 +1903,13 @@ export function assertAttestationSubjectCoverage(assets, attestations) {
   const expectedByKey = new Map();
   for (const asset of assets) {
     requireSha256(asset?.sha256, `${asset?.product ?? "<unknown>"}/${asset?.name ?? "<unknown>"} sha256`);
-    if (expectedByName.has(asset.name)) {
-      throw new Error(`frozen GitHub assets contain ambiguous repeated subject name ${asset.name}`);
-    }
     const key = githubAssetSubjectKey(asset);
-    if (expectedByKey.has(key)) {
-      throw new Error(`frozen GitHub assets contain duplicate subject ${asset.name}`);
-    }
-    expectedByName.set(asset.name, asset);
-    expectedByKey.set(key, asset);
+    const namedDigests = expectedByName.get(asset.name) ?? new Set();
+    namedDigests.add(asset.sha256);
+    expectedByName.set(asset.name, namedDigests);
+    const matchingAssets = expectedByKey.get(key) ?? [];
+    matchingAssets.push(asset);
+    expectedByKey.set(key, matchingAssets);
   }
   const covered = new Set();
   const bundleDigests = new Set();
@@ -1845,8 +1925,7 @@ export function assertAttestationSubjectCoverage(assets, attestations) {
     for (const subject of subjects) {
       const key = githubAssetSubjectKey(subject);
       if (!expectedByKey.has(key)) {
-        const expected = expectedByName.get(subject.name);
-        if (expected !== undefined) {
+        if (expectedByName.has(subject.name)) {
           throw new Error(`attestation bundle ${bundleSha256} subject ${subject.name} digest differs from the frozen GitHub asset`);
         }
         throw new Error(`attestation bundle ${bundleSha256} contains non-frozen subject ${subject.name}`);
@@ -1860,7 +1939,7 @@ export function assertAttestationSubjectCoverage(assets, attestations) {
   }
   const missing = [...expectedByKey]
     .filter(([key]) => !covered.has(key))
-    .map(([, asset]) => `${asset.product}/${asset.name}`)
+    .flatMap(([, matchingAssets]) => matchingAssets.map((asset) => `${asset.product}/${asset.name}`))
     .sort(compareText);
   if (missing.length > 0) {
     throw new Error(`frozen GitHub assets are missing signed subjects: ${missing.join(", ")}`);
@@ -1878,55 +1957,9 @@ function githubSignerWorkflow(repo) {
   return `${repo}/.github/workflows/release.yml`;
 }
 
-function normalizeRecoveryPromotionReceipt(lock, attestations, predicate) {
-  validateRecoveryPromotionPredicateEnvelope(predicate);
-  if (
-    predicate.originalLock.schema !== lock.schema
-    || predicate.originalLock.lockDigest !== lock.lockDigest
-    || predicate.originalLock.catalogDigest !== lock.catalogDigest
-    || predicate.originalLock.packageEnvelopeDigest !== lock.packageEnvelopeDigest
-    || predicate.originalLock.source.commit !== lock.source.commit
-    || predicate.originalLock.source.tree !== lock.source.tree
-  ) {
-    throw new Error(
-      "recovery promotion predicate does not match the frozen publication lock",
-    );
-  }
-  if (
-    predicate.controller.source.commit === lock.source.commit
-    || predicate.controller.source.tree === lock.source.tree
-  ) {
-    throw new Error(
-      "recovery promotion receipt requires distinct controller and publication source identities",
-    );
-  }
-  if (attestations.length !== 1) {
-    throw new Error(
-      "recovery promotion receipt requires exactly one custom attestation bundle",
-    );
-  }
-  const [attestation] = attestations;
-  if (
-    stableStringify(attestation.subjects)
-      !== stableStringify(predicate.subjects)
-  ) {
-    throw new Error(
-      "recovery promotion receipt subjects differ from its validated predicate",
-    );
-  }
-  return {
-    bundleSha256: attestation.bundleSha256,
-    controller: predicate.controller,
-    predicate,
-    predicateEvidenceDigest: predicate.evidenceDigest,
-    predicateType: RECOVERY_PROMOTION_PREDICATE_TYPE,
-  };
-}
-
 export function buildGithubAttestationReceipt({
   attestations,
   lock,
-  recoveryPromotionPredicate = undefined,
   releases,
   repo = repository(),
 }) {
@@ -1936,23 +1969,13 @@ export function buildGithubAttestationReceipt({
     frozenGithubReleaseAssets(lock),
     attestations,
   );
-  const recoveryPromotion = recoveryPromotionPredicate === undefined
-    ? undefined
-    : normalizeRecoveryPromotionReceipt(
-        lock,
-        normalizedAttestations,
-        recoveryPromotionPredicate,
-      );
   const receipt = {
     attestations: normalizedAttestations,
     head: lock.source.commit,
     lockDigest: lock.lockDigest,
-    ...(recoveryPromotion === undefined ? {} : { recoveryPromotion }),
     releases: normalizedReleases,
     repository: canonicalRepo,
-    schema: recoveryPromotion === undefined
-      ? GITHUB_ATTESTATION_RECEIPT_SCHEMA
-      : GITHUB_RECOVERY_ATTESTATION_RECEIPT_SCHEMA,
+    schema: GITHUB_ATTESTATION_RECEIPT_SCHEMA,
     signerWorkflow: githubSignerWorkflow(canonicalRepo),
     sourceRef: "refs/heads/main",
     sourceTree: lock.source.tree,
@@ -1963,14 +1986,11 @@ export function buildGithubAttestationReceipt({
 
 export function validateGithubAttestationReceipt(receipt, lock, { repo = repository() } = {}) {
   const canonicalRepo = normalizedRepository(repo);
-  const recoveryReceipt =
-    receipt?.schema === GITHUB_RECOVERY_ATTESTATION_RECEIPT_SCHEMA;
   assertKeySet(receipt, [
     "attestations",
     "head",
     "lockDigest",
     "receiptDigest",
-    ...(recoveryReceipt ? ["recoveryPromotion"] : []),
     "releases",
     "repository",
     "schema",
@@ -1979,10 +1999,7 @@ export function validateGithubAttestationReceipt(receipt, lock, { repo = reposit
     "sourceTree",
   ], "GitHub attestation receipt");
   if (
-    !new Set([
-      GITHUB_ATTESTATION_RECEIPT_SCHEMA,
-      GITHUB_RECOVERY_ATTESTATION_RECEIPT_SCHEMA,
-    ]).has(receipt.schema)
+    receipt.schema !== GITHUB_ATTESTATION_RECEIPT_SCHEMA
     || receipt.repository !== canonicalRepo
     || receipt.head !== lock.source.commit
     || receipt.sourceTree !== lock.source.tree
@@ -2002,22 +2019,6 @@ export function validateGithubAttestationReceipt(receipt, lock, { repo = reposit
     frozenGithubReleaseAssets(lock),
     receipt.attestations,
   );
-  const recoveryPromotion = recoveryReceipt
-    ? normalizeRecoveryPromotionReceipt(
-        lock,
-        attestations,
-        receipt.recoveryPromotion?.predicate,
-      )
-    : undefined;
-  if (
-    recoveryReceipt
-    && stableStringify(recoveryPromotion)
-      !== stableStringify(receipt.recoveryPromotion)
-  ) {
-    throw new Error(
-      "GitHub recovery promotion receipt is not in deterministic canonical form",
-    );
-  }
   if (
     stableStringify(releases) !== stableStringify(receipt.releases)
     || stableStringify(attestations) !== stableStringify(receipt.attestations)
@@ -2033,15 +2034,28 @@ export function assertGithubReleaseSnapshotMatchesReceipt(receipt, releases) {
   }
 }
 
-async function verifyExtensionReleaseAssets(product, version, actualAssets) {
+async function verifyExtensionReleaseAssets(
+  product,
+  releaseProduct,
+  version,
+  family,
+  actualAssets,
+) {
   const manifestName = `${product}-${version}-manifest.json`;
   const propertiesName = `${product}-${version}-manifest.properties`;
   const swiftCarrierName = swiftExtensionCarrierAssetName(product, version);
   const checksumName = `${product}-${version}-release-assets.sha256`;
-  const localManifestPath = path.join(ROOT, "target/extension-artifacts", product, "release-assets", manifestName);
-  const localSwiftCarrierPath = path.join(ROOT, "target/extension-artifacts", product, "release-assets", swiftCarrierName);
+  const rootFamily = family === "combined" ? "native" : family;
+  const localReleaseAssetRoot = path.join(
+    ROOT,
+    extensionArtifactProductRoot(product, rootFamily, "target/extension-artifacts", PREFIX),
+    "release-assets",
+  );
+  const localManifestPath = path.join(localReleaseAssetRoot, manifestName);
+  const localSwiftCarrierPath = path.join(localReleaseAssetRoot, swiftCarrierName);
   const localManifest = await readJson(localManifestPath);
-  const localSwiftCarrier = await readJson(localSwiftCarrierPath);
+  const includeSwiftCarrier = family !== "wasix";
+  const localSwiftCarrier = includeSwiftCarrier ? await readJson(localSwiftCarrierPath) : null;
   const proofs = new Map();
 
   const manifestAsset = actualAssets.get(manifestName);
@@ -2050,22 +2064,25 @@ async function verifyExtensionReleaseAssets(product, version, actualAssets) {
   proofs.set(manifestName, { bytes: manifestBytes.byteLength, sha256: sha256Bytes(manifestBytes) });
   const remoteManifest = JSON.parse(new TextDecoder().decode(manifestBytes));
   if (stableStringify(remoteManifest) !== stableStringify(localManifest)) {
-    fail(`${product} GitHub release ${await productTag(product, version)} public manifest differs from staged manifest`);
+    fail(`${product} GitHub release ${await productTag(releaseProduct, version)} public manifest differs from staged manifest`);
   }
   const extensionAssets = await validateExtensionManifest(
     product,
     version,
     remoteManifest,
     `${product} ${version} public extension manifest`,
+    { family, releaseProduct },
   );
 
-  const swiftCarrierAsset = actualAssets.get(swiftCarrierName);
-  const swiftCarrierSize = expectedAssetSize(swiftCarrierAsset.size, swiftCarrierName, MAX_CONTROL_ASSET_BYTES);
-  const swiftCarrierBytes = await requestBytes(swiftCarrierAsset.url, swiftCarrierName, swiftCarrierSize);
-  proofs.set(swiftCarrierName, { bytes: swiftCarrierBytes.byteLength, sha256: sha256Bytes(swiftCarrierBytes) });
-  const remoteSwiftCarrier = JSON.parse(new TextDecoder().decode(swiftCarrierBytes));
-  if (stableStringify(remoteSwiftCarrier) !== stableStringify(localSwiftCarrier)) {
-    fail(`${product} GitHub release ${await productTag(product, version)} Swift iOS carrier differs from staged carrier`);
+  if (includeSwiftCarrier) {
+    const swiftCarrierAsset = actualAssets.get(swiftCarrierName);
+    const swiftCarrierSize = expectedAssetSize(swiftCarrierAsset.size, swiftCarrierName, MAX_CONTROL_ASSET_BYTES);
+    const swiftCarrierBytes = await requestBytes(swiftCarrierAsset.url, swiftCarrierName, swiftCarrierSize);
+    proofs.set(swiftCarrierName, { bytes: swiftCarrierBytes.byteLength, sha256: sha256Bytes(swiftCarrierBytes) });
+    const remoteSwiftCarrier = JSON.parse(new TextDecoder().decode(swiftCarrierBytes));
+    if (stableStringify(remoteSwiftCarrier) !== stableStringify(localSwiftCarrier)) {
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} Swift iOS carrier differs from staged carrier`);
+    }
   }
 
   const checksumAsset = actualAssets.get(checksumName);
@@ -2076,25 +2093,25 @@ async function verifyExtensionReleaseAssets(product, version, actualAssets) {
   const checksumCoveredNames = new Set(extensionAssets.map((asset) => asset.name));
   checksumCoveredNames.add(manifestName);
   checksumCoveredNames.add(propertiesName);
-  checksumCoveredNames.add(swiftCarrierName);
+  if (includeSwiftCarrier) checksumCoveredNames.add(swiftCarrierName);
   if (
     stableStringify([...checksums.keys()].sort(compareText)) !==
     stableStringify([...checksumCoveredNames].sort(compareText))
   ) {
     fail(
-      `${product} GitHub release ${await productTag(product, version)} checksum manifest must cover release assets exactly`,
+      `${product} GitHub release ${await productTag(releaseProduct, version)} checksum manifest must cover release assets exactly`,
     );
   }
 
   for (const name of [...checksumCoveredNames].sort(compareText)) {
     if (!actualAssets.has(name)) {
-      fail(`${product} GitHub release ${await productTag(product, version)} is missing checksum-covered asset ${name}`);
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} is missing checksum-covered asset ${name}`);
     }
     const actualAsset = actualAssets.get(name);
     const manifestAsset = extensionAssets.find((asset) => asset.name === name);
     const remoteSize = expectedAssetSize(actualAsset.size, name);
     if (manifestAsset !== undefined && remoteSize !== manifestAsset.bytes) {
-      fail(`${product} GitHub release ${await productTag(product, version)} asset ${name} size metadata mismatch`);
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} asset ${name} size metadata mismatch`);
     }
     let proof = proofs.get(name);
     if (proof === undefined) {
@@ -2102,17 +2119,17 @@ async function verifyExtensionReleaseAssets(product, version, actualAssets) {
       proofs.set(name, proof);
     }
     if (proof.sha256 !== checksums.get(name)) {
-      fail(`${product} GitHub release ${await productTag(product, version)} asset ${name} checksum mismatch`);
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} asset ${name} checksum mismatch`);
     }
     if (remoteSize !== proof.bytes) {
-      fail(`${product} GitHub release ${await productTag(product, version)} asset ${name} size mismatch`);
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} asset ${name} size mismatch`);
     }
   }
 
   for (const asset of extensionAssets) {
     const proof = proofs.get(asset.name);
     if (proof.bytes !== asset.bytes || proof.sha256 !== asset.sha256) {
-      fail(`${product} GitHub release ${await productTag(product, version)} asset ${asset.name} public manifest mismatch`);
+      fail(`${product} GitHub release ${await productTag(releaseProduct, version)} asset ${asset.name} public manifest mismatch`);
     }
   }
 }
@@ -2134,7 +2151,18 @@ async function verifyReleaseAssets(product, version, assets) {
   }
   const config = await productConfig(product);
   if (["exact-extension-artifact", "exact-extension-bundle"].includes(config.kind)) {
-    await verifyExtensionReleaseAssets(product, version, actualAssets);
+    await verifyExtensionReleaseAssets(product, product, version, "combined", actualAssets);
+  } else if (product === "liboliphaunt-native" || product === "liboliphaunt-wasix") {
+    const contrib = contribCarrierDescriptor(PREFIX);
+    if (assets.includes(`${contrib.artifactProduct}-${version}-manifest.json`)) {
+      await verifyExtensionReleaseAssets(
+        contrib.artifactProduct,
+        product,
+        version,
+        product === "liboliphaunt-native" ? "native" : "wasix",
+        actualAssets,
+      );
+    }
   }
   console.log(`${product} GitHub release assets verified for ${tag}: ${assets.join(", ")}`);
 }
@@ -2188,22 +2216,9 @@ function decodeBundleStatement(bundle, context) {
   return statement;
 }
 
-function statementSubjects(statement, context, {
-  recoveryExpectations = undefined,
-} = {}) {
+function statementSubjects(statement, context) {
   if (statement._type !== IN_TOTO_STATEMENT_V1) {
     throw new Error(`${context} must be an in-toto v1 statement`);
-  }
-  if (recoveryExpectations !== undefined) {
-    if (statement.predicateType !== RECOVERY_PROMOTION_PREDICATE_TYPE) {
-      throw new Error(
-        `${context} must use the approved same-version recovery predicate type`,
-      );
-    }
-    return validateRecoveryPromotionStatement(
-      statement,
-      recoveryExpectations,
-    ).subjects;
   }
   if (statement.predicateType !== SLSA_PROVENANCE_V1) {
     throw new Error(`${context} must be an in-toto v1 SLSA provenance v1 statement`);
@@ -2236,7 +2251,6 @@ export function ghBundleVerifyArgs({
   bundlePath,
   file,
   head,
-  predicateType = SLSA_PROVENANCE_V1,
   repo,
 }) {
   if (typeof head !== "string" || !/^[0-9a-f]{40}$/u.test(head)) {
@@ -2257,7 +2271,7 @@ export function ghBundleVerifyArgs({
     "--format",
     "json",
     "--predicate-type",
-    predicateType,
+    SLSA_PROVENANCE_V1,
     "--signer-workflow",
     githubSignerWorkflow(canonicalRepo),
     "--signer-digest",
@@ -2275,15 +2289,12 @@ function runGhBundleVerification({
   bundlePath,
   file,
   head,
-  predicateType,
-  recoveryExpectations,
   repo,
 }) {
   const args = ghBundleVerifyArgs({
     bundlePath,
     file,
     head,
-    predicateType,
     repo,
   });
   const result = captureCommandOutput("gh", args, {
@@ -2312,15 +2323,10 @@ function runGhBundleVerification({
   );
   const statement = verified.verificationResult?.statement;
   requireObject(statement, `gh verification statement for ${bundlePath}`);
-  return statementSubjects(
-    statement,
-    `gh verified statement for ${bundlePath}`,
-    { recoveryExpectations },
-  );
+  return statementSubjects(statement, `gh verified statement for ${bundlePath}`);
 }
 
 export async function verifyAttestationBundles(lock, bundlePaths, {
-  recoveryExpectations = undefined,
   repo = repository(),
   verifyBundleImpl = runGhBundleVerification,
 } = {}) {
@@ -2333,14 +2339,7 @@ export async function verifyAttestationBundles(lock, bundlePaths, {
     throw new Error("attestation bundles contaminate a release selection with no frozen GitHub assets");
   }
   const expectedByKey = new Map(assets.map((asset) => [githubAssetSubjectKey(asset), asset]));
-  const predicateType = recoveryExpectations === undefined
-    ? SLSA_PROVENANCE_V1
-    : RECOVERY_PROMOTION_PREDICATE_TYPE;
-  const signerHead = recoveryExpectations === undefined
-    ? lock.source.commit
-    : normalizeRecoveryPromotionController(
-        recoveryExpectations.controller,
-      ).source.commit;
+  const signerHead = lock.source.commit;
   const records = [];
   const suppliedPaths = new Set();
   const suppliedDigests = new Set();
@@ -2360,7 +2359,6 @@ export async function verifyAttestationBundles(lock, bundlePaths, {
     const untrustedSubjects = statementSubjects(
       decodeBundleStatement(bundle, `attestation bundle ${bundlePath}`),
       `unverified statement for ${bundlePath}`,
-      { recoveryExpectations },
     );
     const representatives = untrustedSubjects
       .map((subject) => expectedByKey.get(githubAssetSubjectKey(subject)))
@@ -2375,8 +2373,6 @@ export async function verifyAttestationBundles(lock, bundlePaths, {
       bundlePath: absolute,
       file,
       head: signerHead,
-      predicateType,
-      recoveryExpectations,
       repo: canonicalRepo,
     });
     if (stableStringify(verifiedSubjects) !== stableStringify(untrustedSubjects)) {
@@ -2409,7 +2405,7 @@ export async function writeImmutableReceipt(file, receipt, {
     try {
       // Linking a fully-written temporary inode publishes the receipt in one
       // filesystem operation. An interruption can leave a disposable temp,
-      // never a truncated immutable target that blocks safe recovery.
+      // never a truncated immutable target that blocks a safe rerun.
       await linkImpl(temporary, absolute);
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
@@ -2450,9 +2446,6 @@ function parseReceiptArgs(command, argv) {
     productsJson: undefined,
     publicationLock: undefined,
     receipt: undefined,
-    recoveryApproval: undefined,
-    recoveryController: undefined,
-    recoveryProvenance: undefined,
     repo: repository(),
   };
   const assign = (key, value, flag) => {
@@ -2479,12 +2472,6 @@ function parseReceiptArgs(command, argv) {
       assign("publicationLock", value, flag);
     } else if (flag === "--receipt") {
       assign("receipt", value, flag);
-    } else if (flag === "--recovery-approval") {
-      assign("recoveryApproval", value, flag);
-    } else if (flag === "--recovery-controller") {
-      assign("recoveryController", value, flag);
-    } else if (flag === "--recovery-provenance") {
-      assign("recoveryProvenance", value, flag);
     } else if (flag === "--repo") {
       assign("repo", value, flag);
     } else if (flag === "--help" || flag === "-h") {
@@ -2507,30 +2494,6 @@ function parseReceiptArgs(command, argv) {
   }
   if (command === "finalize" && (args.output !== undefined || args.attestationBundles.length > 0)) {
     throw new Error("finalize does not accept --output or --attestation-bundle");
-  }
-  const recoveryInputs = [
-    args.recoveryApproval,
-    args.recoveryController,
-    args.recoveryProvenance,
-  ];
-  const recoveryInputCount = recoveryInputs.filter((value) => value !== undefined).length;
-  if (![0, recoveryInputs.length].includes(recoveryInputCount)) {
-    throw new Error(
-      "same-version recovery requires --recovery-approval, "
-        + "--recovery-controller, and --recovery-provenance together",
-    );
-  }
-  if (command === "finalize" && recoveryInputCount > 0) {
-    throw new Error("finalize does not accept same-version recovery input files");
-  }
-  if (
-    command === "pre-mutation"
-    && recoveryInputCount > 0
-    && args.attestationBundles.length !== 1
-  ) {
-    throw new Error(
-      "same-version recovery requires exactly one custom promotion attestation bundle",
-    );
   }
   return args;
 }
@@ -2555,52 +2518,8 @@ function assertRequestedProducts(lock, productsJson) {
 
 function receiptUsage() {
   console.log("usage:");
-  console.log("  tools/release/verify_github_release_attestations.mjs pre-mutation --publication-lock FILE --head-ref REF --output FILE [--products-json JSON] [--attestation-bundle FILE ...] [--recovery-controller FILE --recovery-provenance FILE --recovery-approval FILE]");
+  console.log("  tools/release/verify_github_release_attestations.mjs pre-mutation --publication-lock FILE --head-ref REF --output FILE [--products-json JSON] [--attestation-bundle FILE ...]");
   console.log("  tools/release/verify_github_release_attestations.mjs finalize --publication-lock FILE --head-ref REF --receipt FILE [--products-json JSON]");
-}
-
-async function loadRecoveryAttestationExpectations(args, lock) {
-  if (args.recoveryController === undefined) return undefined;
-  const read = async (file, context) =>
-    parseJsonBytes(
-      await readBoundedRegularFile(
-        path.resolve(file),
-        MAX_ATTESTATION_RECEIPT_BYTES,
-        context,
-      ),
-      context,
-    );
-  const controller = normalizeRecoveryPromotionController(
-    await read(args.recoveryController, "same-version recovery controller"),
-  );
-  const recoveryApproval = await read(
-    args.recoveryApproval,
-    "same-version recovery approval",
-  );
-  const provenance = await read(
-    args.recoveryProvenance,
-    "same-version recovery provenance",
-  );
-  let provenanceRecord;
-  if (isSameVersionRecoverySourcesDocument(provenance)) {
-    provenanceRecord = selectSameVersionRecoverySource(
-      provenance,
-      lock.source.commit,
-    );
-  } else {
-    provenanceRecord = validateSameVersionRecoverySource(provenance);
-    if (provenanceRecord.releaseSource.commit !== lock.source.commit) {
-      throw new Error(
-        "same-version recovery provenance does not match the publication lock source",
-      );
-    }
-  }
-  return {
-    controller,
-    lock,
-    provenanceRecord,
-    recoveryApproval,
-  };
 }
 
 async function receiptMain(command, argv) {
@@ -2614,26 +2533,15 @@ async function receiptMain(command, argv) {
   assertRequestedProducts(lock, args.productsJson);
   const repo = normalizedRepository(args.repo);
   if (command === "pre-mutation") {
-    const recoveryExpectations = await loadRecoveryAttestationExpectations(
-      args,
-      lock,
-    );
     const releases = await queryLockedGithubReleases(lock, { repo });
     const attestations = await verifyAttestationBundles(
       lock,
       args.attestationBundles,
-      { recoveryExpectations, repo },
+      { repo },
     );
-    const recoveryPromotionPredicate = recoveryExpectations === undefined
-      ? undefined
-      : createRecoveryPromotionPredicate({
-          ...recoveryExpectations,
-          subjects: recoveryPromotionSubjectsFromLock(lock),
-        });
     const receipt = buildGithubAttestationReceipt({
       attestations,
       lock,
-      recoveryPromotionPredicate,
       releases,
       repo,
     });

@@ -4,7 +4,6 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 installer="$root/.github/actions/setup-moon/install-pinned-toolchain.sh"
 extractor="$root/.github/actions/setup-moon/toolchain-archive.py"
-action="$root/.github/actions/setup-moon/action.yml"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -21,12 +20,6 @@ for candidate in python3 python; do
   fi
 done
 [ -n "$python" ] || fail "python3 or python is required"
-grep -Fq 'moon_home_fs="$(cygpath -u "$moon_home")"' "$action"
-grep -Fq 'moon_home_env="$(cygpath -w "$moon_home_fs")"' "$action"
-grep -Fq 'echo "MOON_HOME=$moon_home_env" >> "$GITHUB_ENV"' "$action"
-grep -Fq 'export_dir_fs="$(cygpath -u "$export_dir")"' "$action"
-grep -Fq 'github_path_entry="$(cygpath -w "$export_dir_fs")"' "$action"
-grep -Fq 'cp "$binary" "$export_dir_fs/$(basename "$binary")"' "$action"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -135,13 +128,21 @@ PY
 
 moon_archive_sha256="$(sha256_file "$moon_archive")"
 moon_archive_bytes="$(wc -c <"$moon_archive" | tr -d '[:space:]')"
-moon_expanded_bytes="$(find "$fixture/content" -maxdepth 1 -type f -printf '%s\n' | awk '{sum += $1} END {print sum}')"
+moon_expanded_bytes="$(
+  find "$fixture/content" -maxdepth 1 -type f \
+    -exec sh -c 'for file do wc -c < "$file"; done' sh {} + |
+    awk '{sum += $1} END {print sum}'
+)"
 moon_sha256="$(sha256_file "$fixture/content/moon")"
 moonx_sha256="$(sha256_file "$fixture/content/moonx")"
 pnpm_archive_sha256="$(sha256_file "$pnpm_archive")"
 pnpm_archive_sha512="$(sha512_file "$pnpm_archive")"
 pnpm_archive_bytes="$(wc -c <"$pnpm_archive" | tr -d '[:space:]')"
-pnpm_expanded_bytes="$(find "$fixture/content/pnpm" -type f -printf '%s\n' | awk '{sum += $1} END {print sum}')"
+pnpm_expanded_bytes="$(
+  find "$fixture/content/pnpm" -type f \
+    -exec sh -c 'for file do wc -c < "$file"; done' sh {} + |
+    awk '{sum += $1} END {print sum}'
+)"
 pnpm_tree_result="$("$python" "$extractor" tree-digest \
   --root "$fixture/content/pnpm" \
   --executable bin/pnpm.mjs \

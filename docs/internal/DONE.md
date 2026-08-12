@@ -1013,13 +1013,12 @@ Latest local release work:
   AOT packs, so a normal `oliphaunt-wasix` install resolves the target-independent
   `liboliphaunt-wasix-portable` crate plus only the current platform's
   `liboliphaunt-wasix-aot-*` crate;
-- source-only `tools/policy/check-rust-test-topology.sh` no longer runs broad
-  Cargo product validation from the root policy lane. `pnpm moon run
-  liboliphaunt-wasix:smoke` is now the hard runtime gate and requires portable
+- Rust product validation runs in product-owned tasks. `pnpm moon run
+  liboliphaunt-wasix:smoke` is the hard runtime gate and requires portable
   assets plus the host AOT pack;
 - `.github/scripts/download-wasix-runtime-build-artifacts.mjs` is a thin wrapper
-  over `xtask assets download`; exact-SHA, latest-compatible, host-target, and
-  all-target WASIX runtime artifact downloads share one implementation;
+  over `xtask assets download`; exact-SHA, host-target, and all-target WASIX
+  runtime artifact downloads share one implementation;
 - AOT serialization is now owned by a maintainer-only `xtask` feature. The
   normal runtime tree keeps headless Wasmer loading, while
   `xtask --features aot-serializer` is the only path that enables Wasmer LLVM;

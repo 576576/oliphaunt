@@ -9,13 +9,13 @@ import {
   dependentReleaseClosure,
   planDependentReleaseCandidates,
   synchronizeDependentReleaseCandidates,
+  synchronizeReleaseCandidates,
   withDependentReleaseClosure,
 } from "./release-dependent-candidates.mjs";
 import { buildPlan, loadGraph } from "./release-graph.mjs";
 
 const NATIVE = "liboliphaunt-native";
 const WASIX = "liboliphaunt-wasix";
-const CONTRIB = "oliphaunt-extension-contrib-pg18";
 const WASIX_RUST = "oliphaunt-wasix-rust";
 const RUST = "oliphaunt-rust";
 const BROKER = "oliphaunt-broker";
@@ -47,7 +47,6 @@ function topologyGraph(overrides = {}) {
   const products = {
     [NATIVE]: product(NATIVE, versions[NATIVE]),
     [WASIX]: product(WASIX, versions[WASIX]),
-    [CONTRIB]: product(CONTRIB, versions[CONTRIB], { extension: { class: "contrib" } }),
     [WASIX_RUST]: product(WASIX_RUST, versions[WASIX_RUST]),
     [RUST]: product(RUST, versions[RUST], {
       compatibility_versions: {
@@ -69,11 +68,6 @@ function topologyGraph(overrides = {}) {
   const moon_projects = {
     [NATIVE]: project(NATIVE),
     [WASIX]: project(WASIX),
-    [CONTRIB]: project(
-      CONTRIB,
-      [NATIVE, WASIX],
-      { [NATIVE]: "production", [WASIX]: "production" },
-    ),
     [WASIX_RUST]: project(WASIX_RUST, [WASIX], { [WASIX]: "production" }),
     [RUST]: project(RUST, [NATIVE], { [NATIVE]: "production" }),
     [BROKER]: project(BROKER, [NATIVE, RUST], { [NATIVE]: "production", [RUST]: "production" }),
@@ -93,17 +87,19 @@ function set(value) {
   return new Set(value);
 }
 
-test("runtime-only closure includes linked runtimes and every true downstream consumer", () => {
+test("native closure includes its directed consumers without forcing WASIX", () => {
   const closure = dependentReleaseClosure(topologyGraph(), [NATIVE], { prefix: "closure-test" });
   assert.deepEqual(
     set(closure.requiredProducts),
-    set([NATIVE, WASIX, CONTRIB, WASIX_RUST, RUST, BROKER, JS, SWIFT, REACT_NATIVE, EXTERNAL]),
+    set([NATIVE, RUST, BROKER, JS, SWIFT, REACT_NATIVE, EXTERNAL]),
   );
   assert.deepEqual(
     closure.reasons[EXTERNAL].map(({ kind, sourceProduct }) => [kind, sourceProduct]),
-    [["compatibility", NATIVE], ["compatibility", WASIX]],
-    "build-scoped Moon edges do not select the external extension, but directed compatibility fields do",
+    [["compatibility", NATIVE]],
+    "only the selected runtime's directed compatibility edge applies",
   );
+  assert.equal(closure.requiredProducts.includes(WASIX), false);
+  assert.equal(closure.requiredProducts.includes(WASIX_RUST), false);
 });
 
 test("the real runtime plan distinguishes Moon build impact from the final publish fixed point", () => {
@@ -134,15 +130,42 @@ test("the real runtime plan distinguishes Moon build impact from the final publi
       true,
     );
   }
-  assert.equal(plan.requiredReleaseProducts.includes(WASIX_RUST), true);
+  assert.equal(plan.requiredReleaseProducts.includes(WASIX), false);
+  assert.equal(plan.requiredReleaseProducts.includes(WASIX_RUST), false);
 });
 
-test("WASIX-only closure reaches the same linked runtime fixed point", () => {
-  const closure = dependentReleaseClosure(topologyGraph(), [WASIX], { prefix: "closure-test" });
-  assert.deepEqual(
-    set(closure.requiredProducts),
-    set([NATIVE, WASIX, CONTRIB, WASIX_RUST, RUST, BROKER, JS, SWIFT, REACT_NATIVE, EXTERNAL]),
+test("shared contrib source directly selects both runtime owners and no contrib release product", () => {
+  const graph = loadGraph("release-dependent-candidates.test");
+  const plan = buildPlan(
+    graph,
+    ["src/extensions/contrib/postgres18.toml"],
+    "release-dependent-candidates.test",
   );
+  assert.deepEqual(plan.directProducts, [NATIVE, WASIX]);
+  assert.equal(Object.hasOwn(graph.products, "oliphaunt-extension-contrib-pg18"), false);
+  assert.equal(graph.moon_projects[NATIVE].dependsOn.includes(WASIX), false);
+  assert.equal(graph.moon_projects[WASIX].dependsOn.includes(NATIVE), false);
+  for (const file of [
+    "src/postgres/versions/18/source.toml",
+    "src/extensions/contrib/amcheck/targets/artifacts.toml",
+    "src/shared/extension-runtime-contract/contract.toml",
+  ]) {
+    assert.deepEqual(
+      buildPlan(graph, [file], "release-dependent-candidates.test").directProducts,
+      [NATIVE, WASIX],
+    );
+  }
+  for (const file of ["src/extensions/contrib/amcheck/moon.yml", "src/extensions/contrib/moon.yml"]) {
+    const metadataPlan = buildPlan(graph, [file], "release-dependent-candidates.test");
+    assert.deepEqual(metadataPlan.directProducts, []);
+    assert.deepEqual(metadataPlan.releaseProducts, []);
+  }
+});
+
+test("WASIX closure includes its directed consumers without forcing native", () => {
+  const closure = dependentReleaseClosure(topologyGraph(), [WASIX], { prefix: "closure-test" });
+  assert.deepEqual(set(closure.requiredProducts), set([WASIX, WASIX_RUST, EXTERNAL]));
+  assert.equal(closure.requiredProducts.includes(NATIVE), false);
 });
 
 test("Rust-only closure follows production consumers and terminates across a compatibility cycle", () => {
@@ -194,16 +217,16 @@ test("an otherwise-missing first release fails closed instead of guessing policy
   );
 });
 
-test("planner refuses to replace incomplete Release Please linked candidates", () => {
+test("planner does not synthesize the independent WASIX runtime from a native transition", () => {
   const graph = topologyGraph({ versions: { [NATIVE]: "1.1.0" } });
-  assert.throws(
-    () => planDependentReleaseCandidates(
-      graph,
-      [{ product: NATIVE, packagePath: graph.products[NATIVE].path, before: "1.0.0", after: "1.1.0" }],
-      { prefix: "closure-test" },
-    ),
-    /linked runtime candidates are incomplete.*liboliphaunt-wasix.*oliphaunt-extension-contrib-pg18/u,
+  const plan = planDependentReleaseCandidates(
+    graph,
+    [{ product: NATIVE, packagePath: graph.products[NATIVE].path, before: "1.0.0", after: "1.1.0" }],
+    { prefix: "closure-test" },
   );
+  assert.equal(plan.requiredProducts.includes(WASIX), false);
+  assert.equal(plan.requiredProducts.includes(WASIX_RUST), false);
+  assert.equal(plan.candidates.some(({ product }) => product === EXTERNAL), true);
 });
 
 test("planner rejects SemVer components outside the safe integer range", () => {
@@ -229,6 +252,220 @@ function write(root, relative, contents) {
 function read(root, relative) {
   return readFileSync(path.join(root, relative), "utf8");
 }
+
+function singleProductRelease(root, version, changelog) {
+  const packagePath = "packages/native";
+  const graph = {
+    products: {
+      [NATIVE]: {
+        path: packagePath,
+        version,
+        version_files: [`${packagePath}/VERSION`],
+        changelog_path: `${packagePath}/CHANGELOG.md`,
+      },
+    },
+  };
+  const releasePleaseConfig = {
+    packages: {
+      [packagePath]: {
+        component: NATIVE,
+        "release-type": "simple",
+        "version-file": "VERSION",
+        "changelog-path": "CHANGELOG.md",
+      },
+    },
+  };
+  const manifest = { [packagePath]: version };
+  write(root, `${packagePath}/VERSION`, `${version}\n`);
+  write(root, `${packagePath}/CHANGELOG.md`, changelog);
+  write(root, ".release-please-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+  return { graph, manifest, packagePath, releasePleaseConfig };
+}
+
+function sharedSourceCandidate(packagePath, before, after) {
+  return {
+    product: NATIVE,
+    packagePath,
+    before,
+    after,
+    changelogMode: "merge-existing",
+    changelogSection: "Features",
+    reasons: [{
+      kind: "shared-source",
+      commit: "1234567890abcdef",
+      summary: "add a bundled SQL capability",
+    }],
+  };
+}
+
+test("shared-source candidates reuse the release writer with an outcome-specific changelog", (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-shared-contrib-candidate-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const packagePath = "packages/native";
+  const graph = {
+    products: {
+      [NATIVE]: {
+        path: packagePath,
+        version: "1.0.0",
+        version_files: [`${packagePath}/VERSION`],
+        changelog_path: `${packagePath}/CHANGELOG.md`,
+      },
+    },
+  };
+  const releasePleaseConfig = {
+    packages: {
+      [packagePath]: {
+        component: NATIVE,
+        "release-type": "simple",
+        "version-file": "VERSION",
+        "changelog-path": "CHANGELOG.md",
+      },
+    },
+  };
+  const manifest = { [packagePath]: "1.0.0" };
+  write(root, `${packagePath}/VERSION`, "1.0.0\n");
+  write(root, `${packagePath}/CHANGELOG.md`, "# Changelog\n\n## 1.0.0\n");
+  write(root, ".release-please-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+
+  synchronizeReleaseCandidates({
+    root,
+    graph,
+    candidates: [{
+      product: NATIVE,
+      packagePath,
+      before: "1.0.0",
+      after: "1.0.1",
+      changelogSection: "Bug Fixes",
+      reasons: [{
+        kind: "shared-source",
+        commit: "1234567890abcdef",
+        summary: "update PostgreSQL source baseline",
+      }],
+    }],
+    releasePleaseConfig,
+    manifest,
+    write: true,
+    prefix: "shared-source-test",
+  });
+
+  assert.equal(read(root, `${packagePath}/VERSION`), "1.0.1\n");
+  assert.match(
+    read(root, `${packagePath}/CHANGELOG.md`),
+    /### Bug Fixes[\s\S]*\* \*\*contrib:\*\* shared contrib carrier source: update PostgreSQL source baseline \(12345678\)/u,
+  );
+});
+
+test("shared-source reasons merge into an existing sufficient release without changing its version", (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-shared-contrib-merge-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const state = singleProductRelease(
+    root,
+    "1.1.0",
+    [
+      "# Changelog",
+      "",
+      "## [1.1.0](https://example.test/compare/v1.0.0...v1.1.0) (2026-08-12)",
+      "",
+      "### Features",
+      "",
+      "* **native:** preserve the existing runtime fix",
+      "",
+      "## 1.0.0",
+      "",
+    ].join("\n"),
+  );
+  const candidate = sharedSourceCandidate(state.packagePath, "1.1.0", "1.1.0");
+  const synchronize = (writeChanges) => synchronizeReleaseCandidates({
+    root,
+    graph: state.graph,
+    candidates: [candidate],
+    releasePleaseConfig: state.releasePleaseConfig,
+    manifest: state.manifest,
+    write: writeChanges,
+    prefix: "shared-source-merge-test",
+  });
+
+  assert.deepEqual(
+    synchronize(false).map(({ path: file }) => path.relative(root, file)),
+    [`${state.packagePath}/CHANGELOG.md`],
+  );
+  synchronize(true);
+
+  assert.equal(read(root, `${state.packagePath}/VERSION`), "1.1.0\n");
+  assert.deepEqual(JSON.parse(read(root, ".release-please-manifest.json")), state.manifest);
+  assert.match(
+    read(root, `${state.packagePath}/CHANGELOG.md`),
+    /## \[1\.1\.0\][\s\S]*### Features[\s\S]*\* \*\*contrib:\*\* shared contrib carrier source: add a bundled SQL capability \(12345678\)/u,
+  );
+  assert.match(
+    read(root, `${state.packagePath}/CHANGELOG.md`),
+    /\* \*\*native:\*\* preserve the existing runtime fix/u,
+  );
+  assert.deepEqual(synchronize(false), [], "re-running the merge is idempotent");
+});
+
+test("shared-source promotion retitles an existing release and preserves its changelog", (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-shared-contrib-promote-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const state = singleProductRelease(
+    root,
+    "1.0.1",
+    [
+      "# Changelog",
+      "",
+      "## [1.0.1](https://example.test/compare/v1.0.0...v1.0.1) (2026-08-12)",
+      "",
+      "### Bug Fixes",
+      "",
+      "* **native:** preserve the existing runtime fix",
+      "",
+      "## 1.0.0",
+      "",
+    ].join("\n"),
+  );
+  const candidate = sharedSourceCandidate(state.packagePath, "1.0.1", "1.1.0");
+
+  synchronizeReleaseCandidates({
+    root,
+    graph: state.graph,
+    candidates: [candidate],
+    releasePleaseConfig: state.releasePleaseConfig,
+    manifest: state.manifest,
+    write: true,
+    prefix: "shared-source-promotion-test",
+  });
+
+  assert.equal(read(root, `${state.packagePath}/VERSION`), "1.1.0\n");
+  assert.deepEqual(JSON.parse(read(root, ".release-please-manifest.json")), {
+    [state.packagePath]: "1.1.0",
+  });
+  const changelog = read(root, `${state.packagePath}/CHANGELOG.md`);
+  assert.match(
+    changelog,
+    /## \[1\.1\.0\]\(https:\/\/example\.test\/compare\/v1\.0\.0\.\.\.v1\.1\.0\) \(2026-08-12\)/u,
+  );
+  assert.doesNotMatch(changelog, /^## \[1\.0\.1\]/mu);
+  assert.match(changelog, /\* \*\*native:\*\* preserve the existing runtime fix/u);
+  assert.match(
+    changelog,
+    /### Features[\s\S]*\* \*\*contrib:\*\* shared contrib carrier source: add a bundled SQL capability \(12345678\)/u,
+  );
+
+  state.graph.products[NATIVE].version = "1.1.0";
+  state.manifest[state.packagePath] = "1.1.0";
+  assert.deepEqual(
+    synchronizeReleaseCandidates({
+      root,
+      graph: state.graph,
+      candidates: [sharedSourceCandidate(state.packagePath, "1.1.0", "1.1.0")],
+      releasePleaseConfig: state.releasePleaseConfig,
+      manifest: state.manifest,
+      prefix: "shared-source-promotion-test",
+    }),
+    [],
+    "the recomputed promoted candidate is idempotent",
+  );
+});
 
 test("synchronizer writes only declared release files and is closed on its expanded transitions", (t) => {
   const root = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-dependent-candidates-"));

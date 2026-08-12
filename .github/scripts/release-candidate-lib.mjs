@@ -66,14 +66,8 @@ function uniqueStrings(value, context) {
 }
 
 export const FULL_PAYLOAD_QUALIFICATION_MODE = "full-payload";
-export const RECOVERY_CONTROL_QUALIFICATION_MODE = "recovery-control";
-const QUALIFICATION_MODES = new Set([
-  FULL_PAYLOAD_QUALIFICATION_MODE,
-  RECOVERY_CONTROL_QUALIFICATION_MODE,
-]);
-const FULL_SHA = /^[0-9a-f]{40}$/u;
 
-function qualificationBinding(plan, jobs) {
+function qualificationBinding(plan) {
   const fields = [
     "qualification_mode",
     "qualification_base_sha",
@@ -85,18 +79,8 @@ function qualificationBinding(plan, jobs) {
   const mode = plan.qualification_mode;
   const baseSha = plan.qualification_base_sha;
   const headSha = plan.qualification_head_sha;
-  assert(QUALIFICATION_MODES.has(mode), `affected CI plan qualification mode is invalid: ${mode}`);
-  if (mode === FULL_PAYLOAD_QUALIFICATION_MODE) {
-    assert(baseSha === null && headSha === null, "full-payload CI plan must not carry a recovery affected range");
-  } else {
-    assert(FULL_SHA.test(baseSha), "recovery-control CI plan base SHA must be lowercase and full");
-    assert(FULL_SHA.test(headSha), "recovery-control CI plan head SHA must be lowercase and full");
-    assert(baseSha !== headSha, "recovery-control CI plan source and controller must be distinct");
-    assert(
-      JSON.stringify(jobs) === JSON.stringify(["affected"]),
-      "recovery-control CI plan must not select builder or E2E payload jobs",
-    );
-  }
+  assert(mode === FULL_PAYLOAD_QUALIFICATION_MODE, `affected CI plan qualification mode is invalid: ${mode}`);
+  assert(baseSha === null && headSha === null, "full-payload CI plan must not carry an affected range");
   return { mode, baseSha, headSha };
 }
 
@@ -118,7 +102,7 @@ export function affectedPlanBinding(planPath, wasixReleaseRegressionRequired) {
     wasixReleaseRegressionRequired === expectedRequirement,
     `affected CI plan WASIX requirement mismatch: jobs imply ${expectedRequirement}, workflow reported ${wasixReleaseRegressionRequired}`,
   );
-  const qualification = qualificationBinding(plan, jobs);
+  const qualification = qualificationBinding(plan);
   const canonical = JSON.stringify(canonicalValue(plan));
   return {
     digest: sha256(canonical),
@@ -195,7 +179,7 @@ export function wasixEvidenceBinding(
 ) {
   const expectedRunId = Number.parseInt(String(runId), 10);
   positiveInteger(expectedRunId, "expected evidence runId");
-  positiveInteger(runAttempt, "expected evidence runAttempt");
+  positiveInteger(runAttempt, "candidate runAttempt");
   const root = path.resolve(evidenceRoot);
   const { file, value: evidence, bytes } = findEvidenceRun(root);
   same(evidence.status, "passed", "WASIX evidence status");
@@ -206,7 +190,13 @@ export function wasixEvidenceBinding(
   same(evidence.github?.repository, repository, "WASIX evidence GitHub repository");
   same(evidence.github?.workflow, workflow, "WASIX evidence GitHub workflow");
   same(evidence.github?.runId, expectedRunId, "WASIX evidence GitHub runId");
-  same(evidence.github?.runAttempt, runAttempt, "WASIX evidence GitHub runAttempt");
+  positiveInteger(evidence.github?.runAttempt, "WASIX evidence GitHub runAttempt");
+  // A failed-job rerun preserves successful run-level artifacts from an
+  // earlier attempt. Accept that immutable evidence, but never future evidence.
+  assert(
+    evidence.github.runAttempt <= runAttempt,
+    `WASIX evidence GitHub runAttempt must not be newer than the candidate attempt: expected at most ${runAttempt}, got ${evidence.github.runAttempt}`,
+  );
   same(evidence.github?.job, "wasix-release-regression", "WASIX evidence GitHub job");
 
   assert(Array.isArray(evidence.results) && evidence.results.length > 0, "WASIX evidence results must be non-empty");
@@ -278,26 +268,14 @@ export function assertCandidateBindingShape(candidate) {
         === JSON.stringify(["baseSha", "headSha", "mode"]),
       "release candidate affectedPlan qualification fields are invalid",
     );
-    assert(QUALIFICATION_MODES.has(qualification.mode), "release candidate qualification mode is invalid");
-    if (qualification.mode === FULL_PAYLOAD_QUALIFICATION_MODE) {
-      assert(
-        qualification.baseSha === null && qualification.headSha === null,
-        "full-payload release candidate must not carry a recovery affected range",
-      );
-    } else {
-      assert(FULL_SHA.test(qualification.baseSha), "recovery-control candidate base SHA must be lowercase and full");
-      assert(FULL_SHA.test(qualification.headSha), "recovery-control candidate head SHA must be lowercase and full");
-      assert(qualification.baseSha !== qualification.headSha, "recovery-control candidate source and controller must be distinct");
-      assert(candidate.sha === qualification.headSha, "recovery-control candidate controller does not match candidate SHA");
-      assert(
-        JSON.stringify(jobs) === JSON.stringify(["affected"]),
-        "recovery-control candidate must not select builder or E2E payload jobs",
-      );
-      assert(
-        candidate.affectedPlan.extensionPackageProducts.length === 0,
-        "recovery-control candidate must not select extension payload products",
-      );
-    }
+    assert(
+      qualification.mode === FULL_PAYLOAD_QUALIFICATION_MODE,
+      "release candidate qualification mode is invalid",
+    );
+    assert(
+      qualification.baseSha === null && qualification.headSha === null,
+      "full-payload release candidate must not carry an affected range",
+    );
   }
   const requirements = candidate.evidenceRequirements;
   assert(requirements !== null && typeof requirements === "object", "release candidate evidenceRequirements is missing");

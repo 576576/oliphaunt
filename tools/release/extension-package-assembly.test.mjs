@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -13,56 +14,17 @@ import path from "node:path";
 import { spawnSync } from "../test/fd-backed-spawn-sync.mjs";
 import { afterEach, test } from "node:test";
 
+import { extensionSqlNames } from "./release-artifact-targets.mjs";
+
 const ROOT = path.resolve(import.meta.dir, "../..");
 const TEST_BASH = process.env.OLIPHAUNT_TEST_BASH
   ? path.resolve(ROOT, process.env.OLIPHAUNT_TEST_BASH)
   : (process.platform === "darwin" ? "/bin/bash" : "bash");
-const PROJECT_FILE = "src/extensions/artifacts/packages/moon.yml";
 const RELEASE_SCRIPT = "src/extensions/artifacts/packages/tools/package-release-assets.sh";
 const MOBILE_SCRIPT = "src/extensions/artifacts/packages/tools/package-mobile-release-assets.sh";
-const EXTENSION_ASSET_CONTRACT_INPUT = "/tools/release/extension-runtime-asset-contract.mjs";
-const EXTENSION_ASSET_CONTRACT_CONSUMER_INPUTS = new Set([
-  "/tools/release/build-extension-ci-artifacts.mjs",
-  "/tools/release/check-staged-artifacts.mjs",
-  "/tools/release/extension-registry-carrier-materializer.mjs",
-  "/tools/release/publication-lock.mjs",
-]);
+const WASIX_ASSET_PACKAGER = "src/extensions/artifacts/wasix/tools/package-release-assets.mjs";
+const CONTRIB_PRODUCT = "oliphaunt-extension-contrib-pg18";
 const roots = [];
-
-function localModuleClosure(entrypoints) {
-  const pending = [...entrypoints];
-  const result = new Set();
-  while (pending.length > 0) {
-    const relative = pending.shift();
-    if (result.has(relative)) continue;
-    result.add(relative);
-    const extension = path.extname(relative);
-    if (![".cjs", ".cts", ".js", ".mjs", ".mts", ".ts", ".tsx"].includes(extension)) {
-      continue;
-    }
-    const loader = extension === ".ts" || extension === ".mts" || extension === ".cts"
-      ? "ts"
-      : extension === ".tsx"
-        ? "tsx"
-        : "js";
-    const transpiler = new Bun.Transpiler({ loader });
-    const source = readFileSync(path.join(ROOT, relative), "utf8");
-    for (const imported of transpiler.scan(source).imports) {
-      if (!imported.path.startsWith(".")) continue;
-      const unresolved = path.resolve(ROOT, path.dirname(relative), imported.path);
-      const candidates = path.extname(unresolved)
-        ? [unresolved]
-        : [unresolved, ...[".mjs", ".js", ".ts", ".tsx"].map((suffix) => `${unresolved}${suffix}`)];
-      const matches = candidates.filter((candidate) => existsSync(candidate));
-      assert.equal(matches.length, 1, `${relative} must resolve ${imported.path} to one repository file`);
-      const absolute = matches[0];
-      const dependency = path.relative(ROOT, absolute).split(path.sep).join("/");
-      assert.ok(!dependency.startsWith("../"), `${relative} import must remain inside the repository`);
-      pending.push(dependency);
-    }
-  }
-  return [...result].sort();
-}
 
 function fixtureRun(script, { environment = {}, failTool = "" } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "oliphaunt-extension-package-"));
@@ -101,79 +63,6 @@ fi
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { force: true, recursive: true });
-});
-
-test("Moon plans both extension assembly tasks for every producer and validator module", () => {
-  const project = Bun.YAML.parse(readFileSync(path.join(ROOT, PROJECT_FILE), "utf8"));
-  const workspaceTasks = Bun.YAML.parse(
-    readFileSync(path.join(ROOT, ".moon/tasks/inputs.yml"), "utf8"),
-  );
-  const implicitInputs = new Set(workspaceTasks.implicitInputs ?? []);
-  assert.ok(
-    implicitInputs.has("/tools/dev/capture-command-output.mjs"),
-    "the shared file-backed command transport must invalidate every Moon task",
-  );
-  assert.equal(
-    project.tasks["assemble-release"].command,
-    `bash ${RELEASE_SCRIPT}`,
-  );
-  assert.equal(
-    project.tasks["assemble-mobile"].command,
-    `bash ${MOBILE_SCRIPT}`,
-  );
-
-  const moduleInputs = localModuleClosure([
-    "tools/release/build-extension-ci-artifacts.mjs",
-    "tools/release/check-staged-artifacts.mjs",
-  ]).map((file) => `/${file}`);
-  const commonDataInputs = [
-    "/.release-please-manifest.json",
-    "/release-please-config.json",
-    "/src/postgres/versions/18/source.toml",
-    "/src/runtimes/liboliphaunt/native/moon.yml",
-    "/src/runtimes/liboliphaunt/native/release.toml",
-    "/src/runtimes/liboliphaunt/native/VERSION",
-    "/src/runtimes/liboliphaunt/wasix/moon.yml",
-    "/src/runtimes/liboliphaunt/wasix/release.toml",
-    "/src/runtimes/liboliphaunt/wasix/VERSION",
-    "/src/shared/extension-runtime-contract/**/*",
-    "/tools/dev/bun.sh",
-    "/tools/release/extension-target-profiles.toml",
-    "/tools/release/release-semantic-inputs.toml",
-  ];
-  for (const taskName of ["assemble-mobile", "assemble-release"]) {
-    const taskInputs = new Set(project.tasks[taskName].inputs);
-    for (const input of [...moduleInputs, ...commonDataInputs]) {
-      assert.ok(
-        taskInputs.has(input) || implicitInputs.has(input),
-        `${taskName} must track ${input} directly or through global implicit inputs`,
-      );
-    }
-  }
-});
-
-test("Moon tasks that consume the public extension asset projection own its exact source input", () => {
-  const listed = spawnSync("git", ["ls-files", "--", "*moon.yml"], {
-    cwd: ROOT,
-    encoding: "utf8",
-  });
-  assert.equal(listed.status, 0, listed.stderr);
-  const projectFiles = listed.stdout.split(/\r?\n/u).filter(Boolean);
-  assert.ok(projectFiles.length > 0, "repository must contain Moon project files");
-
-  for (const projectFile of projectFiles) {
-    const project = Bun.YAML.parse(readFileSync(path.join(ROOT, projectFile), "utf8"));
-    for (const [taskName, task] of Object.entries(project.tasks ?? {})) {
-      const inputs = new Set(Array.isArray(task?.inputs) ? task.inputs : []);
-      if (![...EXTENSION_ASSET_CONTRACT_CONSUMER_INPUTS].some((input) => inputs.has(input))) {
-        continue;
-      }
-      assert.ok(
-        inputs.has(EXTENSION_ASSET_CONTRACT_INPUT),
-        `${projectFile} ${taskName} must track ${EXTENSION_ASSET_CONTRACT_INPUT}`,
-      );
-    }
-  }
 });
 
 test("full extension assembly validates exactly the planner-selected products and all targets", () => {
@@ -218,18 +107,18 @@ test("extension assembly stops after producer failure and propagates validator f
   ]);
 });
 
-test("mobile extension assembly propagates its immediate validator failure", () => {
+test("mobile contrib assembly scopes both staging and validation to native carriers", () => {
   const { calls, execution } = fixtureRun(MOBILE_SCRIPT, {
     environment: {
       OLIPHAUNT_EXTENSION_PACKAGE_NATIVE_TARGETS: "android-arm64-v8a,ios-xcframework",
-      OLIPHAUNT_EXTENSION_PACKAGE_PRODUCTS: "oliphaunt-extension-postgis",
+      OLIPHAUNT_EXTENSION_PACKAGE_PRODUCTS: "oliphaunt-extension-contrib-pg18",
     },
     failTool: "tools/release/check-staged-artifacts.mjs",
   });
   assert.equal(execution.status, 73);
   assert.deepEqual(calls, [
-    "tools/release/build-extension-ci-artifacts.mjs oliphaunt-extension-postgis --require-native-target android-arm64-v8a --require-native-target ios-xcframework",
-    "tools/release/check-staged-artifacts.mjs --require-extension-product oliphaunt-extension-postgis",
+    "tools/release/build-extension-ci-artifacts.mjs --family native oliphaunt-extension-contrib-pg18 --require-native-target android-arm64-v8a --require-native-target ios-xcframework",
+    "tools/release/check-staged-artifacts.mjs --family native --require-extension-product oliphaunt-extension-contrib-pg18",
   ]);
 });
 
@@ -253,4 +142,57 @@ test("mobile extension assembly rejects delimiter-only selections without nounse
   assert.equal(emptyTargets.execution.status, 1);
   assert.match(emptyTargets.execution.stderr, /did not contain any targets/u);
   assert.doesNotMatch(emptyTargets.execution.stderr, /unbound variable/u);
+});
+
+test("WASIX release staging resolves runtime-owned contrib through its logical artifact product", () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), "oliphaunt-wasix-extension-package-"));
+  roots.push(fixture);
+  const assetRoot = path.join(fixture, "assets");
+  const extensionRoot = path.join(assetRoot, "extensions");
+  const metadataPath = path.join(fixture, "extensions.json");
+  const outDir = path.join(fixture, "out");
+  mkdirSync(extensionRoot, { recursive: true });
+
+  const sqlNames = extensionSqlNames(CONTRIB_PRODUCT, "extension-package-assembly.test");
+  const extensions = sqlNames.map((sqlName) => {
+    const archive = `extensions/${sqlName}.tar.zst`;
+    writeFileSync(path.join(assetRoot, archive), `archive:${sqlName}\n`);
+    return { "sql-name": sqlName, archive };
+  });
+  writeFileSync(metadataPath, `${JSON.stringify({ extensions }, null, 2)}\n`);
+
+  const execution = spawnSync(
+    TEST_BASH,
+    [
+      path.join(ROOT, "tools/dev/bun.sh"),
+      path.join(ROOT, WASIX_ASSET_PACKAGER),
+      "--root",
+      ROOT,
+      "--asset-root",
+      assetRoot,
+      "--metadata",
+      metadataPath,
+      "--out-dir",
+      outDir,
+      "--target",
+      "wasix-portable",
+      "--extension-products",
+      CONTRIB_PRODUCT,
+    ],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+
+  assert.equal(execution.status, 0, execution.stderr);
+  assert.match(execution.stdout, new RegExp(`staged ${sqlNames.length} WASIX exact-extension artifact`));
+  const staged = readdirSync(outDir).sort();
+  assert.equal(staged.length, sqlNames.length + 1);
+  const index = staged.find((entry) => entry.endsWith("-wasix-extension-assets.tsv"));
+  assert.ok(index);
+  const indexedSqlNames = readFileSync(path.join(outDir, index), "utf8")
+    .trimEnd()
+    .split("\n")
+    .slice(1)
+    .map((line) => line.split("\t", 1)[0])
+    .sort();
+  assert.deepEqual(indexedSqlNames, sqlNames);
 });

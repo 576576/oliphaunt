@@ -7,8 +7,6 @@ stack: "systems"
 tags: ["sdk", "rust", "tauri", "native", "release-product"]
 dependsOn:
   - "liboliphaunt-native"
-  - id: "shared-fixtures"
-    scope: "build"
 
 project:
   title: "Oliphaunt Rust SDK"
@@ -32,7 +30,6 @@ tasks:
       CARGO_TARGET_DIR: "target/moon/oliphaunt-rust/check"
     deps:
       - "liboliphaunt-native:check"
-      - "shared-contracts:check"
     inputs:
       - "/Cargo.lock"
       - "/Cargo.toml"
@@ -50,7 +47,6 @@ tasks:
       CARGO_TARGET_DIR: "target/moon/oliphaunt-rust/test"
     deps:
       - "liboliphaunt-native:check"
-      - "shared-fixtures:check"
     inputs:
       - "/Cargo.lock"
       - "/Cargo.toml"
@@ -125,7 +121,6 @@ tasks:
       - "/tools/release/release-cli-utils.mjs"
       - "/tools/release/release-graph.mjs"
       - "/tools/release/release-notices.mjs"
-      - "/tools/release/release-semantic-inputs.mjs"
       - "/tools/release/rust-native-targets.mjs"
       - "/tools/release/tar-command.mjs"
       - "/tools/release/windows-vc-runtime-closure.mjs"
@@ -173,7 +168,6 @@ tasks:
       - "/tools/release/release-cli-utils.mjs"
       - "/tools/release/release-graph.mjs"
       - "/tools/release/release-notices.mjs"
-      - "/tools/release/release-semantic-inputs.mjs"
       - "/tools/release/rust-native-targets.mjs"
       - "/tools/release/source-only-sdk-package.mjs"
       - "/tools/release/swift-source-carrier-contract.mjs"
@@ -181,6 +175,26 @@ tasks:
       - "/tools/runtime/**/*"
     outputs:
       - "/target/sdk-artifacts/oliphaunt-rust/**/*"
+    options:
+      cache: true
+      runFromWorkspaceRoot: true
+  release-consumer-build:
+    tags: ["release", "runtime", "ci-rust-sdk-package"]
+    command: >-
+      src/sdks/rust/tools/check-release-consumer.sh build
+      target/sdk-artifacts/oliphaunt-rust
+      target/native-extension-proof/oliphaunt-rust-release-consumer
+    deps:
+      - "oliphaunt-rust:package-artifacts"
+    env:
+      CARGO_TARGET_DIR: "target/moon/oliphaunt-rust/release-consumer-build"
+    inputs:
+      - "/rust-toolchain.toml"
+      - "/src/sdks/rust/tests/release-consumer/**/*"
+      - "/src/sdks/rust/tools/check-release-consumer.sh"
+      - "/tools/dev/bun.sh"
+    outputs:
+      - "/target/native-extension-proof/oliphaunt-rust-release-consumer"
     options:
       cache: true
       runFromWorkspaceRoot: true

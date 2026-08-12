@@ -324,9 +324,9 @@ intentionally not maintained here.
   changelogs, and tags. Evidence: `release-please-config.json` and
   `.release-please-manifest.json`.
 - [x] Product-local `release.toml` files own registry/package metadata.
-  Evidence: `tools/release/release_graph_query.mjs product-configs` and
-  `registry-packages` expose product-local package metadata from the canonical
-  Bun release graph.
+  Release code imports it directly from `release-graph.mjs` and
+  `release-artifact-targets.mjs`; the workflow query wrapper exposes only the
+  four projections consumed across process boundaries.
 - [x] There is no active `release-graph.toml`, `release-inputs.toml`, or
   `tools/graph/jobs.toml` release brain.
 - [x] `tools/dev/bun.sh tools/release/release_plan.mjs` uses Moon project ownership and dependency
@@ -375,17 +375,13 @@ intentionally not maintained here.
 - [x] Public selection model is exact SQL extension name only. No packs,
   aliases, or grouped selectors.
 - [x] Every public extension in the generated SDK catalog is modeled as an
-  exact-extension release product. Evidence:
-  `src/extensions/generated/sdk/rust.json` drives
-  `tools/policy/check-release-policy.py`, which requires the release product
-  set to match the public catalog. The current graph has 39 exact-extension
-  products: PostgreSQL contrib products under `src/extensions/contrib/<id>/`
-  and external products under `src/extensions/external/<id>/`.
-- [x] Exact-extension products have product-local `release.toml`, `VERSION`,
-  `CHANGELOG.md`, and target metadata. PostgreSQL contrib exact-extension
-  products depend on `extension-contrib-postgres18` and
-  `extension-runtime-contract`; external exact-extension products depend on
-  `extension-runtime-contract` and their product-local source/recipe metadata.
+  exact SQL selector. The 32 PostgreSQL contrib selectors share the logical
+  descriptor at `src/extensions/contrib/carriers.toml`; external extensions
+  remain independent release products under `src/extensions/external/<id>/`.
+- [x] External extension products have product-local `release.toml`, `VERSION`,
+  `CHANGELOG.md`, and target metadata. Contrib members retain only their shared
+  member manifest and per-member target evidence; native and WASIX carriers use
+  their respective runtime versions.
 - [x] Exact-extension target metadata must declare every native runtime target
   that advertises exact-extension artifact support, with unpublished opt-outs
   required when no real producer exists. Published WASIX target coverage remains
@@ -394,7 +390,7 @@ intentionally not maintained here.
   `src/runtimes/liboliphaunt/native/targets/*.toml`, per-extension
   `targets/artifacts.toml` rows, and full builder planner output that includes
   `windows-x64-msvc` in the native exact-extension artifact matrix with all 39
-  exact-extension products selected.
+  exact SQL selectors selected.
 - [x] Native and WASIX extension artifact builders emit target-addressed
   release assets consumed by package assembly.
 - [x] Exact-extension package assembly is single-path. Release builds the
@@ -570,8 +566,6 @@ Run before claiming this architecture complete:
 - [x] `bash src/sdks/react-native/tools/check-sdk.sh build-android-bridge`
 - [x] `moon run policy-tools:check release-tools:check graph-tools:check`
 - [x] `MOON_BIN=$HOME/.proto/shims/moon
-  .github/scripts/run-moon-targets.sh extensions:check`
-- [x] `MOON_BIN=$HOME/.proto/shims/moon
   .github/scripts/run-moon-targets.sh extension-model:check
   extension-artifacts-native:check extension-artifacts-wasix:check`
 - [x] `moon query projects`
@@ -601,8 +595,6 @@ Run before claiming this architecture complete:
   `linux-x64-gnu`.
 - [x] `tools/dev/bun.sh tools/release/release_plan.mjs`
 - [x] `tools/dev/bun.sh tools/release/release-check.mjs`
-- [x] `tools/dev/bun.sh tools/release/release-consumer-shape.mjs --format json --require-ready
-  --products-json '["oliphaunt-swift"]'`
 - [x] `tools/dev/bun.sh tools/release/release-publish.mjs publish-dry-run --products-json
   '["oliphaunt-extension-vector"]' --head-ref HEAD` fails closed when the
   staged exact-extension package is incomplete or missing.
@@ -790,19 +782,17 @@ Run before claiming this architecture complete:
   touched Python release/graph modules,
   `bash tools/policy/check-sdk-mobile-extension-surface.sh`,
   `python3 tools/release/artifact_target_matrix.py extension-artifacts-native`,
-  and `tools/dev/bun.sh tools/release/release-consumer-shape.mjs --format json --require-ready
-  --products-json '["oliphaunt-extension-vector"]'`.
+  and the focused extension package checks.
 - [x] GitHub Builds run `27383810080` on `d7ad6eca` proved the next CI-only
-  blockers: the WASIX runtime committed asset-input fingerprint was stale,
-  Android x86_64 and Linux arm64 native-runtime source fetches failed through
+  blockers: Android x86_64 and Linux arm64 native-runtime source fetches failed through
   `ftpmirror.gnu.org` libiconv 502s, Apple extension runtime builds passed the
   embedded `-bundle_loader` through `PG_LDFLAGS` so PostgreSQL's Darwin default
   `BE_DLLLIBS=-bundle_loader ../../src/backend/postgres` won and failed when
   the backend executable link was intentionally tolerated, and the Windows
   exact-extension row still selected `pgcrypto` even though the current Windows
   runtime disables SSL/OpenSSL and does not package that dependency. The
-  follow-up refreshes `asset-inputs.sha256`, switches libiconv inputs to the
-  canonical GNU URL, routes Darwin PGXS embedded bundle-loader wiring through
+  follow-up switches libiconv inputs to the canonical GNU URL, routes Darwin
+  PGXS embedded bundle-loader wiring through
   `BE_DLLLIBS`, keeps Bash strict-mode arrays guarded by explicit counts, and
   marks Windows `pgcrypto` unpublished with an OpenSSL runtime dependency
   reason. The native exact-extension matrix now keeps Android/iOS/Linux/macOS
@@ -811,7 +801,7 @@ Run before claiming this architecture complete:
   focused macOS `OLIPHAUNT_NATIVE_EXTENSION_SQL_NAMES=amcheck`
   `build-postgres18-macos.sh`, `bash -n` for touched shell scripts,
   `cargo run -p xtask -- assets verify-committed`,
-  `bun tools/policy/assertions/assert-source-inputs.mjs`,
+  `bash tools/policy/check-source-inputs.sh`,
   `python3 src/extensions/tools/check-extension-model.py --check`,
   `python3 tools/release/check_artifact_targets.py`,
   `python3 tools/policy/check-release-policy.py`,
@@ -1026,17 +1016,6 @@ Run before claiming this architecture complete:
   `tools/dev/bun.sh tools/release/release-check-registries.mjs --products-json "$(cat
   target/release-dry-run-local/products.json)" --head-ref HEAD` reports
   `crates:oliphaunt-wasix@0.6.0` plus the renamed internal WASIX crates.
-- [x] GitHub Builds run `27434296236` on `cf0ef3f2` proved the WASIX rename
-  commit still had a stale committed WASIX asset-input fingerprint. The
-  `build-liboliphaunt-wasix-runtime` job failed during
-  `cargo run -p xtask -- assets verify-committed` with computed fingerprint
-  `aed54dc5dbe84544a6627a5fe30d8a7670ea670558e0bc184d57061f8848911e` while
-  `src/runtimes/liboliphaunt/wasix/assets/generated/asset-inputs.sha256`
-  still held `183cff37e33e3349577c6061a85e9ee96a2e30ee5dfeddc93b0eb7789a1f926a`.
-  The follow-up refreshes the committed fingerprint with
-  `cargo run -p xtask -- assets input-fingerprint --write`. A replacement
-  same-SHA `Builds` run is required because `27434296236` cannot be green
-  builder evidence.
 - [x] GitHub Builds run `27448574605` on `927457d3` proved the native
   exact-extension source-fetch gap after decoupling artifact packaging from Rust:
   all native extension rows failed before build work because CI runs
@@ -1161,16 +1140,6 @@ Run before claiming this architecture complete:
   guide](../maintainers/release-setup.md) as canonical rather than replaying
   the historical command above. Same-SHA builder evidence for the branch at
   the time was green in GitHub CI run `27744307637`.
-- [x] Consumer-shape validation for the full selected product closure is green.
-  The checker now treats `oliphaunt-node-direct` as a consumer-facing helper
-  product: the private root source package stays unpublishable, optional
-  platform npm packages publish with provenance and OS/CPU/libc constraints,
-  release metadata declares exactly those optional packages, and the TypeScript
-  SDK can keep selecting Node direct by exact optional platform packages.
-  Evidence: `tools/dev/bun.sh tools/release/release-consumer-shape.mjs --require-ready --product
-  oliphaunt-node-direct` and `tools/dev/bun.sh tools/release/release-consumer-shape.mjs
-  --require-ready --products-json "$(cat
-  target/release-dry-run-local/products.json)"` pass.
 - [x] Windows native exact-extension coverage has a producer path for all nine
   previous Windows gaps. The Windows build script now generates Meson
   producers inside the patched PostgreSQL source tree for `pg_hashids`,

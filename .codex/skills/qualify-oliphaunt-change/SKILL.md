@@ -11,12 +11,10 @@ Use the repository graph to select work, but require the full exact-SHA gate for
 
 1. Inspect the diff and ask Moon for affected projects/tasks. Do not infer affected products from directory names alone.
 2. Run formatting/static checks and focused unit/package tests first. Run expensive producer/E2E lanes only when their inputs or release contract changed.
-3. If the diff intentionally changes WASIX binary-semantic inputs (source pins,
-   patches, build recipes, the WASIX toolchain, or producer code), refresh the
-   committed fingerprint before qualification with
-   `cargo run -p xtask -- assets input-fingerprint --write`. Do not refresh it
-   for version, changelog, package-description, smoke-expectation, or
-   target-envelope-only changes. See `docs/maintainers/assets.md`.
+3. If the diff changes WASIX source pins, patches, build recipes, the toolchain,
+   or producer code, run the product-owned source checks and portable/AOT build.
+   Version, changelog, package-description, smoke-expectation, and
+   target-envelope-only changes do not require that expensive build.
 4. For any release, package identity, workflow, version, or extension change, run:
 
 ```sh
@@ -129,8 +127,8 @@ removing it. Do not turn reference counts into a required CI gate.
   the dispatched commit's immutable sole parent. Never fall back to
   `origin/main` for a main dispatch: after a merge that moving ref is the
   dispatched head itself and turns release-intent validation into an invalid
-  self-comparison. Non-main diagnostic and history-repair dispatches retain
-  their explicit comparison to current `origin/main`.
+  self-comparison. Non-main diagnostic dispatches retain their explicit
+  comparison to current `origin/main`.
 - The `pull_request.closed` event is a runnerless cancellation tombstone. It
   shares the PR concurrency group so merging cancels obsolete PR work, while
   every root and `always()` aggregate job skips before runner allocation. It

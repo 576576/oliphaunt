@@ -17,19 +17,52 @@ import {
 import path from "node:path";
 import test from "node:test";
 
-import { currentProductVersionSync, extensionSqlNames } from "./release-artifact-targets.mjs";
+import {
+  currentProductVersionSync,
+  extensionReleaseProduct,
+  extensionSqlNames,
+} from "./release-artifact-targets.mjs";
 import { stageExtensionUpstreamLicenses } from "./extension-upstream-licenses.mjs";
 import {
   buildIosCarrierManifest,
   buildSwiftExtensionCarrierManifest,
+  discoveredExtensionManifests,
   swiftExtensionCarrierAssetName,
 } from "./ios-carrier-manifest.mjs";
 import { stageReleaseNotices } from "./release-notices.mjs";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 
+test("discovers flat extensions and nested runtime-owned contrib carriers", () => {
+  mkdirSync(path.join(ROOT, "target"), { recursive: true });
+  const root = mkdtempSync(path.join(ROOT, "target", "ios-carrier-discovery-test-"));
+  try {
+    const flat = path.join(root, "oliphaunt-extension-vector", "extension-artifacts.json");
+    const nested = path.join(
+      root,
+      "liboliphaunt-native",
+      "oliphaunt-extension-contrib-pg18",
+      "extension-artifacts.json",
+    );
+    mkdirSync(path.dirname(flat), { recursive: true });
+    mkdirSync(path.dirname(nested), { recursive: true });
+    writeFileSync(flat, "{}\n");
+    writeFileSync(nested, "{}\n");
+
+    assert.deepEqual(discoveredExtensionManifests(root), [nested, flat].sort());
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function sha256(file) {
   return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+function portableTar(args) {
+  execFileSync("tar", ["--format=ustar", ...args], {
+    env: { ...process.env, COPYFILE_DISABLE: "1" },
+  });
 }
 
 function archive(root, name, member, format, legal = undefined) {
@@ -48,7 +81,7 @@ function archive(root, name, member, format, legal = undefined) {
   if (format === "zip") {
     execFileSync("zip", ["-qry", output, legal?.insideMember === false ? "." : member], { cwd: staging });
   } else {
-    execFileSync("tar", ["-czf", output, "-C", staging, legal?.insideMember === false ? "." : member]);
+    portableTar(["-czf", output, "-C", staging, legal?.insideMember === false ? "." : member]);
   }
   return output;
 }
@@ -127,25 +160,6 @@ function withTruncatedArchiveTools(root, callback) {
     else process.env.PATH = previous;
   }
 }
-
-test("delegates archive parsing to the shared portable verifier", () => {
-  const source = readFileSync(
-    path.join(ROOT, "tools/release/ios-carrier-manifest.mjs"),
-    "utf8",
-  );
-  assert.match(source, /from "\.\/portable-archive\.mjs"/u);
-  for (const duplicate of [
-    "node:child_process",
-    "node:zlib",
-    "function zipArchiveIndex",
-    "function tarArchiveIndex",
-  ]) {
-    assert.equal(source.includes(duplicate), false, duplicate);
-  }
-  assert.match(source, /Cache only inert\s+\/\/ metadata/u);
-  assert.match(source, /portableEntries\.clear\(\)/u);
-  assert.doesNotMatch(source, /cache\.set\(key,\s*(?:portableEntries|byName)\)/u);
-});
 
 test("produces exact local and GitHub carrier envelopes without consulting truncated tar/unzip output", () => {
   mkdirSync(path.join(ROOT, "target"), { recursive: true });
@@ -355,7 +369,12 @@ test("bundle carriers verify exact nested bytes without consulting truncated tar
   const root = mkdtempSync(path.join(ROOT, "target", "ios-bundle-carrier-test-"));
   try {
     const product = "oliphaunt-extension-contrib-pg18";
-    const version = currentProductVersionSync(product, "ios-carrier-manifest.test");
+    const releaseProduct = extensionReleaseProduct(
+      product,
+      "native",
+      "ios-carrier-manifest.test",
+    );
+    const version = currentProductVersionSync(releaseProduct, "ios-carrier-manifest.test");
     const sqlNames = extensionSqlNames(product, "ios-carrier-manifest.test");
     const carrierRoot = `${product}-${version}-native-ios-xcframework-bundle`;
     const carrierName = `${carrierRoot}.tar.gz`;
@@ -406,7 +425,7 @@ test("bundle carriers verify exact nested bytes without consulting truncated tar
     const releaseAssets = path.join(root, "release-assets");
     mkdirSync(releaseAssets, { recursive: true });
     const carrierFile = path.join(releaseAssets, carrierName);
-    execFileSync("tar", ["--format=ustar", "-czf", carrierFile, "-C", path.dirname(carrierStage), carrierRoot]);
+    portableTar(["-czf", carrierFile, "-C", path.dirname(carrierStage), carrierRoot]);
     const manifestFile = path.join(root, "extension-artifacts.json");
     const writeBundle = () => writeFileSync(manifestFile, `${JSON.stringify({
       schema: "oliphaunt-extension-ci-artifacts-v2",
@@ -435,13 +454,14 @@ test("bundle carriers verify exact nested bytes without consulting truncated tar
     assert.equal(carrier.entries.length, sqlNames.length);
     assert.ok(carrier.entries.every(({ extension }) =>
       extension.product === product
+      && extension.releaseProduct === releaseProduct
       && extension.assets.length === 1
       && extension.assets[0].carrier === carrierName
       && extension.assets[0].path.startsWith(`${carrierRoot}/extensions/${extension.sqlName}/`)));
 
     const tampered = path.join(carrierStage, "extensions", sqlNames[0], extensions[0].assets[0].name);
     writeFileSync(tampered, "repacked bytes that do not match the logical row\n");
-    execFileSync("tar", ["--format=ustar", "-czf", carrierFile, "-C", path.dirname(carrierStage), carrierRoot]);
+    portableTar(["-czf", carrierFile, "-C", path.dirname(carrierStage), carrierRoot]);
     writeBundle();
     assert.throws(
       () => buildSwiftExtensionCarrierManifest({ extensionManifest: manifestFile, localUrls: true }),

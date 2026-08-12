@@ -9,69 +9,14 @@ import {
   compatibilityEntriesForBumpedProducts,
   releasePleaseManifestTransitions,
   releasePleaseWorktreeTransitions,
-  requireCompleteRuntimeLinkedTransitions,
+  sharedContribReleaseCandidates,
 } from "./release-please-transition.mjs";
-import {
-  RELEASE_PLEASE_BOOTSTRAP_SHA,
-  RELEASE_PLEASE_DISPLACED_MAIN_SHA,
-  RELEASE_PLEASE_HISTORY_REPAIR_BEFORE_SHA,
-} from "./release-please-bootstrap.mjs";
-
-const CANONICAL_CONTRIB_PATH = "src/extensions/contrib";
-const LEGACY_CONTRIB_PATHS = [
-  "src/extensions/contrib/amcheck",
-  "src/extensions/contrib/auto_explain",
-  "src/extensions/contrib/bloom",
-  "src/extensions/contrib/btree_gin",
-  "src/extensions/contrib/btree_gist",
-  "src/extensions/contrib/citext",
-  "src/extensions/contrib/cube",
-  "src/extensions/contrib/dict_int",
-  "src/extensions/contrib/dict_xsyn",
-  "src/extensions/contrib/earthdistance",
-  "src/extensions/contrib/file_fdw",
-  "src/extensions/contrib/fuzzystrmatch",
-  "src/extensions/contrib/hstore",
-  "src/extensions/contrib/intarray",
-  "src/extensions/contrib/isn",
-  "src/extensions/contrib/lo",
-  "src/extensions/contrib/ltree",
-  "src/extensions/contrib/pageinspect",
-  "src/extensions/contrib/pg_buffercache",
-  "src/extensions/contrib/pg_freespacemap",
-  "src/extensions/contrib/pg_surgery",
-  "src/extensions/contrib/pg_trgm",
-  "src/extensions/contrib/pg_visibility",
-  "src/extensions/contrib/pg_walinspect",
-  "src/extensions/contrib/pgcrypto",
-  "src/extensions/contrib/seg",
-  "src/extensions/contrib/tablefunc",
-  "src/extensions/contrib/tcn",
-  "src/extensions/contrib/tsm_system_rows",
-  "src/extensions/contrib/tsm_system_time",
-  "src/extensions/contrib/unaccent",
-  "src/extensions/contrib/uuid_ossp",
-];
-const HISTORY_REPAIR_RUNTIME_PATH = "src/runtimes/liboliphaunt/native";
 
 const PRODUCT_PATHS = {
   "liboliphaunt-native": "packages/native",
   "liboliphaunt-wasix": "packages/wasix",
   "oliphaunt-extension-amcheck": "packages/amcheck",
   "oliphaunt-extension-vector": "packages/vector",
-};
-
-const PRODUCTS = {
-  "liboliphaunt-native": { path: PRODUCT_PATHS["liboliphaunt-native"] },
-  "liboliphaunt-wasix": { path: PRODUCT_PATHS["liboliphaunt-wasix"] },
-  "oliphaunt-extension-amcheck": {
-    path: PRODUCT_PATHS["oliphaunt-extension-amcheck"],
-    extension: { class: "contrib" },
-  },
-  "oliphaunt-extension-vector": {
-    path: PRODUCT_PATHS["oliphaunt-extension-vector"],
-    extension: { class: "external" },
-  },
 };
 
 function git(root, ...args) {
@@ -122,60 +67,47 @@ function fixture(t, versions = null) {
 const ZERO = Object.fromEntries(Object.keys(PRODUCT_PATHS).map((product) => [product, "0.0.0"]));
 const V1 = Object.fromEntries(Object.keys(PRODUCT_PATHS).map((product) => [product, "1.0.0"]));
 
-function historyRepairContribState() {
+function contribManifest(version) {
+  return `postgres-version = ${JSON.stringify(version)}\n\n[[extensions]]\nid = "amcheck"\n`;
+}
+
+function writeCarrierDescriptor(root) {
+  mkdirSync(path.join(root, "src/extensions/contrib"), { recursive: true });
+  mkdirSync(path.join(root, "src/extensions/contrib/amcheck/targets"), { recursive: true });
+  mkdirSync(path.join(root, "src/postgres/versions/18"), { recursive: true });
+  mkdirSync(path.join(root, "src/shared/extension-runtime-contract"), { recursive: true });
+  writeFileSync(
+    path.join(root, "src/extensions/contrib/carriers.toml"),
+    [
+      'logical_product = "oliphaunt-extension-contrib-pg18"',
+      'member_manifest = "src/extensions/contrib/postgres18.toml"',
+      'source = "src/postgres/versions/18/source.toml"',
+      'contract = "src/shared/extension-runtime-contract/contract.toml"',
+      'native_owner = "liboliphaunt-native"',
+      'wasix_owner = "liboliphaunt-wasix"',
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    path.join(root, "src/extensions/contrib/postgres18.toml"),
+    contribManifest("18.4"),
+  );
+  writeFileSync(
+    path.join(root, "src/extensions/contrib/amcheck/targets/artifacts.toml"),
+    'schema = "oliphaunt-extension-artifact-targets-v1"\n',
+  );
+  writeFileSync(path.join(root, "src/postgres/versions/18/source.toml"), 'version = "18.4"\n');
+  writeFileSync(path.join(root, "src/shared/extension-runtime-contract/contract.toml"), 'schema = "v1"\n');
+}
+
+function runtimeGraph(versions) {
   return {
-    config: {
-      "bootstrap-sha": RELEASE_PLEASE_BOOTSTRAP_SHA,
-      packages: {
-        [HISTORY_REPAIR_RUNTIME_PATH]: { component: "liboliphaunt-native" },
-        [CANONICAL_CONTRIB_PATH]: { component: "oliphaunt-extension-contrib-pg18" },
-      },
-    },
-    before: {
-      [HISTORY_REPAIR_RUNTIME_PATH]: "0.0.0",
-      ...Object.fromEntries(LEGACY_CONTRIB_PATHS.map((packagePath) => [packagePath, "0.0.0"])),
-    },
-    after: {
-      [HISTORY_REPAIR_RUNTIME_PATH]: "0.0.0",
-      [CANONICAL_CONTRIB_PATH]: "0.0.0",
-    },
+    products: Object.fromEntries(["liboliphaunt-native", "liboliphaunt-wasix"].map((product) => [product, {
+      path: PRODUCT_PATHS[product],
+      tag_prefix: `${product}-v`,
+      version: versions[product],
+    }])),
   };
-}
-
-function historyRepairTransitions(state, parentSha = RELEASE_PLEASE_DISPLACED_MAIN_SHA) {
-  return releasePleaseManifestTransitions(state.config, state.before, state.after, {
-    parentSha,
-    prefix: "transition-test",
-  });
-}
-
-function firstReleaseRollbackState() {
-  return {
-    config: {
-      "bootstrap-sha": RELEASE_PLEASE_BOOTSTRAP_SHA,
-      "initial-version": "0.1.0",
-      packages: Object.fromEntries(
-        Object.entries(PRODUCT_PATHS).map(([product, packagePath]) => [
-          packagePath,
-          { component: product },
-        ]),
-      ),
-    },
-    before: manifest(Object.fromEntries(
-      Object.keys(PRODUCT_PATHS).map((product) => [product, "0.1.0"]),
-    )),
-    after: manifest(ZERO),
-  };
-}
-
-function firstReleaseRollbackTransitions(
-  state,
-  parentSha = RELEASE_PLEASE_HISTORY_REPAIR_BEFORE_SHA,
-) {
-  return releasePleaseManifestTransitions(state.config, state.before, state.after, {
-    parentSha,
-    prefix: "transition-test",
-  });
 }
 
 test("the unreleased introduction may have no parent release manifest", (t) => {
@@ -199,179 +131,7 @@ test("a missing parent manifest cannot conceal already-released versions", (t) =
   );
 });
 
-test("the exact displaced-main contrib consolidation is an unchanged bootstrap baseline", () => {
-  assert.deepEqual(historyRepairTransitions(historyRepairContribState()), []);
-});
-
-test("the exact unpublished first-release parent normalizes the rollback to seed state", () => {
-  assert.deepEqual(firstReleaseRollbackTransitions(firstReleaseRollbackState()), []);
-});
-
-test("first-release rollback normalization rejects a wrong or missing parent", () => {
-  for (const parentSha of [
-    undefined,
-    RELEASE_PLEASE_DISPLACED_MAIN_SHA,
-    RELEASE_PLEASE_BOOTSTRAP_SHA,
-  ]) {
-    const state = firstReleaseRollbackState();
-    assert.throws(
-      () => parentSha === undefined
-        ? releasePleaseManifestTransitions(
-          state.config,
-          state.before,
-          state.after,
-          { prefix: "transition-test" },
-        )
-        : firstReleaseRollbackTransitions(state, parentSha),
-      /manifest version regressed from 0[.]1[.]0 to 0[.]0[.]0/u,
-    );
-  }
-});
-
-test("the exact rollback parent rejects partial or malformed seed restoration", () => {
-  const cases = [
-    {
-      name: "missing bootstrap",
-      mutate(state) {
-        delete state.config["bootstrap-sha"];
-      },
-      pattern: /requires bootstrap-sha/u,
-    },
-    {
-      name: "wrong first-release version",
-      mutate(state) {
-        state.before[PRODUCT_PATHS["oliphaunt-extension-vector"]] = "0.2.0";
-      },
-      pattern: /parent version 0[.]1[.]0, got 0[.]2[.]0/u,
-    },
-    {
-      name: "partial rollback",
-      mutate(state) {
-        state.after[PRODUCT_PATHS["oliphaunt-extension-vector"]] = "0.1.0";
-      },
-      pattern: /manifest version regressed from 0[.]1[.]0 to 0[.]0[.]0/u,
-    },
-  ];
-  for (const { name, mutate, pattern } of cases) {
-    const state = firstReleaseRollbackState();
-    mutate(state);
-    assert.throws(
-      () => firstReleaseRollbackTransitions(state),
-      pattern,
-      name,
-    );
-  }
-});
-
-for (const [name, mutate] of Object.entries({
-  missing: (state) => {
-    delete state.before[LEGACY_CONTRIB_PATHS[0]];
-  },
-  extra: (state) => {
-    state.before["src/extensions/contrib/adminpack"] = "0.0.0";
-  },
-  substituted: (state) => {
-    delete state.before[LEGACY_CONTRIB_PATHS[0]];
-    state.before["src/extensions/contrib/adminpack"] = "0.0.0";
-  },
-})) {
-  test(`the displaced-main contrib baseline rejects ${name} legacy paths`, () => {
-    const state = historyRepairContribState();
-    mutate(state);
-    assert.throws(
-      () => historyRepairTransitions(state),
-      /must replace exactly the 32 canonical legacy contrib package paths and no other package path/u,
-    );
-  });
-}
-
-for (const [name, mutate] of Object.entries({
-  "a changed legacy leaf": (state) => {
-    state.before[LEGACY_CONTRIB_PATHS[0]] = "0.1.0";
-  },
-  "a released aggregate": (state) => {
-    state.after[CANONICAL_CONTRIB_PATH] = "0.1.0";
-  },
-  "a changed unaffected product": (state) => {
-    state.before[HISTORY_REPAIR_RUNTIME_PATH] = "0.1.0";
-  },
-})) {
-  test(`the displaced-main contrib baseline rejects ${name}`, () => {
-    const state = historyRepairContribState();
-    mutate(state);
-    assert.throws(
-      () => historyRepairTransitions(state),
-      /version continuity|unreleased 0[.]0[.]0|may change only the contrib package ownership/u,
-    );
-  });
-}
-
-test("the contrib consolidation rejects a wrong parent", () => {
-  assert.throws(
-    () => historyRepairTransitions(
-      historyRepairContribState(),
-      "1111111111111111111111111111111111111111",
-    ),
-    /package paths cannot disappear across normalization/u,
-  );
-});
-
-test("the contrib consolidation rejects missing parent context", () => {
-  const state = historyRepairContribState();
-  assert.throws(
-    () => releasePleaseManifestTransitions(
-      state.config,
-      state.before,
-      state.after,
-      { prefix: "transition-test" },
-    ),
-    /package paths cannot disappear across normalization/u,
-  );
-});
-
-test("the contrib consolidation rejects a wrong bootstrap boundary", () => {
-  const state = historyRepairContribState();
-  state.config["bootstrap-sha"] = "1111111111111111111111111111111111111111";
-  assert.throws(
-    () => historyRepairTransitions(state),
-    /requires bootstrap-sha/u,
-  );
-});
-
-test("the contrib consolidation rejects a substituted canonical component", () => {
-  const state = historyRepairContribState();
-  state.config.packages[CANONICAL_CONTRIB_PATH].component = "oliphaunt-extension-amcheck";
-  assert.throws(
-    () => historyRepairTransitions(state),
-    /component oliphaunt-extension-contrib-pg18/u,
-  );
-});
-
-test("a lookalike consolidation on an arbitrary Git parent remains forbidden", (t) => {
-  const root = fixture(t);
-  const state = historyRepairContribState();
-  writeFileSync(
-    path.join(root, "release-please-config.json"),
-    `${JSON.stringify(state.config, null, 2)}\n`,
-  );
-  writeFileSync(
-    path.join(root, ".release-please-manifest.json"),
-    `${JSON.stringify(state.before, null, 2)}\n`,
-  );
-  commit(root, "legacy contrib release ownership");
-  writeFileSync(
-    path.join(root, ".release-please-manifest.json"),
-    `${JSON.stringify(state.after, null, 2)}\n`,
-  );
-  commit(root, "lookalike contrib consolidation");
-
-  assert.throws(
-    () => releasePleaseWorktreeTransitions(root, { prefix: "transition-test" }),
-    /package paths cannot disappear across normalization/u,
-  );
-});
-
-test("the first release deterministically advances the complete linked group", (t) => {
+test("the first release reports every product that advanced", (t) => {
   const root = fixture(t, ZERO);
   const released = Object.fromEntries(Object.keys(PRODUCT_PATHS).map((product) => [product, "0.1.0"]));
   writeReleaseState(root, released);
@@ -379,7 +139,6 @@ test("the first release deterministically advances the complete linked group", (
 
   const transitions = releasePleaseWorktreeTransitions(root, { prefix: "transition-test" });
   assert.deepEqual(transitions.map(({ product }) => product), Object.keys(PRODUCT_PATHS).sort());
-  assert.equal(requireCompleteRuntimeLinkedTransitions(PRODUCTS, transitions, { prefix: "transition-test" }), "0.1.0");
 });
 
 test("a post-first runtime release leaves an independently versioned external sink untouched", (t) => {
@@ -398,8 +157,6 @@ test("a post-first runtime release leaves an independently versioned external si
     transitions.map(({ product }) => product),
     ["liboliphaunt-native", "liboliphaunt-wasix", "oliphaunt-extension-amcheck"],
   );
-  assert.equal(requireCompleteRuntimeLinkedTransitions(PRODUCTS, transitions, { prefix: "transition-test" }), "1.1.0");
-
   const entries = [
     { id: "contrib-native", product: "oliphaunt-extension-amcheck" },
     { id: "external-native", product: "oliphaunt-extension-vector" },
@@ -410,19 +167,16 @@ test("a post-first runtime release leaves an independently versioned external si
   );
 });
 
-test("an incomplete linked group fails before derived synchronization", (t) => {
+test("native can advance without WASIX or contrib", (t) => {
   const root = fixture(t, V1);
   writeReleaseState(root, { ...V1, "liboliphaunt-native": "1.1.0" });
   commit(root, "chore(release): incomplete runtime release");
   const transitions = releasePleaseWorktreeTransitions(root, { prefix: "transition-test" });
 
-  assert.throws(
-    () => requireCompleteRuntimeLinkedTransitions(PRODUCTS, transitions, { prefix: "transition-test" }),
-    /linked-versions output is incomplete.*liboliphaunt-wasix.*oliphaunt-extension-amcheck/u,
-  );
+  assert.deepEqual(transitions.map(({ product }) => product), ["liboliphaunt-native"]);
 });
 
-test("linked products cannot advance to divergent versions", (t) => {
+test("independent products can advance to divergent versions", (t) => {
   const root = fixture(t, V1);
   writeReleaseState(root, {
     ...V1,
@@ -433,19 +187,22 @@ test("linked products cannot advance to divergent versions", (t) => {
   commit(root, "chore(release): divergent runtime release");
   const transitions = releasePleaseWorktreeTransitions(root, { prefix: "transition-test" });
 
-  assert.throws(
-    () => requireCompleteRuntimeLinkedTransitions(PRODUCTS, transitions, { prefix: "transition-test" }),
-    /must advance every runtime-tied product to one version; got 1[.]1[.]0, 1[.]2[.]0/u,
+  assert.deepEqual(
+    transitions.map(({ product, after }) => [product, after]),
+    [
+      ["liboliphaunt-native", "1.1.0"],
+      ["liboliphaunt-wasix", "1.2.0"],
+      ["oliphaunt-extension-amcheck", "1.2.0"],
+    ],
   );
 });
 
-test("an external-only release does not force the runtime linked group", (t) => {
+test("an external-only release remains independent", (t) => {
   const root = fixture(t, V1);
   writeReleaseState(root, { ...V1, "oliphaunt-extension-vector": "1.1.0" });
   commit(root, "chore(release): vector release");
   const transitions = releasePleaseWorktreeTransitions(root, { prefix: "transition-test" });
 
-  assert.equal(requireCompleteRuntimeLinkedTransitions(PRODUCTS, transitions, { prefix: "transition-test" }), null);
   assert.deepEqual(transitions.map(({ product }) => product), ["oliphaunt-extension-vector"]);
 });
 
@@ -457,5 +214,167 @@ test("a manifest regression fails closed", (t) => {
   assert.throws(
     () => releasePleaseWorktreeTransitions(root, { prefix: "transition-test" }),
     /oliphaunt-extension-vector manifest version regressed from 1[.]0[.]0 to 0[.]9[.]0/u,
+  );
+});
+
+test("only the retired contrib release path may disappear without fabricating a transition", () => {
+  const config = { packages: { "packages/native": { component: "liboliphaunt-native" } } };
+  assert.deepEqual(
+    releasePleaseManifestTransitions(
+      config,
+      { "packages/native": "1.0.0", "src/extensions/contrib": "1.0.0" },
+      { "packages/native": "1.0.0" },
+      { prefix: "transition-test" },
+    ),
+    [],
+  );
+  assert.throws(
+    () => releasePleaseManifestTransitions(
+      config,
+      { "packages/native": "1.0.0", "packages/accidentally-removed": "1.0.0" },
+      { "packages/native": "1.0.0" },
+      { prefix: "transition-test" },
+    ),
+    /packages cannot disappear.*packages\/accidentally-removed/u,
+  );
+});
+
+test("shared-only fixes with no Release Please transitions seed both runtime candidates", (t) => {
+  const root = fixture(t, V1);
+  writeCarrierDescriptor(root);
+  commit(root, "refactor(release): define runtime-owned contrib carriers");
+  git(root, "tag", "liboliphaunt-native-v1.0.0");
+  git(root, "tag", "liboliphaunt-wasix-v1.0.0");
+  writeFileSync(path.join(root, "src/postgres/versions/18/source.toml"), 'version = "18.5"\n');
+  commit(root, "fix(contrib): update PostgreSQL source baseline");
+
+  assert.deepEqual(
+    sharedContribReleaseCandidates(root, runtimeGraph(V1), [], { prefix: "transition-test" })
+      .map(({ product, before, after, changelogSection }) => ({ product, before, after, changelogSection })),
+    [
+      { product: "liboliphaunt-native", before: "1.0.0", after: "1.0.1", changelogSection: "Bug Fixes" },
+      { product: "liboliphaunt-wasix", before: "1.0.0", after: "1.0.1", changelogSection: "Bug Fixes" },
+    ],
+  );
+});
+
+test("a pre-1.0 breaking contrib commit requires a minor runtime bump", (t) => {
+  const versions = { ...V1, "liboliphaunt-native": "0.2.3", "liboliphaunt-wasix": "0.2.3" };
+  const root = fixture(t, versions);
+  writeCarrierDescriptor(root);
+  commit(root, "refactor(release): define runtime-owned contrib carriers");
+  git(root, "tag", "liboliphaunt-native-v0.2.3");
+  git(root, "tag", "liboliphaunt-wasix-v0.2.3");
+  writeFileSync(path.join(root, "src/extensions/contrib/postgres18.toml"), contribManifest("18.5"));
+  commit(root, "feat(contrib)!: change bundled SQL surface");
+
+  assert.deepEqual(
+    sharedContribReleaseCandidates(root, runtimeGraph(versions), [], { prefix: "transition-test" })
+      .map(({ product, after }) => [product, after]),
+    [
+      ["liboliphaunt-native", "0.3.0"],
+      ["liboliphaunt-wasix", "0.3.0"],
+    ],
+  );
+});
+
+test("an existing sufficient runtime bump is preserved and receives the shared reasons", (t) => {
+  const root = fixture(t, V1);
+  writeCarrierDescriptor(root);
+  commit(root, "refactor(release): define runtime-owned contrib carriers");
+  git(root, "tag", "liboliphaunt-native-v1.0.0");
+  git(root, "tag", "liboliphaunt-wasix-v1.0.0");
+  writeFileSync(path.join(root, "src/extensions/contrib/postgres18.toml"), contribManifest("18.5"));
+  commit(root, "feat(contrib): add a bundled SQL capability");
+  const versions = { ...V1, "liboliphaunt-native": "1.1.0" };
+
+  assert.deepEqual(
+    sharedContribReleaseCandidates(
+      root,
+      runtimeGraph(versions),
+      [{
+        product: "liboliphaunt-native",
+        packagePath: PRODUCT_PATHS["liboliphaunt-native"],
+        before: "1.0.0",
+        after: "1.1.0",
+      }],
+      { prefix: "transition-test" },
+    ).map(({ product, before, after, changelogMode, reasons }) => ({
+      product,
+      before,
+      after,
+      changelogMode,
+      reasonSummaries: reasons.map(({ summary }) => summary),
+    })),
+    [
+      {
+        product: "liboliphaunt-native",
+        before: "1.1.0",
+        after: "1.1.0",
+        changelogMode: "merge-existing",
+        reasonSummaries: ["add a bundled SQL capability"],
+      },
+      {
+        product: "liboliphaunt-wasix",
+        before: "1.0.0",
+        after: "1.1.0",
+        changelogMode: undefined,
+        reasonSummaries: ["add a bundled SQL capability"],
+      },
+    ],
+  );
+});
+
+test("an insufficient runtime candidate is promoted to the shared-source intent", (t) => {
+  const root = fixture(t, V1);
+  writeCarrierDescriptor(root);
+  commit(root, "refactor(release): define runtime-owned contrib carriers");
+  git(root, "tag", "liboliphaunt-native-v1.0.0");
+  git(root, "tag", "liboliphaunt-wasix-v1.0.0");
+  writeFileSync(path.join(root, "src/extensions/contrib/postgres18.toml"), contribManifest("18.5"));
+  commit(root, "feat(contrib): add a bundled SQL capability");
+  const versions = { ...V1, "liboliphaunt-native": "1.0.1" };
+
+  assert.deepEqual(
+    sharedContribReleaseCandidates(
+      root,
+      runtimeGraph(versions),
+      [{
+        product: "liboliphaunt-native",
+        packagePath: PRODUCT_PATHS["liboliphaunt-native"],
+        before: "1.0.0",
+        after: "1.0.1",
+      }],
+      { prefix: "transition-test" },
+    ).map(({ product, before, after, changelogMode }) => ({ product, before, after, changelogMode })),
+    [
+      {
+        product: "liboliphaunt-native",
+        before: "1.0.1",
+        after: "1.1.0",
+        changelogMode: "merge-existing",
+      },
+      {
+        product: "liboliphaunt-wasix",
+        before: "1.0.0",
+        after: "1.1.0",
+        changelogMode: undefined,
+      },
+    ],
+  );
+});
+
+test("unsupported shared-source commit intent fails closed", (t) => {
+  const root = fixture(t, V1);
+  writeCarrierDescriptor(root);
+  commit(root, "refactor(release): define runtime-owned contrib carriers");
+  git(root, "tag", "liboliphaunt-native-v1.0.0");
+  git(root, "tag", "liboliphaunt-wasix-v1.0.0");
+  writeFileSync(path.join(root, "src/extensions/contrib/postgres18.toml"), contribManifest("18.5"));
+  commit(root, "chore: ambiguous shared source update");
+
+  assert.throws(
+    () => sharedContribReleaseCandidates(root, runtimeGraph(V1), [], { prefix: "transition-test" }),
+    /shared contrib source commit .* unsupported release intent/u,
   );
 });

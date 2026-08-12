@@ -28,13 +28,15 @@ Oliphaunt is a multi-product monorepo, not one repository-wide version:
   carriers.
 - `liboliphaunt-wasix` owns portable WASIX runtime assets and host AOT
   carriers.
+- Native and WASIX own independent versions. A change to one does not select
+  the other unless a declared directed compatibility dependency requires it.
 - Rust, Swift, Kotlin/Android, React Native, TypeScript, and WASIX Rust are
   separately versioned SDK products.
 - Broker and Node-direct helpers are separately versioned runtime products.
 - Every promoted SQL extension remains exactly selectable. PostgreSQL 18
-  contrib members share one runtime-bound distribution product and its stable
-  carriers; each external extension is a separately tagged, independently
-  versioned product.
+  contrib members share one logical artifact bundle whose native and WASIX
+  carriers belong to their respective runtime releases; each external extension
+  is a separately tagged, independently versioned product.
 
 A product owns its SemVer, changelog, source identity, product tag, and GitHub
 release. Platform packages, ABI payloads, and size-split crates are carriers of
@@ -91,13 +93,15 @@ carrier envelope. Selecting `earthdistance` may include its declared `cube`
 dependency; selecting `vector` does not pull unrelated extensions into the
 application.
 
-The `oliphaunt-extension-contrib-pg18` product is runtime-bound and moves with
-the linked runtime version group. Its target carriers contain an exact,
-checksummed member inventory, but consumers still stage only the requested SQL
-members. External extension products own independent packaging SemVer. Their
-immutable upstream version/commit and compatible Oliphaunt runtime versions are
-recorded separately, so consumers must not infer compatibility from matching
-version numbers.
+The `oliphaunt-extension-contrib-pg18` product owns its version independently.
+Its target carriers contain an exact, checksummed member inventory, but
+consumers still stage only the requested SQL members. Release selection follows
+directed dependencies: an exact runtime compatibility pin may select a consumer,
+but it does not create a shared version or a reverse dependency. External
+extension products likewise own independent packaging SemVer. Their immutable
+upstream version/commit and compatible Oliphaunt runtime versions are recorded
+separately, so consumers must not infer compatibility from matching version
+numbers.
 
 ## Development
 

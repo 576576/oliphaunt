@@ -39,6 +39,7 @@ function writeCarrier(
   extensions: Array<{
     dependencies: string[];
     product?: string;
+    releaseProduct?: string;
     sqlName: string;
     tag?: string;
     version?: string;
@@ -60,12 +61,14 @@ function writeCarrier(
     carriers: [],
     extensions: extensions.map((row) => {
       const owner = releaseOwnerForSqlName(row.sqlName);
-      const product = row.product ?? owner.releaseProduct;
+      const product = row.product ?? owner.artifactProduct;
+      const releaseProduct = row.releaseProduct ?? owner.releaseProduct;
       const version = row.version ?? options.ownerVersions?.[owner.releaseProduct] ?? baseVersion;
       return {
         ...row,
         product,
-        tag: row.tag ?? `${product}-v${version}`,
+        releaseProduct,
+        tag: row.tag ?? `${releaseProduct}-v${version}`,
         version,
       };
     }),
@@ -87,9 +90,12 @@ function writeCarrierPackage(
   const carrier = path.join(packageRoot, CARRIER_FILENAME);
   const packageVersion = options.version ?? '1.2.3';
   const nativeVersion = options.liboliphauntVersion ?? packageVersion;
+  const [firstExtension] = extensions;
   writeCarrier(carrier, extensions, {
     baseVersion: nativeVersion,
-    ownerVersions: options.product ? { [options.product]: packageVersion } : {},
+    ownerVersions: firstExtension === undefined
+      ? {}
+      : { [releaseOwnerForSqlName(firstExtension.sqlName).releaseProduct]: packageVersion },
   });
   writeJson(path.join(packageRoot, 'package.json'), {
     name: packageName,
@@ -134,11 +140,12 @@ test('normalizes exact extension selection', () => {
   assert.equal(extensionPackageName('vector'), '@oliphaunt/extension-vector');
   assert.deepEqual(selectedExtensionClosure(['earthdistance']), ['cube', 'earthdistance']);
   assert.deepEqual(releaseOwnerForSqlName('hstore'), {
+    artifactProduct: 'oliphaunt-extension-contrib-pg18',
     members: releaseOwnerForSqlName('earthdistance').members,
     mavenArtifact: 'oliphaunt-extension-contrib-pg18',
     mavenGroup: 'dev.oliphaunt.extensions',
     npmPackage: '@oliphaunt/extension-contrib-pg18',
-    releaseProduct: 'oliphaunt-extension-contrib-pg18',
+    releaseProduct: 'liboliphaunt-native',
     runtimeBound: true,
   });
 });
@@ -264,7 +271,7 @@ test('carrier discovery de-duplicates runtime-bound bundle dependencies', () => 
       basePackageRoot: baseRoot,
       env: {},
     });
-    assert.deepEqual(manifests, [baseCarrier, contribCarrier]);
+    assert.deepEqual(manifests, [baseCarrier, fs.realpathSync(contribCarrier)]);
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }
@@ -309,12 +316,12 @@ test('Android package discovery passes exact owner versions and rejects compatib
     assert.deepEqual(resolution.closure, ['cube', 'earthdistance', 'vector']);
     assert.equal(resolution.owners.length, 2);
     assert.deepEqual(resolution.extensionVersions, {
-      'oliphaunt-extension-contrib-pg18': '1.2.3',
+      'liboliphaunt-native': '1.2.3',
       'oliphaunt-extension-vector': '0.8.1',
     });
     assert.equal(
       serializeExtensionVersions(resolution.extensionVersions),
-      'oliphaunt-extension-contrib-pg18=1.2.3,oliphaunt-extension-vector=0.8.1',
+      'liboliphaunt-native=1.2.3,oliphaunt-extension-vector=0.8.1',
     );
     assert.throws(
       () =>
@@ -484,7 +491,7 @@ test('carrier discovery and staging fail closed', () => {
     ]);
     assert.throws(
       () => readCarrierSummary(fakeOwner),
-      /cube must be owned by oliphaunt-extension-contrib-pg18/,
+      /cube must belong to oliphaunt-extension-contrib-pg18/,
     );
 
     const leadingZero = path.join(root, 'leading-zero.json');
@@ -504,13 +511,13 @@ test('carrier discovery and staging fail closed', () => {
       {
         dependencies: ['cube'],
         sqlName: 'earthdistance',
-        tag: 'oliphaunt-extension-contrib-pg18-v1.2.4',
+        tag: 'liboliphaunt-native-v1.2.4',
         version: '1.2.4',
       },
     ]);
     assert.throws(
       () => readCarrierSummary(ownerConflict),
-      /conflicting releases for owner oliphaunt-extension-contrib-pg18/,
+      /conflicting releases for owner liboliphaunt-native/,
     );
 
     const invalid = path.join(root, 'invalid.json');

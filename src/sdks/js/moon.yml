@@ -11,8 +11,6 @@ dependsOn:
   - "oliphaunt-broker"
   - "oliphaunt-node-direct"
   - "shared-js-core"
-  - id: "shared-fixtures"
-    scope: "build"
 
 project:
   title: "Oliphaunt TypeScript SDK"
@@ -35,7 +33,6 @@ tasks:
     deps:
       - "liboliphaunt-native:check"
       - "oliphaunt-node-direct:check"
-      - "shared-contracts:check"
       - "shared-js-core:check"
     inputs:
       - "/src/shared/fixtures/**/*"
@@ -46,7 +43,6 @@ tasks:
       - "/tools/dev/write-scoped-pnpm-workspace.mjs"
       - "/src/sdks/js/**/*"
       - "/src/runtimes/node-direct/**/*"
-      - "/tools/release/release-product-dry-run.mjs"
       - "/tools/runtime/**/*"
     options:
       cache: true
@@ -57,7 +53,6 @@ tasks:
     deps:
       - "liboliphaunt-native:check"
       - "oliphaunt-node-direct:check"
-      - "shared-fixtures:check"
       - "shared-js-core:check"
     inputs:
       - "/src/shared/fixtures/**/*"
@@ -136,7 +131,6 @@ tasks:
         "release",
         "artifact-package",
         "ci-js-sdk-package",
-        "ci-js-sdk-exact-candidate-consumer",
       ]
     command: "tools/dev/bun.sh tools/release/build-sdk-ci-artifacts.mjs oliphaunt-js"
     deps:
@@ -167,7 +161,6 @@ tasks:
       - "/tools/release/release-cli-utils.mjs"
       - "/tools/release/release-graph.mjs"
       - "/tools/release/release-notices.mjs"
-      - "/tools/release/release-semantic-inputs.mjs"
       - "/tools/release/rust-native-targets.mjs"
       - "/tools/release/source-only-sdk-package.mjs"
       - "/tools/release/swift-source-carrier-contract.mjs"
@@ -237,7 +230,6 @@ tasks:
       - "/tools/dev/write-scoped-pnpm-workspace.mjs"
       - "/src/sdks/js/**/*"
       - "/src/runtimes/node-direct/**/*"
-      - "/tools/release/release-product-dry-run.mjs"
       - "/tools/runtime/**/*"
     options:
       cache: local

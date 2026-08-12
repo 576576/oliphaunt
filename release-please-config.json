@@ -39,15 +39,6 @@
     {
       "type": "node-workspace",
       "merge": false
-    },
-    {
-      "type": "linked-versions",
-      "groupName": "liboliphaunt-runtime",
-      "components": [
-        "liboliphaunt-native",
-        "liboliphaunt-wasix",
-        "oliphaunt-extension-contrib-pg18"
-      ]
     }
   ],
   "packages": {
@@ -247,13 +238,6 @@
           "jsonpath": "$.version"
         }
       ]
-    },
-    "src/extensions/contrib": {
-      "release-type": "simple",
-      "component": "oliphaunt-extension-contrib-pg18",
-      "package-name": "oliphaunt-extension-contrib-pg18",
-      "version-file": "VERSION",
-      "changelog-path": "CHANGELOG.md"
     },
     "src/extensions/external/pg_hashids": {
       "release-type": "simple",

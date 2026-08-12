@@ -48,8 +48,7 @@ source lives under `src/<product>/`.
 - Cross-product architecture, performance, release, and maintainer source docs
   live under `docs/`.
 - Shared fixture corpora consumed by at least two product-native test suites
-  live under `src/shared/fixtures/` and are governed by
-  `src/shared/contracts/test-matrix.toml`.
+  live under `src/shared/fixtures/`.
 - Pinned PostgreSQL source metadata, runtime-level third-party source pins,
   toolchain pins, extension-owned source pins, and generated extension catalogs
   live under `src/postgres/versions/18`, `src/sources/third-party`,
@@ -140,8 +139,8 @@ gap must be represented as an explicit unsupported error and justified in
 - `tools/xtask/src/main.rs` is the command router plus shared helpers. WASIX
   asset build, packaging, generated manifest, AOT packaging, and staged metadata
   orchestration lives in `tools/xtask/src/asset_pipeline.rs`. Source-controlled
-  asset verification, canonical generated-asset layout checks, asset input
-  fingerprinting, AOT target catalog checks, and upstream-fix audits live in
+  asset verification, canonical generated-asset layout checks, AOT target
+  catalog checks, and upstream-fix audits live in
   `tools/xtask/src/asset_checks.rs`. Generated asset manifest DTOs, AOT
   manifest DTOs, asset packaging descriptors, and WASM link-metadata parsing
   live in

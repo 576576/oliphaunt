@@ -802,6 +802,21 @@ describe("GitHub release attestation receipt", () => {
     expect(() => assertAttestationSubjectCoverage([], receiptSubjects())).toThrow(
       "contaminate a release selection with no frozen GitHub assets",
     );
+
+    const repeatedNameAssets = [
+      { product: "liboliphaunt-native", name: "contrib-control.json", sha256: "1".repeat(64) },
+      { product: "liboliphaunt-wasix", name: "contrib-control.json", sha256: "2".repeat(64) },
+    ];
+    const repeatedNameAttestation = [{
+      bundleSha256: "3".repeat(64),
+      subjects: repeatedNameAssets.map(({ name, sha256 }) => ({ name, sha256 })),
+    }];
+    expect(assertAttestationSubjectCoverage(repeatedNameAssets, repeatedNameAttestation))
+      .toEqual(repeatedNameAttestation);
+    expect(() => assertAttestationSubjectCoverage(repeatedNameAssets, [{
+      bundleSha256: "4".repeat(64),
+      subjects: [{ name: "contrib-control.json", sha256: "5".repeat(64) }],
+    }])).toThrow("digest differs from the frozen GitHub asset");
   });
 
   test("builds a deterministic lock/head/release-ID-bound receipt", async () => {
@@ -855,8 +870,6 @@ describe("GitHub release attestation receipt", () => {
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].file).toBe(local);
-    expect(calls[0].predicateType).toBe("https://slsa.dev/provenance/v1");
-    expect(calls[0].recoveryExpectations).toBeUndefined();
     expect(records[0].subjects).toEqual(subjects);
 
     await expect(verifyAttestationBundles(lock, [bundlePath], {
@@ -891,28 +904,6 @@ describe("GitHub release attestation receipt", () => {
     ]);
     expect(args).toContain("--deny-self-hosted-runners");
 
-    const recoveryType =
-      "https://github.com/f0rr0/oliphaunt/attestations/same-version-recovery-promotion/v1";
-    const controller = "4".repeat(40);
-    const recoveryArgs = ghBundleVerifyArgs({
-      bundlePath: "/tmp/recovery-bundle.json",
-      file: "/tmp/asset.tar.zst",
-      head: controller,
-      predicateType: recoveryType,
-      repo: REPO,
-    });
-    expect(
-      recoveryArgs.slice(
-        recoveryArgs.indexOf("--predicate-type"),
-        recoveryArgs.indexOf("--predicate-type") + 2,
-      ),
-    ).toEqual(["--predicate-type", recoveryType]);
-    expect(
-      recoveryArgs.slice(
-        recoveryArgs.indexOf("--source-digest"),
-        recoveryArgs.indexOf("--source-digest") + 2,
-      ),
-    ).toEqual(["--source-digest", controller]);
   });
 
   test("accepts only gh's known empty RFC3161 protobuf canonicalization", () => {

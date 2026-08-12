@@ -42,10 +42,6 @@ tasks:
     tags: ["quality", "static"]
     command: "node src/runtimes/liboliphaunt/native/tools/check-patch-stack.mjs"
     deps:
-      - "postgres18:check"
-      - "third-party-shared:check"
-      - "third-party-native:check"
-      - "extension-runtime-contract:check"
       - "liboliphaunt-native:external-source-fetch-test"
       - "liboliphaunt-native:generation-lifecycle-test"
       - "liboliphaunt-native:ios-extension-packager-test"
@@ -105,7 +101,6 @@ tasks:
     tags: ["quality", "unit"]
     script: |
       bash src/runtimes/liboliphaunt/native/bin/postgis-reproducible-time.test.sh
-      tools/dev/bun.sh test tools/release/postgis-reproducible-time.test.mjs
     inputs:
       - "/src/extensions/external/postgis/source.toml"
       - "/src/extensions/external/postgis/tools/build_wasix.sh"
@@ -120,7 +115,6 @@ tasks:
       - "/src/runtimes/liboliphaunt/native/bin/build-postgres18-windows.ps1"
       - "/src/runtimes/liboliphaunt/native/bin/mobile-postgis-extensions.sh"
       - "/src/runtimes/liboliphaunt/native/bin/postgis-reproducible-time.test.sh"
-      - "/tools/release/postgis-reproducible-time.test.mjs"
       - "/tools/xtask/src/asset_checks.rs"
       - "/tools/xtask/src/asset_manifest.rs"
       - "/tools/xtask/src/asset_pipeline.rs"
@@ -210,7 +204,6 @@ tasks:
   release-runtime:
     tags: ["runtime", "release"]
     deps:
-      - "extension-runtime-contract:check"
       - "source-inputs:source-fetch-native-runtime"
     command: "node src/runtimes/liboliphaunt/native/tools/build-release-runtime.mjs"
     inputs:
@@ -246,7 +239,6 @@ tasks:
     tags: ["runtime", "release", "ci-liboliphaunt-native-desktop"]
     deps:
       - "liboliphaunt-native:check"
-      - "extension-runtime-contract:check"
       - "source-inputs:source-fetch-native-runtime"
     command: "node src/runtimes/liboliphaunt/native/tools/build-release-runtime.mjs"
     inputs:
@@ -288,7 +280,6 @@ tasks:
       ]
     deps:
       - "liboliphaunt-native:check"
-      - "extension-runtime-contract:check"
       - "source-inputs:source-fetch-native-runtime"
     command: "bun src/runtimes/liboliphaunt/native/tools/build-ci-target.mjs \"$OLIPHAUNT_CI_TARGET\""
     inputs:
@@ -329,48 +320,6 @@ tasks:
       - "/target/liboliphaunt/release-assets/**/*"
     outputs:
       - "/target/liboliphaunt/release-assets/**/*"
-    options:
-      cache: false
-      runFromWorkspaceRoot: true
-      runInCI: true
-  registry-carrier-qualification:
-    tags: ["runtime", "release", "artifact-package", "ci-liboliphaunt-native-release-assets"]
-    deps:
-      - "liboliphaunt-native:release-assets"
-    command: "tools/dev/bun.sh tools/release/offline-registry-carrier-qualification.mjs --scope native"
-    inputs:
-      - "/.release-please-manifest.json"
-      - "/release-please-config.json"
-      - "/src/runtimes/liboliphaunt/native/VERSION"
-      - "/src/runtimes/liboliphaunt/native/packages/**/*"
-      - "/src/runtimes/liboliphaunt/native/tools-packages/**/*"
-      - "/src/runtimes/liboliphaunt/native/icu-npm/**/*"
-      - "/src/runtimes/liboliphaunt/licenses/**/*"
-      - "/tools/dev/capture-command-output.mjs"
-      - "/tools/release/archive_dir.mjs"
-      - "/tools/release/atomic-directory.mjs"
-      - "/tools/release/build_maven_artifact_manifest.mjs"
-      - "/tools/release/cargo-source-package.mjs"
-      - "/tools/release/check-liboliphaunt-release-assets.mjs"
-      - "/tools/release/extension-registry-carrier-materializer.mjs"
-      - "/tools/release/extension-runtime-asset-contract.mjs"
-      - "/src/sdks/js/src/native/extension-contract.ts"
-      - "/tools/release/local-registry-publish.mjs"
-      - "/tools/release/maven-artifact-staging.mjs"
-      - "/tools/release/maven-central-contract.mjs"
-      - "/tools/release/offline-registry-carrier-qualification.mjs"
-      - "/tools/release/optimize_native_runtime_payload.mjs"
-      - "/tools/release/package-liboliphaunt-cargo-artifacts.mjs"
-      - "/tools/release/release-artifact-targets.mjs"
-      - "/tools/release/release-notices.mjs"
-      - "/tools/release/release-product-dry-run.mjs"
-      - "/tools/release/rust-build-script-sha256.mjs"
-      - "/target/liboliphaunt/release-assets/**/*"
-    outputs:
-      - "/target/liboliphaunt/cargo-artifacts/**/*"
-      - "/target/release/maven-staging/liboliphaunt-native-maven-dry-run/**/*"
-      - "/target/release/npm-packages/**/*"
-      - "/target/release-work/offline-registry-carrier-qualification/native.json"
     options:
       cache: false
       runFromWorkspaceRoot: true

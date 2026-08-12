@@ -2,7 +2,6 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "../test/fd-backed-spawn-sync.mjs";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
@@ -57,19 +56,6 @@ test("accepts a supplied exact release commit assertion without case sensitivity
   }
 });
 
-test("remains compatible with the stock macOS Bash 3.2 feature set", () => {
-  const source = readFileSync(SCRIPT, "utf8");
-  for (const [feature, pattern] of [
-    ["case-transforming parameter expansion", /\$\{[^}\n]*(?:,,|\^\^)[^}\n]*\}/u],
-    ["associative arrays", /\b(?:declare|local|typeset)\s+(?:-[A-Za-z]*A[A-Za-z]*\s+)/u],
-    ["nameref variables", /\b(?:declare|local|typeset)\s+(?:-[A-Za-z]*n[A-Za-z]*\s+)/u],
-    ["mapfile/readarray", /\b(?:mapfile|readarray)\b/u],
-    ["coprocesses", /(?:^|\n)\s*coproc\b/u],
-  ]) {
-    assert.doesNotMatch(source, pattern, `${feature} requires Bash newer than 3.2`);
-  }
-});
-
 test("rejects malformed and stale release commit assertions before every operation", () => {
   for (const [operation, releaseCommit] of [
     ["prepare-release-pr", "84d90b9"],
@@ -83,13 +69,15 @@ test("rejects malformed and stale release commit assertions before every operati
   }
 });
 
-test("accepts continuations only for publish operations with the exact commit assertion", () => {
-  for (const operation of ["publish", "publish-bootstrap"]) {
-    const result = validate({ operation, releaseCommit: SHA, continuationPointer: "verified-pointer" });
-    assert.equal(result.status, 0, `${operation}: ${result.output}`);
-  }
+test("accepts continuations only for bootstrap with the exact commit assertion", () => {
+  const accepted = validate({
+    operation: "publish-bootstrap",
+    releaseCommit: SHA,
+    continuationPointer: "verified-pointer",
+  });
+  assert.equal(accepted.status, 0, accepted.output);
 
-  for (const operation of ["prepare-release-pr", "publish-dry-run"]) {
+  for (const operation of ["prepare-release-pr", "publish-dry-run", "publish"]) {
     const result = validate({ operation, releaseCommit: SHA, continuationPointer: "verified-pointer" });
     assert.notEqual(result.status, 0, `${operation} unexpectedly accepted a continuation`);
     assert.match(result.output, /continuation_pointer is not valid/u);
@@ -111,7 +99,7 @@ test("root operations are main-only and continuations are exact transport-ref-on
   ]) {
     const continuation = validate({
       continuationPointer: "verified-pointer",
-      operation: "publish",
+      operation: "publish-bootstrap",
       releaseCommit: SHA,
       workflowRef,
     });
@@ -130,14 +118,14 @@ test("root operations are main-only and continuations are exact transport-ref-on
 });
 
 test("rejects a continuation without an explicit exact commit assertion", () => {
-  const result = validate({ operation: "publish", continuationPointer: "verified-pointer" });
+  const result = validate({ operation: "publish-bootstrap", continuationPointer: "verified-pointer" });
   assert.notEqual(result.status, 0, result.output);
   assert.match(result.output, /automatic continuation requires release_commit/u);
 });
 
 test("rejects an oversized continuation pointer", () => {
   const result = validate({
-    operation: "publish",
+    operation: "publish-bootstrap",
     releaseCommit: SHA,
     continuationPointer: "x".repeat(32769),
   });

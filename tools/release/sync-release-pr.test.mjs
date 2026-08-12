@@ -10,16 +10,37 @@ import {
   cargoManifestPaths,
   extensionEvidenceSummaryCommand,
   releaseDerivedPathInventory,
-  releaseSemanticFingerprintDerivedEntries,
+  sharedContribBootstrapRequired,
   syncExampleCargoManifestText,
   syncLockfile,
+  syncTypescriptOptionalRuntimeDependencies,
 } from "./sync-release-pr.mjs";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const SUMMARY_PATH = "src/extensions/generated/docs/extension-evidence.json";
-const RUST_RELEASE_CONSUMER_LOCK = "src/sdks/rust/tests/release-consumer/Cargo.lock";
 const CHECKER_PATH = "src/extensions/tools/check-extension-model.mjs";
 const EVIDENCE_SELF_TEST_PROCESS_TIMEOUT_MS = 15_000;
+
+test("shared contrib bootstrap is allowed only from unreleased main state", () => {
+  assert.equal(
+    sharedContribBootstrapRequired([], () => [{ product: "liboliphaunt-native" }]),
+    true,
+  );
+  assert.equal(sharedContribBootstrapRequired([], () => []), false);
+  let discoveries = 0;
+  assert.equal(
+    sharedContribBootstrapRequired(
+      [{ product: "liboliphaunt-native", before: "0.1.0", after: "0.1.1" }],
+      () => {
+        discoveries += 1;
+        throw new Error("released main must not run shared candidate discovery");
+      },
+    ),
+    false,
+    "a released or pending main transition must not seed another release PR",
+  );
+  assert.equal(discoveries, 0);
+});
 
 test("release sync selects the narrow evidence-summary mutation", () => {
   assert.deepEqual(extensionEvidenceSummaryCommand({ write: true }), [
@@ -38,10 +59,9 @@ test("release commit inventory owns the deterministic evidence summary", () => {
   assert.equal(releaseDerivedPathInventory().includes(SUMMARY_PATH), true);
 });
 
-test("release commit inventory owns every tracked Cargo lock used by an exact consumer", () => {
+test("release commit inventory owns the workspace Cargo lock", () => {
   const inventory = releaseDerivedPathInventory();
   assert.equal(inventory.includes("Cargo.lock"), true);
-  assert.equal(inventory.includes(RUST_RELEASE_CONSUMER_LOCK), true);
 });
 
 test("Cargo manifest inventory retains a successful child's final NUL record", () => {
@@ -91,7 +111,7 @@ test("Cargo manifest inventory rejects a successful partial NUL record", () => {
 });
 
 test("release sync updates only unsourced local packages in a nested Cargo lock", () => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-release-consumer-lock-"));
+  const directory = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-release-lock-"));
   try {
     const lockfile = path.join(directory, "Cargo.lock");
     const initial = `version = 4
@@ -199,31 +219,36 @@ oliphaunt-target = { version = "=0.1.0", features = [
   );
 });
 
-test("release sync refreshes the evidence summary after the asset fingerprint", () => {
-  const source = readFileSync(path.join(ROOT, "tools/release/sync-release-pr.mjs"), "utf8");
-  const fingerprintCall = source.indexOf("syncAssetInputFingerprint(changes, { write });");
-  const summaryCall = source.indexOf("syncExtensionEvidenceSummary(changes, { write });");
-  assert.notEqual(fingerprintCall, -1);
-  assert.notEqual(summaryCall, -1);
-  assert.equal(fingerprintCall < summaryCall, true);
-});
+test("a JavaScript release transition synchronizes its optional runtime versions", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "oliphaunt-js-runtime-sync-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const packageFile = path.join(directory, "package.json");
+  writeFileSync(
+    packageFile,
+    `${JSON.stringify({
+      name: "fixture",
+      optionalDependencies: {
+        "@oliphaunt/liboliphaunt-native": "workspace:0.1.0",
+        "@oliphaunt/liboliphaunt-wasix": "workspace:0.1.0",
+      },
+    }, null, 2)}\n`,
+  );
+  const changes = [];
+  await syncTypescriptOptionalRuntimeDependencies(changes, {
+    write: true,
+    transitions: [{ product: "oliphaunt-js" }],
+    packageFile,
+    runtimeVersions: {
+      "@oliphaunt/liboliphaunt-native": "workspace:0.1.1",
+      "@oliphaunt/liboliphaunt-wasix": "workspace:0.2.0",
+    },
+  });
 
-test("release sync closes semantic fingerprints after every derived byte input", () => {
-  const source = readFileSync(path.join(ROOT, "tools/release/sync-release-pr.mjs"), "utf8");
-  const summaryCall = source.indexOf("syncExtensionEvidenceSummary(changes, { write });");
-  const semanticCall = source.indexOf("syncDerivedReleaseSemanticFingerprints(changes, { write });");
-  assert.notEqual(summaryCall, -1);
-  assert.notEqual(semanticCall, -1);
-  assert.equal(summaryCall < semanticCall, true);
-
-  const inventory = new Set(releaseDerivedPathInventory());
-  const entries = releaseSemanticFingerprintDerivedEntries();
-  assert.equal(entries.length > 0, true);
-  assert.equal(new Set(entries.map(({ product }) => product)).size, entries.length);
-  assert.equal(new Set(entries.map(({ path: fingerprintPath }) => fingerprintPath)).size, entries.length);
-  for (const { path: fingerprintPath } of entries) {
-    assert.equal(inventory.has(fingerprintPath), true, fingerprintPath);
-  }
+  assert.deepEqual(JSON.parse(readFileSync(packageFile, "utf8")).optionalDependencies, {
+    "@oliphaunt/liboliphaunt-native": "workspace:0.1.1",
+    "@oliphaunt/liboliphaunt-wasix": "workspace:0.2.0",
+  });
+  assert.equal(changes.length, 1);
 });
 
 test("generated release readiness closes the cheap pre-fanout fixed point", () => {

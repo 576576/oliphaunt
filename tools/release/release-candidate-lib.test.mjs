@@ -175,7 +175,25 @@ test("rejects substituted evidence bytes even when provenance fields still match
   }
 });
 
-test("rejects evidence from another run attempt or job", () => {
+test("accepts WASIX evidence from an earlier attempt of the same run and source", () => {
+  const { root, cleanup } = fixture();
+  try {
+    writeEvidence(root, { runAttempt: 1 });
+    const evidence = wasixEvidenceBinding(root, {
+      repository: "f0rr0/oliphaunt",
+      workflow: "CI",
+      runId: "123456789",
+      runAttempt: 2,
+      sha: "a".repeat(40),
+      tree: "c".repeat(40),
+    });
+    expect(evidence.github.runAttempt).toBe(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("rejects newer-attempt or provenance-mismatched WASIX evidence", () => {
   const attemptFixture = fixture();
   try {
     writeEvidence(attemptFixture.root, { runAttempt: 2 });
@@ -186,24 +204,36 @@ test("rejects evidence from another run attempt or job", () => {
       runAttempt: 1,
       sha: "a".repeat(40),
       tree: "c".repeat(40),
-    })).toThrow("runAttempt mismatch");
+    })).toThrow("must not be newer than the candidate attempt");
   } finally {
     attemptFixture.cleanup();
   }
 
-  const jobFixture = fixture();
+  const provenanceFixture = fixture();
   try {
-    writeEvidence(jobFixture.root, { job: "different-job" });
-    expect(() => wasixEvidenceBinding(jobFixture.root, {
+    writeEvidence(provenanceFixture.root);
+    const expected = {
       repository: "f0rr0/oliphaunt",
       workflow: "CI",
       runId: "123456789",
       runAttempt: 1,
       sha: "a".repeat(40),
       tree: "c".repeat(40),
-    })).toThrow("GitHub job mismatch");
+    };
+    expect(() => wasixEvidenceBinding(provenanceFixture.root, {
+      ...expected,
+      runId: "987654321",
+    })).toThrow("GitHub runId mismatch");
+    expect(() => wasixEvidenceBinding(provenanceFixture.root, {
+      ...expected,
+      sha: "d".repeat(40),
+    })).toThrow("sourceCommit mismatch");
+    expect(() => wasixEvidenceBinding(provenanceFixture.root, {
+      ...expected,
+      tree: "d".repeat(40),
+    })).toThrow("sourceTree mismatch");
   } finally {
-    jobFixture.cleanup();
+    provenanceFixture.cleanup();
   }
 });
 
@@ -254,69 +284,6 @@ test("keeps legacy F4 qualification plans backward-compatible as full-payload", 
     expect(affectedPlan.qualification).toBeUndefined();
     expect(candidateQualificationMode(candidate)).toBe("full-payload");
     expect(() => assertCandidateBindingShape(candidate)).not.toThrow();
-  } finally {
-    cleanup();
-  }
-});
-
-test("binds recovery-control to an exact source/controller range without payload jobs", () => {
-  const { root, cleanup } = fixture();
-  try {
-    const releaseSha = "1".repeat(40);
-    const controllerSha = "2".repeat(40);
-    const planPath = path.join(root, "recovery-plan.json");
-    writeFileSync(planPath, JSON.stringify({
-      qualification_mode: "recovery-control",
-      qualification_base_sha: releaseSha,
-      qualification_head_sha: controllerSha,
-      projects: ["release-tools"],
-      jobs: ["affected"],
-      extension_package_products: [],
-    }));
-    const affectedPlan = affectedPlanBinding(planPath, false);
-    const candidate = {
-      schemaVersion: 2,
-      sha: controllerSha,
-      affectedPlan,
-      evidenceRequirements: {
-        wasixReleaseRegression: false,
-        artifacts: [],
-      },
-      evidence: { wasixReleaseRegression: null },
-    };
-    expect(candidateQualificationMode(candidate)).toBe("recovery-control");
-    expect(affectedPlan.qualification).toEqual({
-      mode: "recovery-control",
-      baseSha: releaseSha,
-      headSha: controllerSha,
-    });
-    expect(() => assertCandidateBindingShape(candidate)).not.toThrow();
-
-    const substituted = structuredClone(candidate);
-    substituted.affectedPlan.qualification.headSha = "3".repeat(40);
-    expect(() => assertCandidateBindingShape(substituted)).toThrow(
-      "controller does not match candidate SHA",
-    );
-  } finally {
-    cleanup();
-  }
-});
-
-test("rejects recovery-control plans that select any payload job", () => {
-  const { root, cleanup } = fixture();
-  try {
-    const planPath = path.join(root, "invalid-recovery-plan.json");
-    writeFileSync(planPath, JSON.stringify({
-      qualification_mode: "recovery-control",
-      qualification_base_sha: "1".repeat(40),
-      qualification_head_sha: "2".repeat(40),
-      projects: [],
-      jobs: ["affected", "js-sdk-package"],
-      extension_package_products: [],
-    }));
-    expect(() => affectedPlanBinding(planPath, false)).toThrow(
-      "must not select builder or E2E payload jobs",
-    );
   } finally {
     cleanup();
   }

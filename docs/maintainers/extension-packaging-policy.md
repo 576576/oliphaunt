@@ -16,12 +16,11 @@ verified external artifact index.
 ## Release products and carriers
 
 Release ownership is not the same thing as SQL selection. The 32 promoted
-PostgreSQL 18 contrib members belong to one independently tagged distribution
-product, `oliphaunt-extension-contrib-pg18`. Its packaging version, changelog,
-and compatibility metadata live at `src/extensions/contrib/`; it is
-runtime-bound and shares the runtime linked-version group. Contrib member
-folders retain exact build, target, and evidence metadata but do not own leaf
-versions, changelogs, tags, or package identities.
+PostgreSQL 18 contrib members have native carriers owned by
+`liboliphaunt-native` and WASIX carriers owned by `liboliphaunt-wasix`. The
+shared inventory has no version, changelog, or tag of its own. A shared contrib
+source change selects both runtimes; a native-only change does not select WASIX
+and a WASIX-only change does not select native.
 
 Every build-enabled, stable promoted external extension is an independently
 tagged release product. Its packaging version, changelog, immutable upstream
@@ -32,8 +31,8 @@ packages merely because its source pin exists.
 
 For an external extension, `release.toml` is the active-public-product
 boundary, not general build metadata. A deferred extension must have no
-`release.toml`, `VERSION`, `CHANGELOG.md`, release-semantic fingerprint,
-Release Please component, or Moon release-product metadata. Its source pin,
+`release.toml`, `VERSION`, `CHANGELOG.md`, Release Please component, or Moon
+release-product metadata. Its source pin,
 recipe, target profiles, build tasks, and qualification evidence remain so CI
 can continue proving the implementation without reserving or publishing a
 package identity.
@@ -50,7 +49,7 @@ runtime supports it.
 Ecosystem packages are carriers, not extra products: a stable Cargo façade,
 native/WASIX Cargo leaves, an npm façade plus selected platform packages,
 Android ABI Maven artifacts, and SwiftPM/GitHub assets as declared by the
-target contract. Contrib carriers are shared by the contrib product and contain
+target contract. Contrib carriers use their owning runtime release and contain
 an exact member inventory with nested path, byte count, and checksum for every
 SQL member. External products have separate carriers and versions. Every
 consumer resolves by SQL name and extracts/stages only the selected member and

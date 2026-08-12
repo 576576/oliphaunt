@@ -411,9 +411,10 @@ function assertLightweightVersioning() {
   for (const required of [
     '| Product | Current source version | First public version | Version relationship | Publish targets | Tag prefix |',
     'unreleased sentinel',
-    'runtime-bound',
+    'Shared PostgreSQL contrib carrier inputs select both runtime owners',
     'upstream-bound',
-    'Release coupling is derived from Moon production and peer dependency scopes',
+    'Release Please selects changed product paths',
+    'Native and WASIX are independent products',
     'liboliphaunt-native',
     'oliphaunt-react-native',
     'oliphaunt-wasix-rust',
