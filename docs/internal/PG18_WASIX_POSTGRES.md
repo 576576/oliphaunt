@@ -1,9 +1,13 @@
 # PG18 WASIX PostgreSQL Runtime
 
+> **Historical implementation snapshot — non-normative.** This document records
+> an earlier runtime design and may name superseded artifacts or APIs. Current
+> source, package metadata, and maintainer contracts are authoritative.
+
 This runtime is the fresh PostgreSQL 18 WASIX build that keeps the released
 Oliphaunt WASM product shape: one embedded backend behind the direct Rust API
-and the local server wrapper.  It is not the concurrent full PostgreSQL WASIX
-experiment and should not take postmaster or multi-backend assumptions as a
+and the local server wrapper. It is the single-backend peer of the concurrent
+WASIX postmaster product and should not take multi-backend assumptions as a
 performance constraint.
 
 ## Target Shape
@@ -13,55 +17,49 @@ performance constraint.
 - Existing released-lane capabilities preserved before replacement:
   protocol execution, template packaging, initdb, pg_dump, bundled extensions,
   runtime support modules, and the server wrapper.
-- The released artifact pipeline packages standalone WASIX `initdb` and
-  `pg_dump` tools.  `pg_dumpall.c` is patched only because it shares the
-  renamed pg_dump helper; pg_dumpall and psql are not separate packaged WASIX
-  tools in this lane unless future work adds them explicitly.
+- The released artifact pipeline packages standalone WASIX `initdb`,
+  `pg_dump`, and `psql` tools. `pg_dumpall.c` is patched only because it shares
+  the renamed pg_dump helper; `pg_dumpall` is not a packaged WASIX tool.
 - Patch series kept small, ordered, and reviewable.  Each patch should explain
   which PostgreSQL invariant it changes and why the embedded WASIX runtime
   still preserves the useful part of that invariant.
-- Performance goal is to beat the released PG17.5 WASIX lane on the existing
-  benches before this becomes a replacement candidate.
+- Performance comparisons use the released PG17.5 WASIX lane on the existing
+  benches; this document makes no replacement claim.
 
-## Research Assessment
+## Topology Decision
 
-The concurrent full-PostgreSQL WASIX experiment is still valuable for finding
-Wasmer, WASIX libc, fork, socket, shared-memory, and toolchain blockers, but it
-is not the right replacement path for the released embedded product yet.  The
-experiment evidence points to persistent process/fork/shmem/socket/RSS costs
-before query execution, while the released product wins by keeping one backend,
-one host lifecycle, direct FE/BE pumping, prebuilt PGDATA, and AOT reuse.
+The single-backend runtime and concurrent
+[`liboliphaunt-wasix-postmaster`](../../src/runtimes/liboliphaunt/wasix-postmaster/README.md)
+are peer release products. Neither replaces or silently falls back to the
+other. The single-backend product keeps one host lifecycle, direct FE/BE
+pumping, prebuilt PGDATA, and AOT reuse. The postmaster product owns sockets,
+shared memory, process handoff, and one isolated backend per connection.
 
 The practical direction is therefore:
 
-- Keep full concurrent PostgreSQL under WASIX as upstream/runtime research and
-  a correctness oracle for patches that should eventually make WASIX more
-  POSIX-like.
-- Build the replacement product as PG18 WASIX `wasix-dl`, preserving the
-  released Oliphaunt-style execution model and only taking runtime patches that
-  improve that model.
-- Treat the PG18 experiment's PostgreSQL hot-path patches as candidates after
-  parity is buildable.  The strongest candidates are WASIX-gated
-  `hash_bytes()` load folding, top-level `TransactionIdIsCurrentTransactionId`
-  short-circuiting, and narrow btree int4 comparator fast paths.  They attack
-  hot guest CPU paths without changing the host lifecycle.
+- Keep PG18 WASIX `wasix-dl` as the low-overhead embedded topology.
+- Keep concurrent PostgreSQL in the postmaster product, with its own guest
+  patch stack, carrier, target claims, and concurrency/recovery qualification.
+- Share source inputs and topology-neutral patches; do not import single-backend
+  spinlock, worker, process, or lifecycle assumptions into postmaster.
+- Treat topology-neutral PostgreSQL hot-path changes as candidates only after
+  focused regression coverage. `hash_bytes()` load folding, top-level
+  `TransactionIdIsCurrentTransactionId` short-circuiting, and narrow btree int4
+  comparator fast paths attack guest CPU paths without changing host lifecycle.
 - Keep diagnostic toggles, such as bottom-up btree delete disabling, out of the
   default product path unless benchmarks prove a production-safe default.
 - Defer broader planner/executor shortcuts, locale-sensitive LIKE shortcuts,
   and stack-allocation rewrites until they have focused regression coverage,
   because they can silently change SQL semantics or memory pressure.
-- Record every full-PG experiment patch in
+- Preserve the concluded cross-topology patch review in
   `src/runtimes/liboliphaunt/wasix/assets/build/postgres/experiment-patch-disposition.toml`
-  before porting or rejecting it.  The source-spine guard checks that manifest
-  so experiment patches cannot be copied into this runtime without a WASIX
-  rationale.
+  and require a fresh WASIX rationale before adopting any additional
+  postmaster-originated patch into the embedded runtime.
 
-The immediate conclusion is that a "proper" concurrent PostgreSQL under WASIX
-is unlikely to match native PostgreSQL or released Oliphaunt-style WASM performance
-soon.  A fresh PG18 WASIX runtime can plausibly beat the released PG17.5 lane
-because it keeps the low-overhead lifecycle while inheriting newer PostgreSQL,
-newer WASIX/Wasmer fixes, tighter host ABI boundaries, and targeted hot-path
-patches from the experiment.
+Current postmaster architecture and performance interpretation are maintained
+in [`docs/maintainers/wasix-postmaster.md`](../maintainers/wasix-postmaster.md).
+Historical carrier measurements are not current release evidence for either
+topology.
 
 ## PG17.5 Release-Lane Implementation Comparison
 
@@ -180,7 +178,7 @@ Useful findings from that branch:
   backend was made to look postmaster-owned.  The active PG18 lane now does the
   same under `OLIPHAUNT_WASM_SINGLE_USER`.
 - It shortens `PGSemaphoreReset()` to one `sem_trywait()` under Oliphaunt.  The
-  active PG18 lane ports this as part of the current 37-patch stack.  It is a
+  active PG18 lane ports this as part of the current canonical patch stack.  It is a
   lifecycle/runtime cleanup optimization, not an explanation for the earlier
   isolated Test 11 COMMIT gap.
 - It changes `pg_flush_data()` to call `fsync()` under oliphaunt.  That is a
@@ -274,8 +272,8 @@ not by wholesale copying more upstream Oliphaunt code.
    family with int4 input on both sides and InvalidOid collation, while still
    using `index_getattr()` and falling back to upstream comparison for every
    other case. Done in patch 0016; the more aggressive direct tuple-data
-   shortcut from the full-PG experiment remains intentionally unported pending
-   runtime evidence and tighter layout proof.
+   shortcut from the full-PG experiment is excluded because it lacks the
+   required layout proof and runtime evidence.
 17. Btree delete scratch buffers: keep `MaxTIDsPerBTreePage` simple-deletion
    and bottom-up-deletion scratch arrays on the stack in the embedded WASIX
    lane. The arrays are page-size bounded and PostgreSQL already uses similar
@@ -298,29 +296,31 @@ not by wholesale copying more upstream Oliphaunt code.
 22. Performance work: carry Wasmer, WASIX libc, LTO/codegen, file-system, and
    memory-growth improvements into this lane only after parity is testable.
 
-## Experiment Patch Disposition
+## Historical Patch Disposition
 
-The full-concurrent PG18 WASIX experiment remains useful prior art, but its
-patches are not the default source of truth for this lane.  The reviewed
-disposition manifest is:
+The postmaster product's early patch stack was useful prior art, but its
+topology-specific patches are not the source of truth for this lane. The
+reviewed historical disposition manifest is:
 
 ```sh
 src/runtimes/liboliphaunt/wasix/assets/build/postgres/experiment-patch-disposition.toml
 ```
 
-The manifest records each experiment patch by filename, whether it was ported,
-replaced, deferred, or rejected, and why that decision fits a single-backend
-WASIX product.  The currently carried performance/tool patches are the hash
-load fast path, top-XID visibility fast path, guarded btree int4 comparator,
-btree delete scratch-buffer stack placement, LIKE substring shortcut, first
-int4 leaf compare shortcut, and pg_dump LTO symbol hygiene.  The
-bottom-up-delete runtime toggle and full EXEC_BACKEND/fork runtime patches
-remain outside the default lane.
+The manifest records each reviewed patch by filename, whether it was applied,
+adopted from current main, or rejected, and why that decision fits a
+single-backend WASIX product. The five compatible optimizations—hash-load,
+top-XID visibility, guarded btree int4 comparison, LIKE literal substring, and
+first int4 leaf comparison—are owned by the main WASIX runtime. The postmaster
+consumes those exact patches through
+`postgres/main-optimizations.series` instead of maintaining copies. The
+single-user-only btree delete stack placement, bottom-up-delete runtime toggle,
+and full concurrent-postmaster runtime patches remain outside the default
+single-backend lane. The postmaster keeps its narrow pg_dump LTO hygiene patch
+locally because it belongs to that build topology.
 
-When the full-PG experiment checkout exists locally, the source-spine guard
-also compares the disposition manifest against the actual experiment patch
-directory, so new experiment patches cannot appear without an explicit
-embedded-runtime decision.
+The source-spine guard keeps those concluded decisions explicit. New shared
+optimizations must be adopted through the canonical single-backend patch stack;
+postmaster lifecycle patches remain owned by the postmaster product.
 
 ## Current Slice
 
@@ -339,8 +339,8 @@ The source-spine guard also requires that file to match the duplicate
 and the applied patch order cannot drift silently.  It also rejects orphan
 `.patch` files that are not listed in the series; source fingerprints and
 applied patch contents must describe the same stack.  The guard also checks
-that the stack remains reviewable: currently exactly 31 sequentially numbered
-`oliphaunt-wasix` patches, each with a matching subject/filename slug, an
+that the stack remains reviewable: sequentially numbered `oliphaunt-wasix`
+patches, each with a matching subject/filename slug, an
 Oliphaunt maintainer header, and a short rationale before the diff.  When a
 prepared PG18 source tree exists, xtask recomputes the source fingerprint from
 the PostgreSQL tarball metadata, patch series file, and patch file hashes, then
@@ -419,7 +419,7 @@ the applied runtime, tool, contrib, and hot-path patch markers.  The PG18
 source-spine command defaults to source-only validation; `--strict-local` also
 requires the shared non-backend source checkouts to be present, clean, and pinned.
 
-Once those outputs exist, `assets template` and
+Once those outputs exist, `assets cluster-seeds` and
 `assets package` discover the PG18 build tree,
 derive manifest PostgreSQL versions from the prepared PG18 source markers, and
 write explicit PG18 source-fingerprint and PG18 source pins into
@@ -436,11 +436,10 @@ those markers after configure, companion build stages fail closed if either
 marker drifts, and xtask checks the markers again before packaging, template, or
 build-output manifest generation can consume an existing build tree.
 
-PGDATA template manifests produced by `assets template --source fingerprint ...` also
-carry camelCase `sourceLane` metadata, and the asset manifest's
-`pgdata-template` entry records the same lane.  PG18 templates also carry the
-same source fingerprint as the runtime assets.  Older released templates without
-those fields still parse as released-lane templates.
+Cluster seed manifests produced by `assets cluster-seeds` also carry camelCase
+`sourceLane` metadata, and the asset manifest's `cluster-seeds` entries record
+the same lane. PG18 cluster seeds also carry the same source fingerprint as the
+runtime assets.
 
 The source-spine guard also checks the prepared PG18 tree against the runtime
 assets and promoted contrib build plan.  The required `plpgsql`,
@@ -484,7 +483,7 @@ AOT outputs write to the stable generated directory
 `assets check-aot` verifies those fields before checking module hashes.
 
 The Rust asset parser preserves the same source-fingerprint metadata that xtask
-writes into PG18 asset manifests. Embedded PGDATA template manifests must match
+writes into PG18 asset manifests. Embedded cluster seed manifests must match
 the top-level asset manifest fingerprint, and bundled AOT manifests must match
 the same fingerprint and PostgreSQL version before their module hashes are
 accepted. The `liboliphaunt-wasix-portable` build script probes
@@ -607,11 +606,10 @@ Verified locally:
   fingerprint and PostgreSQL version markers match the prepared source.
 - Packaged AOT manifests now carry explicit `source fingerprint`, `postgres-version`,
   and source-fingerprint metadata.
-- PGDATA template manifests and asset-manifest `pgdata-template` entries now
-  carry lane metadata as well, plus PG18 source fingerprints for experimental
-  PG18 templates.
-- Runtime asset parsing preserves PG18 source fingerprints, and embedded PGDATA
-  template/AOT manifests are checked against the bundled asset manifest before
+- Cluster seed manifests and asset-manifest `cluster-seeds` entries now carry
+  lane metadata as well, plus PG18 source fingerprints.
+- Runtime asset parsing preserves PG18 source fingerprints, and embedded cluster
+  seed/AOT manifests are checked against the bundled asset manifest before
   use.
 - WASIX perf reports include bundled runtime asset provenance, so benchmark JSON
   identifies the measured source selection, PostgreSQL version, and PG18 source
@@ -640,7 +638,7 @@ Verified locally:
 - `assets source-spine --check-patch-applies`
   passes against the prepared PostgreSQL 18.4 source tree in source-only mode.
 - `assets source-spine` passes after the
-  37-patch stack, including the PG18 source-spine guard and source fingerprint
+  canonical patch stack, including the PG18 source-spine guard and source fingerprint
   isolation guard.
 - `assets release-build --skip-build --skip-aot
   --skip-package-size` regenerates the PG18 asset manifest, and the regenerated

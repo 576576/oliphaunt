@@ -81,7 +81,6 @@ function repoPath(value) {
 function nativeRuntimeArtifactTargets(version) {
   return allArtifactTargets({
     product: "liboliphaunt-native",
-    publishedOnly: true,
   }, PREFIX)
     .filter((target) => target.surfaces.includes("maven"))
     .map((target) => ({
@@ -93,7 +92,10 @@ function nativeRuntimeArtifactTargets(version) {
 
 function runtimeMavenArtifactId(target) {
   if (target.kind === "runtime-resources") {
-    return "liboliphaunt-runtime-resources";
+    if (target.target !== "android-datum64") {
+      fail(`unsupported Maven runtime-resource target ${target.target}`);
+    }
+    return "liboliphaunt-runtime-resources-android-datum64";
   }
   if (target.kind === "icu-data") {
     return "oliphaunt-icu";
@@ -108,7 +110,7 @@ function runtimeMavenArtifactMetadata(target) {
   if (target.kind === "runtime-resources") {
     return {
       name: "Oliphaunt runtime resources",
-      description: "Package-managed Oliphaunt PostgreSQL runtime resources for Android app builds.",
+      description: "Package-managed Oliphaunt PostgreSQL runtime resources for the Android datum64 physical domain.",
       licenseProfile: "native-runtime-resources",
     };
   }
@@ -267,7 +269,6 @@ async function extensionRows(extensionRoot, selectedProducts) {
     const targets = [...new Map(releaseExtensionArtifactTargets({
       product,
       family: "native",
-      publishedOnly: true,
     }, PREFIX).filter((target) =>
       target.kind === "native-static-registry" && target.target.startsWith("android-"))
       .map((target) => [target.target, target])).values()];

@@ -24,8 +24,8 @@ include = [
 ]
 
 [package.metadata.oliphaunt-wasix-tools.assets]
-pg-dump-wasix-sha256 = "6f3e92ba8a9faae2cf108a9d6e0f91e399e27d2f54c543297eaf5de63d511418"
-psql-wasix-sha256 = "41c20c6c43ad437a732b0248efa173b5e0edcd2ab5bb4eee2752595201aa9db9"
+pg-dump-wasix-sha256 = "90180532a2d4ccd68405f9ecc3057607e84fb5a033ae51541bc36535a8311909"
+psql-wasix-sha256 = "894aeb0d846c249e4697a4795184b2e6a470ca53daa4819f61c204f05baf9c8d"
 
 [lib]
 path = "src/lib.rs"

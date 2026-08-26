@@ -37,7 +37,7 @@ Implemented:
   `pg_backup_stop` filtered-PGDATA tar control with equal `56.17 MB` p50
   payloads. The logical `pg_dump`/`pg_restore -Fc` row remains comparison data,
   not the direct parity gate.
-- direct physical backups now prefer `oliphaunt_backup_ex`, which appends SDK
+- direct physical backups use the options-based `oliphaunt_backup`, which appends SDK
   root/archive metadata while the C archive is still being written instead of
   validating and copying the full archive in Rust afterward. The C tar writer
   also uses direct `read(2)` file reads, per-entry buffer reservation, and
@@ -303,16 +303,11 @@ Implemented:
 - `OliphauntBuilder::extensions`;
 - `OliphauntBuilder::username`;
 - `OliphauntBuilder::database`;
-- `OliphauntBuilder::debug_level`;
-- `OliphauntBuilder::relaxed_durability`;
-- `OliphauntBuilder::startup_arg`;
-- `OliphauntBuilder::startup_args`;
-- `OliphauntBuilder::load_data_dir_archive`;
+- `DatabaseInitialization::PhysicalArchive`;
 - `Oliphaunt::enable_extension`;
 - `Oliphaunt::preload`;
 - `Oliphaunt::preload_extensions`;
-- `Oliphaunt::dump_data_dir`;
-- `Oliphaunt::dump_data_dir_with_format`;
+- `Oliphaunt::backup`;
 - `Oliphaunt::try_clone`;
 - physical PGDATA archives now apply Wasmer overlay whiteouts, so files deleted
   from the lower template are not resurrected by dump/load/clone;
@@ -324,21 +319,19 @@ Implemented:
   this is a same-runtime/same-version physical import/export path, not a
   cross-version backup protocol;
 - `Oliphaunt::exec_protocol_raw`;
-- `Oliphaunt::exec_protocol_raw_stream`;
-- `Oliphaunt::dump_sql`;
-- `Oliphaunt::dump_bytes`;
+- `Oliphaunt::exec_protocol_stream`;
+- `tools::pg_dump`;
+- `tools::psql`;
+- `tools::PgDumpOptions`;
+- `tools::PsqlOptions`;
 - `OliphauntServerBuilder::extension`;
 - `OliphauntServerBuilder::extensions`;
 - `OliphauntServerBuilder::username`;
 - `OliphauntServerBuilder::database`;
-- `OliphauntServerBuilder::debug_level`;
-- `OliphauntServerBuilder::relaxed_durability`;
-- `OliphauntServerBuilder::startup_arg`;
-- `OliphauntServerBuilder::startup_args`;
-- `OliphauntServer::database_url`;
-- `OliphauntServer::dump_sql`;
-- `OliphauntServer::dump_bytes`;
-- `PgDumpOptions`;
+- `OliphauntServerBuilder::listen`;
+- `ServerListen::tcp` / `ServerListen::tcp_port`;
+- Unix hosts: `ServerListen::unix` / `ServerListen::unix_port`;
+- `OliphauntServer::connection_string`;
 - 37 public extension constants plus `extensions::ALL`, covering the smoke-gated
   packaged Oliphaunt/Postgres catalog: `amcheck`, `auto_explain`, `bloom`,
   `age`, `btree_gin`, `btree_gist`, `citext`, `cube`, `dict_int`, `dict_xsyn`,
@@ -351,11 +344,6 @@ Implemented:
 
 `oliphaunt-wasix-dump` no longer exposes the old archive-unpack behavior. It is now a
 real logical dump CLI backed by the packaged WASIX `pg_dump` module.
-
-`relaxed_durability` is a startup-profile flag rather than a hidden mutation of
-`PostgresConfig`; explicit user `postgres_config` values win and
-`relaxed_durability(true).relaxed_durability(false)` returns to the normal
-profile.
 
 ## Protocol And Server Correctness
 
@@ -395,9 +383,9 @@ Implemented coverage:
   after the C bridge reports active streaming COPY;
 - direct raw protocol streaming is routed through the shared `BackendSession`
   framed sender instead of a separate client-only transport path;
-- Rust-owned guest bridge allocations are scoped through `pg_free`/`free`, and
-  debug builds now have a direct raw-protocol stress test proving repeated
-  bridge round trips keep allocation/free counters balanced;
+- the C bridge owns reusable input/output capacity, and the direct raw-protocol
+  stress test proves repeated bridge round trips remain correct without
+  per-request guest allocation/free calls;
 - direct LISTEN/UNLISTEN quotes channel identifiers and dispatches notifications
   by the exact backend channel name, including case-sensitive and quoted names.
 - a larger PostgreSQL regression subset now ports the relevant Oliphaunt test
@@ -423,25 +411,26 @@ Verified ownership boundaries:
   state, COPY state, portal cleanup, and longjmp recovery boundaries;
 - the WASIX bridge owns only the host ABI that Wasmer/WASIX cannot provide as a
   normal OS process boundary: protocol fd transport, locale/identity shims,
-  single-process shared memory, fail-closed process calls, and explicit
-  allocation/free ownership.
+  single-process shared memory, fail-closed process calls, and reusable
+  guest-owned protocol buffers.
 
 Review conclusions:
 
-- guest-memory ownership is scoped through `GuestAllocator`, `pg_free`/`free`,
-  and debug allocation/free counters;
+- guest-memory ownership is scoped through bridge-owned input/output buffers;
+  hosts copy requests directly into reserved guest memory and copy each
+  response once into host-owned storage before the bridge buffer is reset;
 - detached protocol stdio fails closed rather than silently accepting bytes;
 - COPY state is reported by PostgreSQL through
   `pgl_protocol_report_copy_response`; the proxy no longer parses SQL text,
   fabricates COPY state, scans whole backend buffers, or eagerly copies
   continuation bytes for ordinary traffic;
-- direct raw protocol streaming and direct `pg_dump` use the shared
+- direct raw protocol streaming and direct `pg_dump`/`psql` tools use the shared
   `BackendSession` transport instead of a separate clone/server path;
 - startup role/database failures are PostgreSQL-owned: WASIX backend open
   captures `InitPostgres` `ErrorResponse` bytes, the proxy forwards those bytes,
   and Rust no longer probes `pg_database` or string-guesses `3D000`;
 - direct API, server API, proxy CLI, raw protocol, physical archive/clone, and
-  direct `pg_dump` share `RootPlan`/`prepare_root` and `BackendSession`
+  direct tools share `RootPlan`/`prepare_root` and `BackendSession`
   lifecycle paths;
 - side-module cache seeding is keyed by artifact name, source module hash,
   Wasmer version, Wasmer-WASIX version, and engine identity;
@@ -527,23 +516,22 @@ Implemented coverage:
   runtime-support/extension side-module imports, rather than being a
   hand-maintained export allowlist;
 - extension archive hash mismatch rejection;
-- public WASIX `pg_dump` runner loads through the AOT manifest, connects to
-  `OliphauntServer`, dumps plain SQL, restores into fresh `Oliphaunt`, and verifies
-  schema/data;
-- direct `Oliphaunt::dump_sql` no longer uses a temporary physical clone, public
+- the public WASIX tools namespace loads `pg_dump` and `psql` through the AOT
+  manifest, runs both against an open `Oliphaunt`, restores plain SQL into a
+  fresh database, and verifies schema/data;
+- direct `tools::pg_dump` does not use a temporary physical clone, public
   `OliphauntServer`, or OS loopback TCP; it runs the standalone WASIX `pg_dump`
   against an in-process Wasmer virtual TCP connection whose host side is routed
   through the same direct raw-protocol backend;
-- direct `Oliphaunt::dump_sql` rejects database/user options that would imply a
-  different backend than the already-open direct session; callers needing that
-  use the server `pg_dump` path;
+- direct tools reject connection, output, format, and parallel-job options that
+  conflict with the already-open session and the plain captured-output contract;
 - the direct `pg_dump` transport keeps `pg_dump`/libpq stock and owns the only
   required semantic adapter in Rust: a first-write-readiness normalization for
   Wasmer's in-memory `TcpSocketHalf` so libpq's connect-time and first-write
   polls remain level-triggered;
-- public `pg_dump` coverage includes indexes, views, sequences,
-  `--schema-only`, `--quote-all-identifiers`, source-server reuse after dump,
-  and vector extension dump/restore;
+- public tool coverage includes indexes, views, sequences, COPY data,
+  `--schema-only`, quoted identifiers, source-database reuse, and a packaged
+  extension dump/restore;
 - `PgDumpOptions` rejects passthrough flags that conflict with the typed
   output/connection contract instead of letting callers override the internal
   output file, format, host, port, username, database, or job count.
@@ -1048,14 +1036,14 @@ following completed work was removed from `TODO.md`:
   crate templates, staged release workspaces, exact-SHA artifact downloads,
   package-size gates, and Release workflow trusted-publishing permissions
   through `id-token: write`;
-- public `pg_dump` functionality that is already implemented and tested:
-  `PgDumpOptions`, direct and server `dump_sql`/`dump_bytes`, the `oliphaunt-wasix-dump`
-  CLI, typed rejection of managed passthrough flags, no-clone/no-public-server
-  direct dumps, stock libpq over virtual networking, indexes/views/sequences,
-  `--schema-only`, `--quote-all-identifiers`, source-server reuse after dump,
-  and vector dump/restore coverage;
+- public `pg_dump`/`psql` functionality that is already implemented and tested:
+  the optional `tools` namespace, the `oliphaunt-wasix-dump` CLI, typed rejection
+  of managed passthrough flags, no-clone/no-public-server direct tools, stock
+  libpq over virtual networking, indexes/views/sequences, COPY data,
+  `--schema-only`, quoted identifiers, source-database reuse, and a packaged
+  extension dump/restore;
 - split WASIX `initdb` runtime support that is present locally: direct and
-  server `fresh_temporary()`/`template_cache(false)` paths, split-initdb module
+  explicit `DatabaseInitialization::FreshInitdb`, split-initdb module
   execution, interrupted-PGDATA cleanup, initdb shim ABI/source-spine checks,
   and PGDATA template manifest checks. The remaining backlog tracks only full
   WASIX runtime CI proof, deterministic two-build comparison, and package-size
@@ -1656,17 +1644,18 @@ each app to invent its own native-boundary test:
   installed-app runner into iOS simulator/device and Android emulator/device CI
   jobs with real packaged `liboliphaunt` runtime resources.
 
-## Native Direct Reopen Capability
+## Native Lifecycle Capabilities
 
-The SDKs now publish reopenability as an explicit capability instead of letting
-apps infer it from process isolation:
+The SDKs publish distinct lifecycle capabilities instead of asking apps to
+infer recovery behavior from process isolation:
 
 - Rust `EngineCapabilities`, Swift `OliphauntCapabilities`, Kotlin
-  `EngineCapabilities`, and React Native `EngineCapabilities` all expose
-  `reopenable`;
-- `NativeDirect` reports `false` because the embedded PostgreSQL backend is a
-  process-lifetime direct session, while `NativeBroker` and `NativeServer`
-  report `true`;
+  `EngineCapabilities`, and React Native `EngineCapabilities` expose
+  same-instance logical reopen, instance switching, and crash restart as
+  separate facts;
+- `NativeDirect` reports same-instance logical reopen but no instance switching
+  or crash restart, while broker and server modes advertise only the lifecycle
+  behaviors their process owners actually provide;
 - a local C-core experiment removed the process-spent guard and crashed on the
   second same-process direct open in PostgreSQL relation/storage startup, which
   shows this is not an fd-table-only reset problem. Broker/server remain the
@@ -1811,16 +1800,16 @@ The native perf harness now accepts the same tuning shape:
 
 ## Explicit Lifecycle Capability Vocabulary
 
-The SDK contract no longer relies on a single ambiguous `reopenable` boolean:
+The SDK contract uses separate lifecycle properties:
 
-- Rust `EngineCapabilities` now exposes `same_root_logical_reopen`,
-  `root_switchable`, and `crash_restartable`;
+- Rust `EngineCapabilities` exposes `same_instance_logical_reopen`,
+  `instance_switchable`, and `crash_restartable`;
 - Swift, Kotlin, and React Native expose matching camelCase fields in their
   capability structs/dictionaries;
-- native direct reports same-root resident logical reopen only, with
-  `rootSwitchable=false` and `crashRestartable=false`;
-- broker reports process isolation, root-switchability, and helper
-  crash-restartability; server reports root-switchability but no in-place
+- native direct reports same-instance resident logical reopen only, with
+  `instanceSwitchable=false` and `crashRestartable=false`;
+- broker reports process isolation, instance switching, and helper
+  crash-restartability; server reports instance switching but no in-place
   crash restart for the current SDK-owned server handle;
 - SDK tests and docs assert these semantics so mobile callers do not infer crash
   isolation from direct-mode logical close/reopen.

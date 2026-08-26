@@ -11,202 +11,323 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 
 ## Rust: oliphaunt
 
-- `oliphaunt::BackgroundCheckpointSkipReason`
-- `oliphaunt::BackgroundPreparationOptions`
-- `oliphaunt::BackgroundPreparationResult`
-- `oliphaunt::BackupArtifact`
-- `oliphaunt::BackupFormat`
-- `oliphaunt::BackupRequest`
-- `oliphaunt::BenchmarkMetric`
-- `oliphaunt::BenchmarkTarget`
-- `oliphaunt::BootstrapStrategy`
-- `oliphaunt::DEFAULT_DATABASE`
-- `oliphaunt::DEFAULT_USERNAME`
-- `oliphaunt::DatabaseRoot`
-- `oliphaunt::DurabilityProfile`
-- `oliphaunt::EngineCancel`
-- `oliphaunt::EngineCapabilities`
-- `oliphaunt::EngineMode`
-- `oliphaunt::EngineModeSupport`
-- `oliphaunt::EngineSession`
+- `oliphaunt::CommandResult`
+- `oliphaunt::CommandResult.command_tag()`
+- `oliphaunt::CommandResult.row_count()`
+- `oliphaunt::DatabaseStorage`
 - `oliphaunt::Error`
 - `oliphaunt::Extension`
-- `oliphaunt::ExtensionArtifactPolicy`
-- `oliphaunt::ExtensionCoverage`
-- `oliphaunt::ExtensionManifestEntry`
-- `oliphaunt::ExtensionModuleAsset`
-- `oliphaunt::ExtensionRedistribution`
-- `oliphaunt::ExtensionSizeReport`
-- `oliphaunt::ExtensionSmokeCoverage`
-- `oliphaunt::ExtensionSmokePlan`
-- `oliphaunt::ExtensionSourceKind`
-- `oliphaunt::ExtensionSqlAsset`
-- `oliphaunt::MobileStaticLinkStatus`
-- `oliphaunt::MobileStaticRegistryMetadata`
-- `oliphaunt::MobileStaticRegistryState`
-- `oliphaunt::NATIVE_EXTENSION_MANIFEST`
-- `oliphaunt::NativeBrokerConfig`
-- `oliphaunt::NativeBrokerRuntime`
-- `oliphaunt::NativeDirectConfig`
-- `oliphaunt::NativeExtensionArtifact`
-- `oliphaunt::NativeExtensionArtifactFormat`
-- `oliphaunt::NativeExtensionArtifactIndex`
-- `oliphaunt::NativeExtensionArtifactIndexArtifact`
-- `oliphaunt::NativeExtensionArtifactIndexCatalog`
-- `oliphaunt::NativeExtensionArtifactIndexCatalogEntry`
-- `oliphaunt::NativeExtensionArtifactIndexCreateOptions`
-- `oliphaunt::NativeExtensionArtifactIndexOptions`
-- `oliphaunt::NativeExtensionArtifactIndexResolution`
-- `oliphaunt::NativeExtensionArtifactIndexSignature`
-- `oliphaunt::NativeExtensionArtifactIndexSigningOptions`
-- `oliphaunt::NativeExtensionArtifactIndexTrustRoot`
-- `oliphaunt::NativeExtensionArtifactLegalContract`
-- `oliphaunt::NativeExtensionArtifactLicenseProfile`
-- `oliphaunt::NativeExtensionArtifactOptions`
-- `oliphaunt::NativeExtensionMobileStaticArchive`
-- `oliphaunt::NativeExtensionMobileStaticDependencyArchive`
-- `oliphaunt::NativeExtensionStaticSymbolAlias`
-- `oliphaunt::NativePrebuiltExtensionArtifact`
-- `oliphaunt::NativeRuntime`
-- `oliphaunt::NativeRuntimeFeature`
-- `oliphaunt::NativeRuntimeResourceOptions`
-- `oliphaunt::NativeRuntimeResourceSizeReport`
-- `oliphaunt::NativeRuntimeResources`
-- `oliphaunt::NativeServerConfig`
-- `oliphaunt::NativeServerRuntime`
+- `oliphaunt::Extension.by_sql_name()`
+- `oliphaunt::Extension.sql_name()`
 - `oliphaunt::Oliphaunt`
+- `oliphaunt::Oliphaunt.backup()`
+- `oliphaunt::Oliphaunt.builder()`
+- `oliphaunt::Oliphaunt.cancel()`
+- `oliphaunt::Oliphaunt.checkpoint()`
+- `oliphaunt::Oliphaunt.close()`
+- `oliphaunt::Oliphaunt.exec_protocol_raw()`
+- `oliphaunt::Oliphaunt.exec_protocol_stream()`
+- `oliphaunt::Oliphaunt.execute()`
+- `oliphaunt::Oliphaunt.execute_with_params()`
+- `oliphaunt::Oliphaunt.query()`
+- `oliphaunt::Oliphaunt.query_with_params()`
+- `oliphaunt::Oliphaunt.restore()`
+- `oliphaunt::Oliphaunt.transaction()`
 - `oliphaunt::OliphauntBuilder`
-- `oliphaunt::OliphauntRuntime`
-- `oliphaunt::OliphauntRuntimeSource`
-- `oliphaunt::OpenConfig`
-- `oliphaunt::PerformanceGate`
-- `oliphaunt::PerformanceGateSet`
-- `oliphaunt::PerformanceOperator`
+- `oliphaunt::OliphauntBuilder.broker()`
+- `oliphaunt::OliphauntBuilder.broker_executable()`
+- `oliphaunt::OliphauntBuilder.database()`
+- `oliphaunt::OliphauntBuilder.direct()`
+- `oliphaunt::OliphauntBuilder.directory()`
+- `oliphaunt::OliphauntBuilder.extension()`
+- `oliphaunt::OliphauntBuilder.extensions()`
+- `oliphaunt::OliphauntBuilder.listen()`
+- `oliphaunt::OliphauntBuilder.new()`
+- `oliphaunt::OliphauntBuilder.open()`
+- `oliphaunt::OliphauntBuilder.open_server()`
+- `oliphaunt::OliphauntBuilder.server_executable()`
+- `oliphaunt::OliphauntBuilder.startup_guc()`
+- `oliphaunt::OliphauntBuilder.startup_gucs()`
+- `oliphaunt::OliphauntBuilder.storage()`
+- `oliphaunt::OliphauntBuilder.temporary_directory()`
+- `oliphaunt::OliphauntBuilder.username()`
+- `oliphaunt::OliphauntServer`
+- `oliphaunt::OliphauntServer.cancel()`
+- `oliphaunt::OliphauntServer.checkpoint()`
+- `oliphaunt::OliphauntServer.close()`
+- `oliphaunt::OliphauntServer.connection_string()`
+- `oliphaunt::OliphauntServer.exec_protocol_raw()`
+- `oliphaunt::OliphauntServer.exec_protocol_stream()`
+- `oliphaunt::OliphauntServer.execute()`
+- `oliphaunt::OliphauntServer.execute_with_params()`
+- `oliphaunt::OliphauntServer.query()`
+- `oliphaunt::OliphauntServer.query_with_params()`
+- `oliphaunt::OliphauntServer.transaction()`
 - `oliphaunt::PostgresError`
 - `oliphaunt::PostgresErrorField`
-- `oliphaunt::PostgresStartupGuc`
-- `oliphaunt::ProtocolRequest`
-- `oliphaunt::ProtocolResponse`
 - `oliphaunt::QueryField`
 - `oliphaunt::QueryFormat`
 - `oliphaunt::QueryParam`
+- `oliphaunt::QueryParam.binary()`
+- `oliphaunt::QueryParam.text()`
 - `oliphaunt::QueryResult`
+- `oliphaunt::QueryResult.command_tag()`
+- `oliphaunt::QueryResult.field_index()`
+- `oliphaunt::QueryResult.fields()`
+- `oliphaunt::QueryResult.get_text()`
+- `oliphaunt::QueryResult.row_count()`
+- `oliphaunt::QueryResult.rows()`
 - `oliphaunt::QueryRow`
-- `oliphaunt::RestoreRequest`
-- `oliphaunt::RestoreTargetPolicy`
+- `oliphaunt::QueryRow.text()`
+- `oliphaunt::QueryRow.values()`
 - `oliphaunt::Result`
-- `oliphaunt::RootLockPolicy`
-- `oliphaunt::RuntimeFootprintProfile`
-- `oliphaunt::RuntimeUnavailable`
-- `oliphaunt::SessionConcurrency`
-- `oliphaunt::SessionPin`
-- `oliphaunt::StorageConfig`
+- `oliphaunt::ServerListen`
+- `oliphaunt::ServerListen.tcp()`
+- `oliphaunt::ServerListen.tcp_port()`
+- `oliphaunt::ServerListen.unix()`
+- `oliphaunt::ServerListen.unix_port()`
 - `oliphaunt::Transaction`
-- `oliphaunt::build_native_runtime_resources`
-- `oliphaunt::create_prebuilt_extension_artifact`
-- `oliphaunt::create_prebuilt_extension_artifact_index`
-- `oliphaunt::list_prebuilt_extension_artifact_index_catalog`
-- `oliphaunt::parse_query_response`
+- `oliphaunt::Transaction.exec_protocol_raw()`
+- `oliphaunt::Transaction.exec_protocol_stream()`
+- `oliphaunt::Transaction.execute()`
+- `oliphaunt::Transaction.execute_with_params()`
+- `oliphaunt::Transaction.query()`
+- `oliphaunt::Transaction.query_with_params()`
 - `oliphaunt::register_build_resources!`
 - `oliphaunt::register_build_resources_dir`
-- `oliphaunt::required_shared_preload_libraries`
-- `oliphaunt::resolve_extension_selection`
-- `oliphaunt::resolve_prebuilt_extension_artifacts_from_indexes`
-- `oliphaunt::sign_prebuilt_extension_artifact_index`
+
+## Rust build integration: oliphaunt-build
+
+- `oliphaunt_build::BuildOutput`
+- `oliphaunt_build::Error`
+- `oliphaunt_build::configure()`
+- `oliphaunt_build::try_configure()`
+
+## Native Rust tools: oliphaunt-tools
+
+- `oliphaunt_tools::KIND`
+- `oliphaunt_tools::PRODUCT`
+- `oliphaunt_tools::PgDumpOptions`
+- `oliphaunt_tools::PgDumpOptions.arg()`
+- `oliphaunt_tools::PgDumpOptions.args()`
+- `oliphaunt_tools::PgDumpOptions.new()`
+- `oliphaunt_tools::PostgresToolError`
+- `oliphaunt_tools::PsqlOptions`
+- `oliphaunt_tools::PsqlOptions.arg()`
+- `oliphaunt_tools::PsqlOptions.args()`
+- `oliphaunt_tools::PsqlOptions.command()`
+- `oliphaunt_tools::PsqlOptions.new()`
+- `oliphaunt_tools::PsqlOptions.script()`
+- `oliphaunt_tools::pg_dump()`
+- `oliphaunt_tools::psql()`
+
+## Rust WASIX: oliphaunt-wasix
+
+- `oliphaunt_wasix::CommandResult`
+- `oliphaunt_wasix::CommandResult.command_tag()`
+- `oliphaunt_wasix::CommandResult.row_count()`
+- `oliphaunt_wasix::DatabaseStorage`
+- `oliphaunt_wasix::Error`
+- `oliphaunt_wasix::Error.postgres_error()`
+- `oliphaunt_wasix::Error.tool_error()`
+- `oliphaunt_wasix::Oliphaunt`
+- `oliphaunt_wasix::Oliphaunt.backup()`
+- `oliphaunt_wasix::Oliphaunt.builder()`
+- `oliphaunt_wasix::Oliphaunt.checkpoint()`
+- `oliphaunt_wasix::Oliphaunt.close()`
+- `oliphaunt_wasix::Oliphaunt.exec_protocol_raw()`
+- `oliphaunt_wasix::Oliphaunt.exec_protocol_stream()`
+- `oliphaunt_wasix::Oliphaunt.execute()`
+- `oliphaunt_wasix::Oliphaunt.execute_with_params()`
+- `oliphaunt_wasix::Oliphaunt.open()`
+- `oliphaunt_wasix::Oliphaunt.query()`
+- `oliphaunt_wasix::Oliphaunt.query_with_params()`
+- `oliphaunt_wasix::Oliphaunt.restore()`
+- `oliphaunt_wasix::Oliphaunt.transaction()`
+- `oliphaunt_wasix::OliphauntBuilder`
+- `oliphaunt_wasix::OliphauntBuilder.database()`
+- `oliphaunt_wasix::OliphauntBuilder.extension()`
+- `oliphaunt_wasix::OliphauntBuilder.extensions()`
+- `oliphaunt_wasix::OliphauntBuilder.new()`
+- `oliphaunt_wasix::OliphauntBuilder.open()`
+- `oliphaunt_wasix::OliphauntBuilder.startup_guc()`
+- `oliphaunt_wasix::OliphauntBuilder.startup_gucs()`
+- `oliphaunt_wasix::OliphauntBuilder.storage()`
+- `oliphaunt_wasix::OliphauntBuilder.username()`
+- `oliphaunt_wasix::OliphauntServer`
+- `oliphaunt_wasix::OliphauntServer.builder()`
+- `oliphaunt_wasix::OliphauntServer.close()`
+- `oliphaunt_wasix::OliphauntServer.connection_string()`
+- `oliphaunt_wasix::OliphauntServer.socket_path()`
+- `oliphaunt_wasix::OliphauntServer.tcp_addr()`
+- `oliphaunt_wasix::OliphauntServerBuilder`
+- `oliphaunt_wasix::OliphauntServerBuilder.database()`
+- `oliphaunt_wasix::OliphauntServerBuilder.extension()`
+- `oliphaunt_wasix::OliphauntServerBuilder.extensions()`
+- `oliphaunt_wasix::OliphauntServerBuilder.listen()`
+- `oliphaunt_wasix::OliphauntServerBuilder.new()`
+- `oliphaunt_wasix::OliphauntServerBuilder.start()`
+- `oliphaunt_wasix::OliphauntServerBuilder.startup_guc()`
+- `oliphaunt_wasix::OliphauntServerBuilder.startup_gucs()`
+- `oliphaunt_wasix::OliphauntServerBuilder.storage()`
+- `oliphaunt_wasix::OliphauntServerBuilder.username()`
+- `oliphaunt_wasix::PostgresError`
+- `oliphaunt_wasix::PostgresErrorField`
+- `oliphaunt_wasix::QueryField`
+- `oliphaunt_wasix::QueryFormat`
+- `oliphaunt_wasix::QueryParam`
+- `oliphaunt_wasix::QueryParam.binary()`
+- `oliphaunt_wasix::QueryParam.text()`
+- `oliphaunt_wasix::QueryResult`
+- `oliphaunt_wasix::QueryResult.command_tag()`
+- `oliphaunt_wasix::QueryResult.field_index()`
+- `oliphaunt_wasix::QueryResult.fields()`
+- `oliphaunt_wasix::QueryResult.get_text()`
+- `oliphaunt_wasix::QueryResult.row_count()`
+- `oliphaunt_wasix::QueryResult.rows()`
+- `oliphaunt_wasix::QueryRow`
+- `oliphaunt_wasix::QueryRow.text()`
+- `oliphaunt_wasix::QueryRow.values()`
+- `oliphaunt_wasix::Result`
+- `oliphaunt_wasix::ServerListen`
+- `oliphaunt_wasix::ServerListen.tcp()`
+- `oliphaunt_wasix::ServerListen.tcp_port()`
+- `oliphaunt_wasix::ServerListen.unix()`
+- `oliphaunt_wasix::ServerListen.unix_port()`
+- `oliphaunt_wasix::Transaction`
+- `oliphaunt_wasix::Transaction.exec_protocol_raw()`
+- `oliphaunt_wasix::Transaction.exec_protocol_stream()`
+- `oliphaunt_wasix::Transaction.execute()`
+- `oliphaunt_wasix::Transaction.execute_with_params()`
+- `oliphaunt_wasix::Transaction.query()`
+- `oliphaunt_wasix::Transaction.query_with_params()`
+- `oliphaunt_wasix::extensions`
+- `oliphaunt_wasix::extensions::ALL`
+- `oliphaunt_wasix::extensions::AMCHECK`
+- `oliphaunt_wasix::extensions::AUTO_EXPLAIN`
+- `oliphaunt_wasix::extensions::BLOOM`
+- `oliphaunt_wasix::extensions::BTREE_GIN`
+- `oliphaunt_wasix::extensions::BTREE_GIST`
+- `oliphaunt_wasix::extensions::CITEXT`
+- `oliphaunt_wasix::extensions::CUBE`
+- `oliphaunt_wasix::extensions::DICT_INT`
+- `oliphaunt_wasix::extensions::DICT_XSYN`
+- `oliphaunt_wasix::extensions::EARTHDISTANCE`
+- `oliphaunt_wasix::extensions::Extension`
+- `oliphaunt_wasix::extensions::Extension.sql_name()`
+- `oliphaunt_wasix::extensions::FILE_FDW`
+- `oliphaunt_wasix::extensions::FUZZYSTRMATCH`
+- `oliphaunt_wasix::extensions::HSTORE`
+- `oliphaunt_wasix::extensions::INTARRAY`
+- `oliphaunt_wasix::extensions::ISN`
+- `oliphaunt_wasix::extensions::LO`
+- `oliphaunt_wasix::extensions::LTREE`
+- `oliphaunt_wasix::extensions::PAGEINSPECT`
+- `oliphaunt_wasix::extensions::PGCRYPTO`
+- `oliphaunt_wasix::extensions::PGTAP`
+- `oliphaunt_wasix::extensions::PG_BUFFERCACHE`
+- `oliphaunt_wasix::extensions::PG_FREESPACEMAP`
+- `oliphaunt_wasix::extensions::PG_HASHIDS`
+- `oliphaunt_wasix::extensions::PG_IVM`
+- `oliphaunt_wasix::extensions::PG_SURGERY`
+- `oliphaunt_wasix::extensions::PG_TEXTSEARCH`
+- `oliphaunt_wasix::extensions::PG_TRGM`
+- `oliphaunt_wasix::extensions::PG_UUIDV7`
+- `oliphaunt_wasix::extensions::PG_VISIBILITY`
+- `oliphaunt_wasix::extensions::PG_WALINSPECT`
+- `oliphaunt_wasix::extensions::POSTGIS`
+- `oliphaunt_wasix::extensions::SEG`
+- `oliphaunt_wasix::extensions::TABLEFUNC`
+- `oliphaunt_wasix::extensions::TCN`
+- `oliphaunt_wasix::extensions::TSM_SYSTEM_ROWS`
+- `oliphaunt_wasix::extensions::TSM_SYSTEM_TIME`
+- `oliphaunt_wasix::extensions::UNACCENT`
+- `oliphaunt_wasix::extensions::UUID_OSSP`
+- `oliphaunt_wasix::extensions::VECTOR`
+- `oliphaunt_wasix::extensions::by_sql_name()`
+- `oliphaunt_wasix::tools`
+- `oliphaunt_wasix::tools::PgDumpOptions`
+- `oliphaunt_wasix::tools::PgDumpOptions.arg()`
+- `oliphaunt_wasix::tools::PgDumpOptions.args()`
+- `oliphaunt_wasix::tools::PgDumpOptions.new()`
+- `oliphaunt_wasix::tools::PostgresToolError`
+- `oliphaunt_wasix::tools::PostgresToolError.exit_code()`
+- `oliphaunt_wasix::tools::PostgresToolError.stderr()`
+- `oliphaunt_wasix::tools::PostgresToolError.stdout()`
+- `oliphaunt_wasix::tools::PostgresToolError.tool()`
+- `oliphaunt_wasix::tools::PsqlOptions`
+- `oliphaunt_wasix::tools::PsqlOptions.arg()`
+- `oliphaunt_wasix::tools::PsqlOptions.args()`
+- `oliphaunt_wasix::tools::PsqlOptions.command()`
+- `oliphaunt_wasix::tools::PsqlOptions.new()`
+- `oliphaunt_wasix::tools::PsqlOptions.script()`
+- `oliphaunt_wasix::tools::pg_dump()`
+- `oliphaunt_wasix::tools::psql()`
+
+## Native C ABI: liboliphaunt
+
+### Types
+
+- `OliphauntConfig`
+- `OliphauntHandle`
+- `OliphauntResponse`
+- `OliphauntRestoreOptions`
+- `OliphauntStaticExtension`
+- `OliphauntStaticExtensionSymbol`
+- `OliphauntStreamCallback`
+
+### Constants
+
+- `OLIPHAUNT_ABI_VERSION`
+- `OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK`
+- `OLIPHAUNT_STATIC_EXTENSION_ABI_VERSION`
+
+### Functions
+
+- `oliphaunt_backup()`
+- `oliphaunt_cancel()`
+- `oliphaunt_close()`
+- `oliphaunt_close_if_generation()`
+- `oliphaunt_detach()`
+- `oliphaunt_exec_protocol()`
+- `oliphaunt_exec_protocol_stream()`
+- `oliphaunt_exec_simple_query()`
+- `oliphaunt_free_response()`
+- `oliphaunt_init()`
+- `oliphaunt_last_error()`
+- `oliphaunt_logical_generation()`
+- `oliphaunt_register_static_extensions()`
+- `oliphaunt_restore()`
+- `oliphaunt_version()`
 
 ## Swift: Oliphaunt
 
-- `OliphauntBackgroundPreparationOptions.cancelActiveWork`
-- `OliphauntBackgroundPreparationOptions.checkpointWhenIdle`
-- `OliphauntBackgroundPreparationOptions.init`
-- `OliphauntBackgroundPreparationResult.cancelledActiveWork`
-- `OliphauntBackgroundPreparationResult.checkpointed`
-- `OliphauntBackgroundPreparationResult.init`
-- `OliphauntBackgroundPreparationResult.skippedCheckpointReason`
-- `OliphauntBackupArtifact.bytes`
-- `OliphauntBackupArtifact.format`
-- `OliphauntBackupArtifact.init`
-- `OliphauntBackupRequest.format`
-- `OliphauntBackupRequest.init`
-- `OliphauntCapabilities.backupFormats`
-- `OliphauntCapabilities.backupRestore`
-- `OliphauntCapabilities.connectionString`
-- `OliphauntCapabilities.crashRestartable`
-- `OliphauntCapabilities.extensions`
-- `OliphauntCapabilities.independentSessions`
-- `OliphauntCapabilities.init`
-- `OliphauntCapabilities.maxClientSessions`
-- `OliphauntCapabilities.mode`
-- `OliphauntCapabilities.multiRoot`
-- `OliphauntCapabilities.processIsolated`
-- `OliphauntCapabilities.protocolRaw`
-- `OliphauntCapabilities.protocolStream`
-- `OliphauntCapabilities.queryCancel`
-- `OliphauntCapabilities.reopenable`
-- `OliphauntCapabilities.restoreFormats`
-- `OliphauntCapabilities.rootSwitchable`
-- `OliphauntCapabilities.sameRootLogicalReopen`
-- `OliphauntCapabilities.simpleQuery`
-- `OliphauntCapabilities.supportsBackupFormat()`
-- `OliphauntCapabilities.supportsRestoreFormat()`
+- `OliphauntCommandResult.commandTag`
+- `OliphauntCommandResult.init`
+- `OliphauntCommandResult.rowCount`
 - `OliphauntConfiguration.database`
-- `OliphauntConfiguration.durability`
 - `OliphauntConfiguration.extensions`
 - `OliphauntConfiguration.init`
-- `OliphauntConfiguration.mode`
-- `OliphauntConfiguration.root`
-- `OliphauntConfiguration.runtimeFootprint`
 - `OliphauntConfiguration.startupGUCs`
+- `OliphauntConfiguration.storage`
 - `OliphauntConfiguration.username`
 - `OliphauntDatabase.backup()`
 - `OliphauntDatabase.cancel()`
-- `OliphauntDatabase.capabilities()`
 - `OliphauntDatabase.checkpoint()`
 - `OliphauntDatabase.close()`
-- `OliphauntDatabase.connectionString()`
 - `OliphauntDatabase.execProtocolRaw()`
 - `OliphauntDatabase.execProtocolStream()`
 - `OliphauntDatabase.execute()`
 - `OliphauntDatabase.open()`
-- `OliphauntDatabase.prepareForBackground()`
 - `OliphauntDatabase.query()`
 - `OliphauntDatabase.restore()`
-- `OliphauntDatabase.resumeFromBackground()`
-- `OliphauntDatabase.supportedModes()`
-- `OliphauntDatabase.supportsBackupFormat()`
-- `OliphauntDatabase.supportsRestoreFormat()`
 - `OliphauntDatabase.transaction()`
-- `OliphauntDefaultEngine.brokerUnavailableReason`
-- `OliphauntDefaultEngine.init`
-- `OliphauntDefaultEngine.open()`
-- `OliphauntDefaultEngine.restore()`
-- `OliphauntDefaultEngine.serverUnavailableReason`
-- `OliphauntDefaultEngine.supportedModes`
-- `OliphauntEngineModeSupport.available`
-- `OliphauntEngineModeSupport.capabilities`
-- `OliphauntEngineModeSupport.init`
-- `OliphauntEngineModeSupport.mode`
-- `OliphauntEngineModeSupport.unavailableReason`
 - `OliphauntError.description`
-- `OliphauntExtensionSizeReport.bytes`
-- `OliphauntExtensionSizeReport.fileCount`
-- `OliphauntExtensionSizeReport.init`
-- `OliphauntExtensionSizeReport.name`
-- `OliphauntNativeDirectEngine.database`
-- `OliphauntNativeDirectEngine.init`
-- `OliphauntNativeDirectEngine.libraryURL`
-- `OliphauntNativeDirectEngine.open()`
-- `OliphauntNativeDirectEngine.restore()`
-- `OliphauntNativeDirectEngine.runtimeDirectory`
-- `OliphauntNativeDirectEngine.runtimeResources`
-- `OliphauntNativeDirectEngine.supportedModes`
-- `OliphauntNativeDirectEngine.username`
 - `OliphauntPostgresError.columnName`
 - `OliphauntPostgresError.constraintName`
 - `OliphauntPostgresError.dataTypeName`
 - `OliphauntPostgresError.description`
 - `OliphauntPostgresError.detail`
-- `OliphauntPostgresError.fallback()`
 - `OliphauntPostgresError.fields`
 - `OliphauntPostgresError.hint`
 - `OliphauntPostgresError.init`
@@ -220,8 +341,6 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `OliphauntPostgresErrorField.code`
 - `OliphauntPostgresErrorField.init`
 - `OliphauntPostgresErrorField.value`
-- `OliphauntProtocol.extendedQuery()`
-- `OliphauntProtocol.simpleQuery()`
 - `OliphauntQueryField.format`
 - `OliphauntQueryField.name`
 - `OliphauntQueryField.tableAttribute`
@@ -238,36 +357,6 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `OliphauntQueryResult.rows`
 - `OliphauntQueryRow.text()`
 - `OliphauntQueryRow.values`
-- `OliphauntRestoreRequest.artifact`
-- `OliphauntRestoreRequest.init`
-- `OliphauntRestoreRequest.replaceExisting()`
-- `OliphauntRestoreRequest.root`
-- `OliphauntRestoreRequest.targetPolicy`
-- `OliphauntRuntimeResourceSizeReport.extensions`
-- `OliphauntRuntimeResourceSizeReport.init`
-- `OliphauntRuntimeResourceSizeReport.mobileStaticRegistryPending`
-- `OliphauntRuntimeResourceSizeReport.mobileStaticRegistryRegistered`
-- `OliphauntRuntimeResourceSizeReport.mobileStaticRegistryState`
-- `OliphauntRuntimeResourceSizeReport.nativeModuleStems`
-- `OliphauntRuntimeResourceSizeReport.packageBytes`
-- `OliphauntRuntimeResourceSizeReport.runtimeBytes`
-- `OliphauntRuntimeResourceSizeReport.runtimeFeatures`
-- `OliphauntRuntimeResourceSizeReport.selectedExtensionBytes`
-- `OliphauntRuntimeResourceSizeReport.staticRegistryBytes`
-- `OliphauntRuntimeResourceSizeReport.templatePgdataBytes`
-- `OliphauntRuntimeResources.bundled()`
-- `OliphauntRuntimeResources.cacheRoot`
-- `OliphauntRuntimeResources.defaultCacheRoot()`
-- `OliphauntRuntimeResources.init`
-- `OliphauntRuntimeResources.materializeRuntime()`
-- `OliphauntRuntimeResources.packageSizeReport()`
-- `OliphauntRuntimeResources.preparePgdata()`
-- `OliphauntRuntimeResources.resourceRoot`
-- `OliphauntSDKSupport.allModes`
-- `OliphauntSDKSupport.capabilities()`
-- `OliphauntSDKSupport.nativeDirectOnly()`
-- `OliphauntSDKSupport.unavailable()`
-- `OliphauntSession.execProtocolStream()`
 - `OliphauntStartupGUC.init`
 - `OliphauntStartupGUC.name`
 - `OliphauntStartupGUC.value`
@@ -275,116 +364,54 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `OliphauntTransaction.execProtocolStream()`
 - `OliphauntTransaction.execute()`
 - `OliphauntTransaction.query()`
-- `RuntimeUnavailableEngine.init`
-- `RuntimeUnavailableEngine.open()`
-- `RuntimeUnavailableEngine.restore()`
-- `RuntimeUnavailableEngine.supportedModes`
 - `actor OliphauntDatabase`
-- `enum OliphauntBackgroundCheckpointSkipReason`
-- `enum OliphauntBackupFormat`
-- `enum OliphauntDurability`
-- `enum OliphauntEngineMode`
+- `enum OliphauntDatabaseStorage`
 - `enum OliphauntError`
-- `enum OliphauntProtocol`
 - `enum OliphauntQueryFormat`
 - `enum OliphauntQueryParam`
-- `enum OliphauntRestoreTargetPolicy`
-- `enum OliphauntRuntimeFootprintProfile`
-- `enum OliphauntSDKSupport`
 - `extension OliphauntDatabase`
-- `extension OliphauntSession`
 - `extension OliphauntTransaction`
-- `parseOliphauntQueryResponse()`
-- `protocol OliphauntEngine`
-- `protocol OliphauntEngineSupportProvider`
-- `protocol OliphauntSession`
-- `registerPackagedExtensionResource()`
-- `struct OliphauntBackgroundPreparationOptions`
-- `struct OliphauntBackgroundPreparationResult`
-- `struct OliphauntBackupArtifact`
-- `struct OliphauntBackupRequest`
-- `struct OliphauntCapabilities`
+- `struct OliphauntCommandResult`
 - `struct OliphauntConfiguration`
-- `struct OliphauntDefaultEngine`
-- `struct OliphauntEngineModeSupport`
-- `struct OliphauntExtensionSizeReport`
-- `struct OliphauntNativeDirectEngine`
 - `struct OliphauntPostgresError`
 - `struct OliphauntPostgresErrorField`
 - `struct OliphauntQueryField`
 - `struct OliphauntQueryResult`
 - `struct OliphauntQueryRow`
-- `struct OliphauntRestoreRequest`
-- `struct OliphauntRuntimeResourceSizeReport`
-- `struct OliphauntRuntimeResources`
 - `struct OliphauntStartupGUC`
 - `struct OliphauntTransaction`
-- `struct RuntimeUnavailableEngine`
-- `unregisterPackagedExtensionResource()`
+
+## Swift: OliphauntExtensionSupport
+
+- `OliphauntExtensionSupport.register()`
+- `enum OliphauntExtensionSupport`
 
 ## Kotlin: oliphaunt
 
 ### commonMain
 
-- `EngineCapabilities.supportsBackupFormat()`
-- `EngineCapabilities.supportsRestoreFormat()`
 - `OliphauntDatabase.backup()`
 - `OliphauntDatabase.cancel()`
-- `OliphauntDatabase.capabilities()`
 - `OliphauntDatabase.checkpoint()`
 - `OliphauntDatabase.close()`
-- `OliphauntDatabase.connectionString()`
 - `OliphauntDatabase.execProtocolRaw()`
 - `OliphauntDatabase.execProtocolStream()`
 - `OliphauntDatabase.execute()`
-- `OliphauntDatabase.open()`
-- `OliphauntDatabase.prepareForBackground()`
 - `OliphauntDatabase.query()`
-- `OliphauntDatabase.restore()`
-- `OliphauntDatabase.resumeFromBackground()`
-- `OliphauntDatabase.supportedModes()`
-- `OliphauntDatabase.supportsBackupFormat()`
-- `OliphauntDatabase.supportsRestoreFormat()`
 - `OliphauntDatabase.transaction()`
-- `OliphauntEngine.open()`
-- `OliphauntEngine.restore()`
-- `OliphauntEngine.supportedModes()`
-- `OliphauntRuntimeSupport.allModes`
-- `OliphauntRuntimeSupport.capabilitiesFor()`
-- `OliphauntRuntimeSupport.nativeDirectOnly()`
-- `OliphauntRuntimeSupport.unavailable()`
-- `OliphauntSession.backup()`
-- `OliphauntSession.cancel()`
-- `OliphauntSession.capabilities()`
-- `OliphauntSession.close()`
-- `OliphauntSession.execProtocolRaw()`
-- `OliphauntSession.execProtocolStream()`
 - `OliphauntTransaction.execProtocolRaw()`
 - `OliphauntTransaction.execProtocolStream()`
 - `OliphauntTransaction.execute()`
 - `OliphauntTransaction.query()`
-- `PostgresError.fallback()`
-- `PostgresError.fromFields()`
 - `PostgresException.postgresError`
-- `ProtocolRequest.Companion.extendedQuery()`
-- `ProtocolRequest.simpleQuery()`
-- `QueryFormat.fromCode()`
 - `QueryParam.binary()`
 - `QueryParam.text()`
 - `QueryParam.value`
 - `QueryResult.fieldIndex()`
 - `QueryResult.getText()`
-- `QueryResult.rowCount`
 - `QueryRow.text()`
 - `QueryRow.values`
-- `RestoreRequest.replaceExisting()`
-- `class BackgroundPreparationOptions`
-- `class BackgroundPreparationResult`
-- `class BackupArtifact`
-- `class BackupRequest`
-- `class EngineCapabilities`
-- `class EngineModeSupport`
-- `class OliphauntConfig`
+- `class CommandResult`
 - `class OliphauntDatabase`
 - `class OliphauntException`
 - `class OliphauntTransaction`
@@ -392,8 +419,6 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `class PostgresErrorField`
 - `class PostgresException`
 - `class PostgresStartupGuc`
-- `class ProtocolRequest`
-- `class ProtocolResponse`
 - `class QueryField`
 - `class QueryFormat`
 - `class QueryFormat.Other`
@@ -402,213 +427,107 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `class QueryParam.Text`
 - `class QueryResult`
 - `class QueryRow`
-- `class RestoreRequest`
-- `class RuntimeUnavailableEngine`
-- `defaultOliphauntEngine()`
-- `enum class BackgroundCheckpointSkipReason`
-- `enum class BackupFormat`
-- `enum class DurabilityProfile`
-- `enum class EngineMode`
-- `enum class RestoreTargetPolicy`
-- `enum class RuntimeFootprintProfile`
-- `interface OliphauntEngine`
-- `interface OliphauntSession`
-- `object OliphauntRuntimeSupport`
 - `object QueryFormat.Binary`
 - `object QueryFormat.Text`
 - `object QueryParam.Null`
-- `parseQueryResponse()`
 
 ### androidMain
 
-- `AndroidNativeDirectEngine.packageSizeReport()`
-- `OliphauntAndroid.open()`
-- `OliphauntAndroid.packageSizeReport()`
-- `OliphauntAndroid.restore()`
-- `OliphauntAndroid.supportedModes()`
-- `class AndroidNativeDirectEngine`
-- `class OliphauntExtensionSizeReport`
-- `class OliphauntPackageSizeReport`
-- `defaultOliphauntEngine()`
-- `object OliphauntAndroid`
+- `Oliphaunt.open()`
+- `Oliphaunt.restore()`
+- `class DatabaseStorage.Directory`
+- `class OliphauntConfig`
+- `interface DatabaseStorage`
+- `object DatabaseStorage.TemporaryDirectory`
+- `object Oliphaunt`
 
 ### jvmMain
 
-- `defaultOliphauntEngine()`
+- none
 
-### nativeMain
+## Kotlin Android Gradle plugin
 
-- `class NativeDirectEngine`
-- `defaultOliphauntEngine()`
+- `OliphauntAndroidExtension.getAndroidAbis()`
+- `OliphauntAndroidExtension.getExtensionVersions()`
+- `OliphauntAndroidExtension.getIcu()`
+- `OliphauntAndroidExtension.getLiboliphauntVersion()`
+- `OliphauntAndroidExtension.getSelectedExtensions()`
+- `class OliphauntAndroidExtension`
+- `plugin dev.oliphaunt.android`
 
 ## React Native: @oliphaunt/react-native
 
+### Package exports
+
+- `. = {"types":"./lib/typescript/index.d.ts","react-native":"./lib/module/index.js","import":"./lib/module/index.js","require":"./lib/commonjs/index.js","default":"./lib/module/index.js"}`
+- `./protocol = {"types":"./lib/typescript/protocol.d.ts","react-native":"./lib/module/protocol.js","import":"./lib/module/protocol.js","require":"./lib/commonjs/protocol.js","default":"./lib/module/protocol.js"}`
+- `./query = {"types":"./lib/typescript/query.d.ts","react-native":"./lib/module/query.js","import":"./lib/module/query.js","require":"./lib/commonjs/query.js","default":"./lib/module/query.js"}`
+- `./extension-metadata = {"types":"./lib/typescript/extension-metadata.d.ts","react-native":"./lib/module/extension-metadata.js","import":"./lib/module/extension-metadata.js","require":"./lib/commonjs/extension-metadata.js","default":"./lib/module/extension-metadata.js"}`
+- `./package.json = "./package.json"`
+
 ### Types
 
-- `BackgroundPreparationOptions`
-- `BackgroundPreparationResult`
-- `BackupArtifact`
-- `BackupFormat`
 - `BinaryInput`
-- `DurabilityProfile`
-- `EngineCapabilities`
-- `EngineMode`
-- `EngineModeSupport`
-- `ExtensionSizeReport`
-- `JsiRawProtocolTransport`
-- `LatencySummary`
-- `MobileReleaseExtensionProof`
-- `MobileReleasePlatform`
-- `NativeCapabilities`
-- `NativeEngineModeSupport`
-- `NativeExtensionSizeReport`
-- `NativeOpenConfig`
-- `NativePackageSizeReport`
-- `NativeProcessMemoryReport`
-- `NativeResourceConfig`
+- `CommandResult`
+- `DatabaseStorage`
 - `OliphauntClient`
+- `OliphauntDatabase`
 - `OliphauntTransaction`
 - `OpenConfig`
-- `PackageSizeReport`
-- `PackageSizeReportOptions`
 - `PostgresErrorField`
-- `PostgresSettings`
-- `PostgresStartupGUC`
-- `ProcessMemoryReport`
-- `ProtocolChunkCallback`
-- `QueryBinaryInput`
 - `QueryField`
 - `QueryFormat`
 - `QueryParam`
 - `QueryResult`
 - `QueryRow`
-- `RawProtocolTransport`
-- `ReactNativeBenchmarkOptions`
-- `ReactNativeBenchmarkReport`
-- `ReactNativeBenchmarkWorkload`
-- `ReactNativeSmokeOptions`
-- `ReactNativeSmokeReport`
-- `RestoreOptions`
-- `RuntimeFootprintProfile`
-- `Spec`
-- `ThroughputSummary`
+- `RestoreDestination`
 
 ### Values
 
-- `MOBILE_RELEASE_EXTENSION_CATALOG_SHA256`
-- `MOBILE_RELEASE_EXTENSION_PROOF_COUNT`
 - `Oliphaunt`
-- `OliphauntDatabase`
 - `PostgresError`
-- `createOliphauntClient`
-- `extendedQuery`
-- `mobileReleaseExtensionProofPlan`
-- `parseQueryResponse`
-- `runInstalledOliphauntReactNativeBenchmark`
-- `runInstalledOliphauntReactNativeSmoke`
-- `runOliphauntReactNativeBenchmark`
-- `runOliphauntReactNativeSmoke`
-- `simpleQuery`
-- `supportsBackupFormat`
-- `supportsRestoreFormat`
 
 ### Members
 
-- `BackgroundPreparationOptions.cancelActiveWork`
-- `BackgroundPreparationOptions.checkpointWhenIdle`
-- `BackgroundPreparationResult.cancelledActiveWork`
-- `BackgroundPreparationResult.checkpointed`
-- `BackgroundPreparationResult.skippedCheckpointReason`
-- `BackupArtifact.bytes`
-- `BackupArtifact.format`
-- `EngineCapabilities.backupFormats`
-- `EngineCapabilities.backupRestore`
-- `EngineCapabilities.connectionString`
-- `EngineCapabilities.crashRestartable`
-- `EngineCapabilities.engine`
-- `EngineCapabilities.extensions`
-- `EngineCapabilities.independentSessions`
-- `EngineCapabilities.maxClientSessions`
-- `EngineCapabilities.multiRoot`
-- `EngineCapabilities.processIsolated`
-- `EngineCapabilities.protocolRaw`
-- `EngineCapabilities.protocolStream`
-- `EngineCapabilities.queryCancel`
-- `EngineCapabilities.rawProtocolTransport`
-- `EngineCapabilities.reopenable`
-- `EngineCapabilities.restoreFormats`
-- `EngineCapabilities.rootSwitchable`
-- `EngineCapabilities.sameRootLogicalReopen`
-- `EngineCapabilities.simpleQuery`
-- `EngineModeSupport.available`
-- `EngineModeSupport.capabilities`
-- `EngineModeSupport.engine`
-- `EngineModeSupport.unavailableReason`
-- `ExtensionSizeReport.bytes`
-- `ExtensionSizeReport.fileCount`
-- `ExtensionSizeReport.name`
+- `CommandResult.commandTag`
+- `CommandResult.rowCount`
 - `OliphauntClient.open()`
-- `OliphauntClient.packageSizeReport()`
-- `OliphauntClient.processMemory()`
 - `OliphauntClient.restore()`
-- `OliphauntClient.supportedModes()`
+- `OliphauntDatabase.[Symbol.asyncDispose]()`
 - `OliphauntDatabase.backup()`
 - `OliphauntDatabase.cancel()`
-- `OliphauntDatabase.capabilities()`
 - `OliphauntDatabase.checkpoint()`
 - `OliphauntDatabase.close()`
-- `OliphauntDatabase.connectionString()`
 - `OliphauntDatabase.execProtocolRaw()`
 - `OliphauntDatabase.execProtocolStream()`
 - `OliphauntDatabase.execute()`
-- `OliphauntDatabase.handle`
-- `OliphauntDatabase.prepareForBackground()`
 - `OliphauntDatabase.query()`
-- `OliphauntDatabase.resumeFromBackground()`
-- `OliphauntDatabase.supportsBackupFormat()`
-- `OliphauntDatabase.supportsRestoreFormat()`
+- `OliphauntDatabase.transaction()`
 - `OliphauntTransaction.execProtocolRaw()`
 - `OliphauntTransaction.execProtocolStream()`
 - `OliphauntTransaction.execute()`
 - `OliphauntTransaction.query()`
 - `OpenConfig.database`
-- `OpenConfig.durability`
-- `OpenConfig.engine`
 - `OpenConfig.extensions`
-- `OpenConfig.libraryPath`
-- `OpenConfig.resourceRoot`
-- `OpenConfig.root`
-- `OpenConfig.runtimeDirectory`
-- `OpenConfig.runtimeFootprint`
 - `OpenConfig.startupGUCs`
-- `OpenConfig.temporary`
+- `OpenConfig.storage`
 - `OpenConfig.username`
-- `PackageSizeReport.extensions`
-- `PackageSizeReport.mobileStaticRegistryPending`
-- `PackageSizeReport.mobileStaticRegistryRegistered`
-- `PackageSizeReport.mobileStaticRegistryState`
-- `PackageSizeReport.nativeModuleStems`
-- `PackageSizeReport.packageBytes`
-- `PackageSizeReport.runtimeBytes`
-- `PackageSizeReport.runtimeFeatures`
-- `PackageSizeReport.selectedExtensionBytes`
-- `PackageSizeReport.staticRegistryBytes`
-- `PackageSizeReport.templatePgdataBytes`
-- `PackageSizeReportOptions.resourceRoot`
+- `PostgresError.columnName`
+- `PostgresError.constraintName`
+- `PostgresError.constructor()`
+- `PostgresError.dataTypeName`
+- `PostgresError.detail`
+- `PostgresError.fields`
+- `PostgresError.hint`
+- `PostgresError.position`
+- `PostgresError.postgresMessage`
+- `PostgresError.schemaName`
+- `PostgresError.severity`
+- `PostgresError.sqlstate`
+- `PostgresError.tableName`
+- `PostgresError.whereText`
 - `PostgresErrorField.code`
 - `PostgresErrorField.value`
-- `ProcessMemoryReport.nativeHeapAllocatedBytes`
-- `ProcessMemoryReport.nativeHeapSizeBytes`
-- `ProcessMemoryReport.peakResidentBytes`
-- `ProcessMemoryReport.physicalFootprintBytes`
-- `ProcessMemoryReport.residentBytes`
-- `ProcessMemoryReport.runtimeFreeBytes`
-- `ProcessMemoryReport.runtimeTotalBytes`
-- `ProcessMemoryReport.source`
-- `ProcessMemoryReport.totalPrivateDirtyKb`
-- `ProcessMemoryReport.totalPssKb`
-- `ProcessMemoryReport.totalSharedDirtyKb`
-- `ProcessMemoryReport.virtualBytes`
 - `QueryField.format`
 - `QueryField.name`
 - `QueryField.tableAttribute`
@@ -624,167 +543,306 @@ node tools/policy/generate-sdk-api-surface.mjs --write
 - `QueryResult.rows`
 - `QueryRow.text()`
 - `QueryRow.values`
-- `RestoreOptions.artifact`
-- `RestoreOptions.libraryPath`
-- `RestoreOptions.replaceExisting`
-- `RestoreOptions.root`
-- `createOliphauntClient()`
-- `extendedQuery()`
-- `parseQueryResponse()`
-- `simpleQuery()`
-- `supportsBackupFormat()`
-- `supportsRestoreFormat()`
 
 ## TypeScript: @oliphaunt/ts
 
+### Package exports
+
+- `. = {"types":"./lib/index.d.ts","default":"./lib/index.js"}`
+- `./protocol = {"types":"./lib/protocol.d.ts","default":"./lib/protocol.js"}`
+- `./query = {"types":"./lib/query.d.ts","default":"./lib/query.js"}`
+- `./package.json = {"default":"./package.json"}`
+
 ### Types
 
-- `BackgroundPreparationOptions`
-- `BackgroundPreparationResult`
-- `BackupArtifact`
-- `BackupFormat`
 - `BinaryInput`
-- `BrokerTransport`
-- `DurabilityProfile`
-- `EngineCapabilities`
-- `EngineMode`
-- `EngineModeSupport`
-- `JavaScriptRuntime`
-- `MaybePromise`
-- `NativeBinding`
-- `NativeBindingOptions`
-- `NativeHandle`
-- `NativeOpenConfig`
-- `NativeRestoreOptions`
-- `NormalizedOpenConfig`
+- `CommandResult`
+- `DatabaseStorage`
 - `OliphauntClient`
+- `OliphauntDatabase`
+- `OliphauntServer`
 - `OliphauntTransaction`
 - `OpenConfig`
-- `PostgresStartupGUC`
-- `ProtocolChunkCallback`
-- `RawProtocolTransport`
-- `RestoreOptions`
-- `RuntimeBinding`
-- `RuntimeFootprintProfile`
-- `RuntimeHandle`
-- `SupportedModesOptions`
+- `PostgresErrorField`
+- `QueryField`
+- `QueryFormat`
+- `QueryParam`
+- `QueryResult`
+- `QueryRow`
+- `ServerListen`
+- `ServerOpenConfig`
 
 ### Values
 
 - `Oliphaunt`
-- `OliphauntDatabase`
 - `PostgresError`
-- `assertSuccessfulQueryResponse`
-- `createBunNativeBinding`
-- `createDefaultNativeBinding`
-- `createDenoNativeBinding`
-- `createNodeNativeBinding`
-- `createOliphauntClient`
-- `extendedQuery`
-- `nativeDirectCapabilities`
-- `parseQueryResponse`
-- `simpleQuery`
-- `supportsBackupFormat`
-- `supportsRestoreFormat`
-- `toUint8Array`
-- `type NativeBindingFactory`
-- `type PostgresErrorField`
-- `type QueryBinaryInput`
-- `type QueryField`
-- `type QueryFormat`
-- `type QueryParam`
-- `type QueryResult`
-- `type QueryRow`
 
 ### Members
 
-- `BackgroundPreparationOptions.cancelActiveWork`
-- `BackgroundPreparationOptions.checkpointWhenIdle`
-- `BackgroundPreparationResult.cancelledActiveWork`
-- `BackgroundPreparationResult.checkpointed`
-- `BackgroundPreparationResult.skippedCheckpointReason`
-- `BackupArtifact.bytes`
-- `BackupArtifact.format`
-- `EngineCapabilities.backupFormats`
-- `EngineCapabilities.backupRestore`
-- `EngineCapabilities.connectionString`
-- `EngineCapabilities.crashRestartable`
-- `EngineCapabilities.engine`
-- `EngineCapabilities.extensions`
-- `EngineCapabilities.independentSessions`
-- `EngineCapabilities.maxClientSessions`
-- `EngineCapabilities.multiRoot`
-- `EngineCapabilities.processIsolated`
-- `EngineCapabilities.protocolRaw`
-- `EngineCapabilities.protocolStream`
-- `EngineCapabilities.queryCancel`
-- `EngineCapabilities.rawProtocolTransport`
-- `EngineCapabilities.reopenable`
-- `EngineCapabilities.restoreFormats`
-- `EngineCapabilities.rootSwitchable`
-- `EngineCapabilities.sameRootLogicalReopen`
-- `EngineCapabilities.simpleQuery`
-- `EngineModeSupport.available`
-- `EngineModeSupport.capabilities`
-- `EngineModeSupport.engine`
-- `EngineModeSupport.unavailableReason`
+- `CommandResult.commandTag`
+- `CommandResult.rowCount`
 - `OliphauntClient.open()`
+- `OliphauntClient.openServer()`
 - `OliphauntClient.restore()`
-- `OliphauntClient.supportedModes()`
+- `OliphauntDatabase.[Symbol.asyncDispose]()`
 - `OliphauntDatabase.backup()`
 - `OliphauntDatabase.cancel()`
-- `OliphauntDatabase.capabilities()`
 - `OliphauntDatabase.checkpoint()`
 - `OliphauntDatabase.close()`
-- `OliphauntDatabase.connectionString()`
 - `OliphauntDatabase.execProtocolRaw()`
 - `OliphauntDatabase.execProtocolStream()`
 - `OliphauntDatabase.execute()`
-- `OliphauntDatabase.handle`
-- `OliphauntDatabase.prepareForBackground()`
 - `OliphauntDatabase.query()`
-- `OliphauntDatabase.resumeFromBackground()`
-- `OliphauntDatabase.supportsBackupFormat()`
-- `OliphauntDatabase.supportsRestoreFormat()`
+- `OliphauntDatabase.transaction()`
+- `OliphauntServer.[Symbol.asyncDispose]()`
+- `OliphauntServer.cancel()`
+- `OliphauntServer.checkpoint()`
+- `OliphauntServer.close()`
+- `OliphauntServer.connectionString`
+- `OliphauntServer.execProtocolRaw()`
+- `OliphauntServer.execProtocolStream()`
+- `OliphauntServer.execute()`
+- `OliphauntServer.query()`
+- `OliphauntServer.transaction()`
 - `OliphauntTransaction.execProtocolRaw()`
 - `OliphauntTransaction.execProtocolStream()`
 - `OliphauntTransaction.execute()`
 - `OliphauntTransaction.query()`
 - `OpenConfig.brokerExecutable`
-- `OpenConfig.brokerMaxRoots`
-- `OpenConfig.brokerTransport`
 - `OpenConfig.database`
-- `OpenConfig.durability`
-- `OpenConfig.engine`
+- `OpenConfig.execution`
 - `OpenConfig.extensions`
 - `OpenConfig.libraryPath`
-- `OpenConfig.maxClientSessions`
-- `OpenConfig.root`
 - `OpenConfig.runtimeDirectory`
-- `OpenConfig.runtimeFootprint`
-- `OpenConfig.serverExecutable`
-- `OpenConfig.serverPort`
-- `OpenConfig.serverToolDirectory`
 - `OpenConfig.startupGUCs`
-- `OpenConfig.temporary`
+- `OpenConfig.storage`
 - `OpenConfig.username`
-- `RestoreOptions.artifact`
-- `RestoreOptions.brokerExecutable`
-- `RestoreOptions.engine`
-- `RestoreOptions.libraryPath`
-- `RestoreOptions.replaceExisting`
-- `RestoreOptions.root`
-- `SupportedModesOptions.brokerExecutable`
-- `SupportedModesOptions.brokerTransport`
-- `SupportedModesOptions.libraryPath`
-- `SupportedModesOptions.runtimeDirectory`
-- `SupportedModesOptions.serverExecutable`
-- `SupportedModesOptions.serverToolDirectory`
-- `assertSuccessfulQueryResponse()`
-- `createOliphauntClient()`
-- `extendedQuery()`
-- `parseQueryResponse()`
-- `simpleQuery()`
-- `supportsBackupFormat()`
-- `supportsRestoreFormat()`
-- `toUint8Array()`
+- `PostgresError.columnName`
+- `PostgresError.constraintName`
+- `PostgresError.constructor()`
+- `PostgresError.dataTypeName`
+- `PostgresError.detail`
+- `PostgresError.fields`
+- `PostgresError.hint`
+- `PostgresError.position`
+- `PostgresError.postgresMessage`
+- `PostgresError.schemaName`
+- `PostgresError.severity`
+- `PostgresError.sqlstate`
+- `PostgresError.tableName`
+- `PostgresError.whereText`
+- `PostgresErrorField.code`
+- `PostgresErrorField.value`
+- `QueryField.format`
+- `QueryField.name`
+- `QueryField.tableAttribute`
+- `QueryField.tableOid`
+- `QueryField.typeModifier`
+- `QueryField.typeOid`
+- `QueryField.typeSize`
+- `QueryResult.commandTag`
+- `QueryResult.fieldIndex()`
+- `QueryResult.fields`
+- `QueryResult.getText()`
+- `QueryResult.rowCount`
+- `QueryResult.rows`
+- `QueryRow.text()`
+- `QueryRow.values`
+
+## Native TypeScript tools: @oliphaunt/tools
+
+### Package exports
+
+- `. = {"types":"./index.d.ts","default":"./index.js"}`
+- `./package.json = "./package.json"`
+
+### Types
+
+- `PgDumpOptions`
+- `PsqlOptions`
+
+### Values
+
+- `PostgresToolError`
+- `pgDump`
+- `psql`
+
+### Members
+
+- `PgDumpOptions.args`
+- `PostgresToolError.exitCode`
+- `PostgresToolError.signal`
+- `PostgresToolError.stderr`
+- `PostgresToolError.stdout`
+- `PostgresToolError.tool`
+- `PsqlOptions.args`
+- `PsqlOptions.command`
+- `PsqlOptions.script`
+
+## WASIX TypeScript: @oliphaunt/wasix-ts
+
+### Package exports
+
+- `. = {"types":"./lib/index.d.ts","deno":"./lib/index.deno.js","bun":"./lib/index.bun.js","node":"./lib/index.node.js","browser":"./lib/index.js","default":"./lib/index.js"}`
+- `./protocol = {"types":"./lib/protocol.d.ts","default":"./lib/protocol.js"}`
+- `./query = {"types":"./lib/query.d.ts","default":"./lib/query.js"}`
+- `./internal/tools = {"types":"./lib/internal.d.ts","deno":"./lib/internal.node.js","bun":"./lib/internal.node.js","node":"./lib/internal.node.js","browser":"./lib/internal.js","default":"./lib/internal.js"}`
+- `./server/node = {"types":"./lib/server.node.d.ts","node":"./lib/server.node.js"}`
+- `./server/bun = {"types":"./lib/server.node.d.ts","bun":"./lib/server.node.js"}`
+- `./server/deno = {"types":"./lib/server.node.d.ts","deno":"./lib/server.node.js"}`
+- `./storage/indexed-db = {"types":"./lib/storage/indexed-db.d.ts","default":"./lib/storage/indexed-db.js"}`
+- `./storage/opfs = {"types":"./lib/storage/opfs.d.ts","default":"./lib/storage/opfs.js"}`
+- `./storage/node = {"types":"./lib/storage/node.d.ts","node":"./lib/storage/node.js"}`
+- `./storage/bun = {"types":"./lib/storage/bun.d.ts","bun":"./lib/storage/bun.js"}`
+- `./storage/deno = {"types":"./lib/storage/deno.d.ts","deno":"./lib/storage/deno.js"}`
+- `./package.json = {"default":"./package.json"}`
+
+### Types
+
+- `BinaryInput`
+- `CommandResult`
+- `ExecutionMode`
+- `OliphauntClient`
+- `OliphauntDatabase`
+- `OliphauntTransaction`
+- `OpenConfig`
+- `PersistentWasixStorage`
+- `PostgresErrorField`
+- `QueryField`
+- `QueryFormat`
+- `QueryParam`
+- `QueryResult`
+- `QueryRow`
+- `WasixAssetSource`
+- `WasixExtensionDescriptor`
+- `WasixStorage`
+- `WasixStorageCommitState`
+- `WasixStorageErrorCode`
+
+### Values
+
+- `Oliphaunt`
+- `PostgresError`
+- `WasixStorageError`
+- `memory`
+
+### Members
+
+- `CommandResult.commandTag`
+- `CommandResult.rowCount`
+- `OliphauntClient.open()`
+- `OliphauntClient.restore()`
+- `OliphauntDatabase.[Symbol.asyncDispose]()`
+- `OliphauntDatabase.backup()`
+- `OliphauntDatabase.checkpoint()`
+- `OliphauntDatabase.close()`
+- `OliphauntDatabase.execProtocolRaw()`
+- `OliphauntDatabase.execProtocolStream()`
+- `OliphauntDatabase.execute()`
+- `OliphauntDatabase.query()`
+- `OliphauntDatabase.transaction()`
+- `OliphauntTransaction.execProtocolRaw()`
+- `OliphauntTransaction.execProtocolStream()`
+- `OliphauntTransaction.execute()`
+- `OliphauntTransaction.query()`
+- `OpenConfig.database`
+- `OpenConfig.execution`
+- `OpenConfig.extensions`
+- `OpenConfig.icu`
+- `OpenConfig.startupGUCs`
+- `OpenConfig.storage`
+- `OpenConfig.username`
+- `PostgresError.columnName`
+- `PostgresError.constraintName`
+- `PostgresError.constructor()`
+- `PostgresError.dataTypeName`
+- `PostgresError.detail`
+- `PostgresError.fields`
+- `PostgresError.hint`
+- `PostgresError.position`
+- `PostgresError.postgresMessage`
+- `PostgresError.schemaName`
+- `PostgresError.severity`
+- `PostgresError.sqlstate`
+- `PostgresError.tableName`
+- `PostgresError.whereText`
+- `PostgresErrorField.code`
+- `PostgresErrorField.value`
+- `QueryField.format`
+- `QueryField.name`
+- `QueryField.tableAttribute`
+- `QueryField.tableOid`
+- `QueryField.typeModifier`
+- `QueryField.typeOid`
+- `QueryField.typeSize`
+- `QueryResult.commandTag`
+- `QueryResult.fieldIndex()`
+- `QueryResult.fields`
+- `QueryResult.getText()`
+- `QueryResult.rowCount`
+- `QueryResult.rows`
+- `QueryRow.text()`
+- `QueryRow.values`
+- `WasixStorageError.code`
+- `WasixStorageError.commitState`
+- `WasixStorageError.constructor()`
+
+### Storage subpath: @oliphaunt/wasix-ts/storage/indexed-db
+
+- `indexedDB`
+
+### Storage subpath: @oliphaunt/wasix-ts/storage/opfs
+
+- `opfs`
+
+### Storage subpath: @oliphaunt/wasix-ts/storage/node
+
+- `directory`
+
+### Storage subpath: @oliphaunt/wasix-ts/storage/bun
+
+- `directory`
+
+### Storage subpath: @oliphaunt/wasix-ts/storage/deno
+
+- `directory`
+
+### Server subpaths: @oliphaunt/wasix-ts/server/{node,bun,deno}
+
+- `OliphauntServer`
+- `ServerListen`
+- `ServerOpenConfig`
+- `openServer`
+- `OliphauntServer.[Symbol.asyncDispose]()`
+- `OliphauntServer.close()`
+- `OliphauntServer.connectionString`
+
+## WASIX TypeScript tools: @oliphaunt/wasix-tools
+
+### Package exports
+
+- `. = {"types":"./lib/index.d.ts","default":"./lib/index.js"}`
+- `./package.json = "./package.json"`
+
+### Types
+
+- `PgDumpOptions`
+- `PsqlOptions`
+
+### Values
+
+- `PostgresToolError`
+- `pgDump`
+- `psql`
+
+### Members
+
+- `PgDumpOptions.args`
+- `PostgresToolError.constructor()`
+- `PostgresToolError.exitCode`
+- `PostgresToolError.stderr`
+- `PostgresToolError.stdout`
+- `PostgresToolError.tool`
+- `PsqlOptions.args`
+- `PsqlOptions.command`
+- `PsqlOptions.script`

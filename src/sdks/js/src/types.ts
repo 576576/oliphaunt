@@ -1,104 +1,39 @@
-export type EngineMode = 'nativeDirect' | 'nativeBroker' | 'nativeServer';
-export type DurabilityProfile = 'safe' | 'balanced' | 'fastDev';
-export type RuntimeFootprintProfile = 'throughput' | 'balancedMobile' | 'smallMobile';
-export type JavaScriptRuntime = 'node' | 'bun' | 'deno';
-export type RawProtocolTransport =
-  | 'node-addon'
-  | 'bun-ffi'
-  | 'deno-ffi'
-  | 'broker-ipc'
-  | 'server-wire';
-export type BackupFormat = 'sql' | 'physicalArchive' | 'oliphauntArchive';
-export type BrokerTransport = 'auto' | 'unix' | 'tcp';
-
-export type PostgresStartupGUC =
-  | string
-  | {
-      readonly name: string;
-      readonly value: string;
-    };
+export type DatabaseStorage =
+  | { readonly kind: 'temporaryDirectory' }
+  | { readonly kind: 'directory'; readonly path: string };
 
 export type BinaryInput = ArrayBuffer | ArrayBufferView | Uint8Array | ReadonlyArray<number>;
+export type ProtocolChunkCallback = (chunk: Uint8Array) => void;
 
 export type OpenConfig = {
-  engine?: EngineMode;
-  root?: string;
-  temporary?: boolean;
-  durability?: DurabilityProfile;
-  runtimeFootprint?: RuntimeFootprintProfile;
-  startupGUCs?: ReadonlyArray<PostgresStartupGUC>;
+  execution?: 'direct' | 'broker';
+  storage?: DatabaseStorage;
+  startupGUCs?: Readonly<Record<string, string>>;
   username?: string;
   database?: string;
   extensions?: ReadonlyArray<string>;
   libraryPath?: string;
   runtimeDirectory?: string;
-  maxClientSessions?: number;
   brokerExecutable?: string;
-  brokerMaxRoots?: number;
-  brokerTransport?: BrokerTransport;
+};
+
+export type ServerOpenConfig = Omit<
+  OpenConfig,
+  'execution' | 'brokerExecutable' | 'libraryPath'
+> & {
   serverExecutable?: string;
-  serverPort?: number;
-  serverToolDirectory?: string;
+  listen?: ServerListen;
 };
 
-export type EngineCapabilities = {
-  engine: EngineMode;
-  processIsolated: boolean;
-  multiRoot: boolean;
-  reopenable: boolean;
-  sameRootLogicalReopen: boolean;
-  rootSwitchable: boolean;
-  crashRestartable: boolean;
-  independentSessions: boolean;
-  maxClientSessions: number;
-  protocolRaw: boolean;
-  protocolStream: boolean;
-  queryCancel: boolean;
-  backupRestore: boolean;
-  backupFormats: BackupFormat[];
-  restoreFormats: BackupFormat[];
-  simpleQuery: boolean;
-  extensions: boolean;
-  connectionString?: string;
-  rawProtocolTransport?: RawProtocolTransport;
-};
-
-export type EngineModeSupport = {
-  engine: EngineMode;
-  available: boolean;
-  capabilities: EngineCapabilities;
-  unavailableReason?: string;
-};
-
-export type BackupArtifact = {
-  format: BackupFormat;
-  bytes: Uint8Array;
-};
-
-export type RestoreOptions = {
-  engine?: EngineMode;
-  root: string;
-  artifact: BackupArtifact;
-  replaceExisting?: boolean;
-  libraryPath?: string;
-  brokerExecutable?: string;
-};
-
-export type BackgroundPreparationOptions = {
-  cancelActiveWork?: boolean;
-  checkpointWhenIdle?: boolean;
-};
-
-export type BackgroundPreparationResult = {
-  cancelledActiveWork: boolean;
-  checkpointed: boolean;
-  skippedCheckpointReason?: 'activeWork' | 'transactionActive';
-};
-
-export type ProtocolChunkCallback = (chunk: Uint8Array) => void;
+export type ServerListen =
+  | { readonly transport: 'tcp'; readonly port?: number }
+  | { readonly transport: 'unix'; readonly directory: string; readonly port?: number };
 
 export type OliphauntTransaction = {
-  execute(sql: string): Promise<Uint8Array>;
+  execute(
+    sql: string,
+    parameters?: ReadonlyArray<import('./query.js').QueryParam>,
+  ): Promise<import('./query.js').CommandResult>;
   query(
     sql: string,
     parameters?: ReadonlyArray<import('./query.js').QueryParam>,
@@ -107,17 +42,50 @@ export type OliphauntTransaction = {
   execProtocolStream(input: BinaryInput, onChunk: ProtocolChunkCallback): Promise<void>;
 };
 
-export type SupportedModesOptions = {
+export type OliphauntDatabase = {
+  execute(
+    sql: string,
+    parameters?: ReadonlyArray<import('./query.js').QueryParam>,
+  ): Promise<import('./query.js').CommandResult>;
+  query(
+    sql: string,
+    parameters?: ReadonlyArray<import('./query.js').QueryParam>,
+  ): Promise<import('./query.js').QueryResult>;
+  execProtocolRaw(input: BinaryInput): Promise<Uint8Array>;
+  execProtocolStream(input: BinaryInput, onChunk: ProtocolChunkCallback): Promise<void>;
+  backup(): Promise<Uint8Array>;
+  checkpoint(): Promise<void>;
+  cancel(): Promise<void>;
+  transaction<T>(body: (transaction: OliphauntTransaction) => Promise<T> | T): Promise<T>;
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+};
+
+export type OliphauntServer = {
+  execute(
+    sql: string,
+    parameters?: ReadonlyArray<import('./query.js').QueryParam>,
+  ): Promise<import('./query.js').CommandResult>;
+  query(
+    sql: string,
+    parameters?: ReadonlyArray<import('./query.js').QueryParam>,
+  ): Promise<import('./query.js').QueryResult>;
+  execProtocolRaw(input: BinaryInput): Promise<Uint8Array>;
+  execProtocolStream(input: BinaryInput, onChunk: ProtocolChunkCallback): Promise<void>;
+  checkpoint(): Promise<void>;
+  cancel(): Promise<void>;
+  transaction<T>(body: (transaction: OliphauntTransaction) => Promise<T> | T): Promise<T>;
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+  readonly connectionString: string;
+};
+
+export type RestoreOptions = {
   libraryPath?: string;
-  runtimeDirectory?: string;
-  brokerExecutable?: string;
-  brokerTransport?: BrokerTransport;
-  serverExecutable?: string;
-  serverToolDirectory?: string;
 };
 
 export type OliphauntClient = {
-  supportedModes(options?: SupportedModesOptions): Promise<EngineModeSupport[]>;
-  open(config?: OpenConfig): Promise<import('./client.js').OliphauntDatabase>;
-  restore(options: RestoreOptions): Promise<string>;
+  open(config?: OpenConfig): Promise<OliphauntDatabase>;
+  openServer(config?: ServerOpenConfig): Promise<OliphauntServer>;
+  restore(destination: string, backup: BinaryInput, options?: RestoreOptions): Promise<void>;
 };

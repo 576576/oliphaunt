@@ -204,18 +204,22 @@ oliphaunt_runtime_native_host_can_initdb() {
   [ -x "$oliphaunt_runtime_initdb" ] || return 1
 
   oliphaunt_runtime_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/oliphaunt-runtime-initdb.XXXXXX")"
-  if [ -d "$oliphaunt_runtime_icu_data" ]; then
-    if ICU_DATA="$oliphaunt_runtime_icu_data" "$oliphaunt_runtime_initdb" -D "$oliphaunt_runtime_probe_dir/pgdata" --no-sync --locale-provider=libc --locale=C --encoding=UTF8 >/dev/null 2>&1; then
-      oliphaunt_runtime_initdb_status=0
+  if (
+    unset ICU_DATA
+    unset OLIPHAUNT_INTERNAL_ICU_READY
+    unset OLIPHAUNT_INTERNAL_SKIP_ICU_DISCOVERY
+    unset OLIPHAUNT_INTERNAL_SKIP_SYSTEM_COLLATION_DISCOVERY
+    if [ -d "$oliphaunt_runtime_icu_data" ]; then
+      export ICU_DATA="$oliphaunt_runtime_icu_data"
+      export OLIPHAUNT_INTERNAL_ICU_READY=1
     else
-      oliphaunt_runtime_initdb_status="$?"
+      export OLIPHAUNT_INTERNAL_SKIP_ICU_DISCOVERY=1
     fi
+    "$oliphaunt_runtime_initdb" -D "$oliphaunt_runtime_probe_dir/pgdata" --no-sync --locale-provider=libc --locale=C --encoding=UTF8 >/dev/null 2>&1
+  ); then
+    oliphaunt_runtime_initdb_status=0
   else
-    if "$oliphaunt_runtime_initdb" -D "$oliphaunt_runtime_probe_dir/pgdata" --no-sync --locale-provider=libc --locale=C --encoding=UTF8 >/dev/null 2>&1; then
-      oliphaunt_runtime_initdb_status=0
-    else
-      oliphaunt_runtime_initdb_status="$?"
-    fi
+    oliphaunt_runtime_initdb_status="$?"
   fi
   rm -rf "$oliphaunt_runtime_probe_dir"
   return "$oliphaunt_runtime_initdb_status"
@@ -448,7 +452,8 @@ function pyTruthy(value) {
 const manifest = await Bun.file("target/oliphaunt-wasix/assets/manifest.json").json();
 const hasExtensions = pyTruthy(manifest.extensions);
 const hasPgDump = pyTruthy(manifest["pg-dump"]);
-console.log(hasExtensions && hasPgDump ? "full" : "core");
+const hasPsql = pyTruthy(manifest.psql);
+console.log(hasExtensions && hasPgDump && hasPsql ? "full" : "core");
 '
 }
 
@@ -468,7 +473,7 @@ oliphaunt_runtime_wasm_require() {
   oliphaunt_runtime_asset_mode="$(oliphaunt_runtime_wasm_asset_mode)"
   if [ "$oliphaunt_runtime_asset_mode" = "core" ]; then
     if [ "$oliphaunt_runtime_mode" = "regression" ]; then
-      echo "full WASIX assets are required for liboliphaunt-wasix:regression; core-only assets would skip extension and pg_dump evidence" >&2
+      echo "full WASIX assets are required for liboliphaunt-wasix:regression; core-only assets would skip extension and frontend-tool evidence" >&2
       return 1
     fi
     export OLIPHAUNT_WASM_SKIP_EXTENSIONS_FOR_PERF=1

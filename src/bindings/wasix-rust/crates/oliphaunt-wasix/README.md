@@ -1,118 +1,157 @@
-<h1 align="center">oliphaunt-wasix</h1>
+# `oliphaunt-wasix`
 
-<p align="center">
-  <strong>Embedded Postgres for Rust tests and local apps.</strong><br>
-  Real PostgreSQL. Direct Rust API or a local Postgres URL.
-</p>
-
-<p align="center">
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/guide.mdx">Guide</a>
-  ·
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/reference/performance.md">Performance</a>
-  ·
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/reference/extensions.mdx">Extensions</a>
-  ·
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/dump-restore.md">Dump & Upgrade</a>
-  ·
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/runtime.md">Runtime</a>
-  ·
-  <a href="https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/learn/tauri.md">Tauri</a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/f0rr0/oliphaunt/actions/workflows/ci.yml"><img src="https://github.com/f0rr0/oliphaunt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://crates.io/crates/oliphaunt-wasix"><img src="https://img.shields.io/crates/v/oliphaunt-wasix.svg" alt="crates.io"></a>
-  <a href="https://docs.rs/oliphaunt-wasix"><img src="https://docs.rs/oliphaunt-wasix/badge.svg" alt="docs.rs"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/msrv-1.93-blue" alt="MSRV"></a>
-  <a href="https://github.com/f0rr0/oliphaunt#license"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
-</p>
-
-`oliphaunt-wasix` brings the WASIX Oliphaunt/Postgres runtime to Rust with a
-small API. Open a database directly with `Oliphaunt`, or hand `OliphauntServer`
-to SQLx and any standard Postgres client. The release-built runtime is
-PostgreSQL 18.4. Cargo resolves the matching WASIX runtime and AOT artifact
-crates; applications do not download runtime assets at first database open.
-
-## Add Postgres In One Minute ⚡
-
-Already using SQLx or another Postgres client? The WASIX API shape is:
+Embedded PostgreSQL 18 for Rust through the canonical `liboliphaunt-wasix`
+runtime. Use the direct typed API, or start a local PostgreSQL server for SQLx,
+`tokio-postgres`, and other standard clients.
 
 ```sh
 cargo add oliphaunt-wasix
 ```
+
+## Direct API
+
+```rust,no_run
+use oliphaunt_wasix::{DatabaseStorage, Oliphaunt};
+
+# fn main() -> anyhow::Result<()> {
+let mut database = Oliphaunt::builder()
+    .storage(DatabaseStorage::Directory("./data/main".into()))
+    .startup_guc("work_mem", "8MB")
+    .open()?;
+
+database.execute("CREATE TABLE items(id integer PRIMARY KEY, value text NOT NULL)")?;
+database.execute_with_params(
+    "INSERT INTO items VALUES ($1, $2)",
+    ["1", "hello"],
+)?;
+let result = database.query_with_params(
+    "SELECT value FROM items WHERE id = $1",
+    [1_i32],
+)?;
+assert_eq!(result.get_text(0, "value")?, Some("hello"));
+
+database.transaction(|transaction| {
+    transaction.execute("UPDATE items SET value = 'committed' WHERE id = 1")?;
+    Ok(())
+})?;
+database.close()?;
+# Ok(())
+# }
+```
+
+`execute` and `query` are the parameter-free forms;
+`execute_with_params` and `query_with_params` use PostgreSQL positional
+parameters. `exec_protocol_raw` is the buffered escape hatch for callers that
+need PostgreSQL frontend-protocol bytes. `exec_protocol_stream` delivers
+bounded callback chunks and streams COPY output through the guest protocol
+pump instead of accumulating the complete response. Every fallible API returns the
+crate-owned `Result<T>`. Its opaque `Error` implements `std::error::Error` and
+offers `postgres_error()`; PostgreSQL failures return the exported
+`PostgresError` details for fields such as SQLSTATE.
+
+The builder also supports `username`, `database`, `startup_gucs`, and bundled
+`extension`/`extensions` when the corresponding crate features are enabled.
+
+## Storage and physical backup
+
+`DatabaseStorage::Memory` is the default and keeps mutable PGDATA in Wasmer's
+memory filesystem. `DatabaseStorage::Directory(path)` persists a managed root:
+
+```text
+data/main/
+├── .oliphaunt.json
+└── pgdata/
+```
+
+A new empty root is initialized from the matching packaged cluster seed. An existing
+root must contain an exact descriptor and complete PostgreSQL 18 PGDATA;
+incomplete or unexpected contents fail without being adopted, deleted, or
+reinitialized.
+
+Rust uses one stable sibling advisory lock for both open and restore. It
+coordinates Rust WASIX owners of that path, including before a new root exists.
+The WASIX TypeScript binding has its own binding-local lease. Cross-binding root
+handoff is not a supported or qualified workflow.
+
+Physical backup is a PostgreSQL online backup in a plain tar archive:
+
+```rust,no_run
+use oliphaunt_wasix::{DatabaseStorage, Oliphaunt};
+
+# fn main() -> anyhow::Result<()> {
+let mut source = Oliphaunt::open()?;
+let backup = source.backup()?;
+source.close()?;
+
+Oliphaunt::restore("./data/restored", backup)?;
+let mut restored = Oliphaunt::builder()
+    .storage(DatabaseStorage::Directory("./data/restored".into()))
+    .open()?;
+restored.close()?;
+# Ok(())
+# }
+```
+
+`restore` accepts an absent or empty directory, validates and stages the whole
+archive, then publishes the managed root. The archive contains `pgdata/**` and
+`.oliphaunt/backup-manifest.properties`; it does not contain the destination's
+`.oliphaunt.json` descriptor. Physical archives are for the same PostgreSQL
+major and WASIX physical format. Use logical dump/restore for upgrades.
+
+## Standard PostgreSQL clients and tools
 
 ```rust,no_run
 use oliphaunt_wasix::OliphauntServer;
 use sqlx::{Connection, Row};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = OliphauntServer::temporary_tcp()?;
-    // For a persistent TCP server:
-    // let server = OliphauntServer::builder().path("./.oliphaunt").start()?;
-    let mut conn = sqlx::PgConnection::connect(&server.database_url()).await?;
-
-    let row = sqlx::query("SELECT $1::int4 + 1 AS answer")
-        .bind(41_i32)
-        .fetch_one(&mut conn)
+async fn main() -> anyhow::Result<()> {
+    let server = OliphauntServer::builder().start()?;
+    let mut connection = sqlx::PgConnection::connect(&server.connection_string()).await?;
+    let row = sqlx::query("SELECT 42::int AS answer")
+        .fetch_one(&mut connection)
         .await?;
     assert_eq!(row.try_get::<i32, _>("answer")?, 42);
-
-    conn.close().await?;
-    server.shutdown()?;
+    connection.close().await?;
+    server.close()?;
     Ok(())
 }
 ```
 
-That's it. Real PostgreSQL, no service setup.
+With the `tools` feature, the optional `tools` namespace runs the matching
+packaged WASIX PostgreSQL programs directly against an open database:
 
-## Why oliphaunt-wasix ✨
+```rust,no_run
+use oliphaunt_wasix::{Oliphaunt, tools};
 
-Postgres should be as easy to add to a Rust project as SQLite.
+# fn main() -> anyhow::Result<()> {
+let mut source = Oliphaunt::open()?;
+let sql = tools::pg_dump(
+    &mut source,
+    tools::PgDumpOptions::new().arg("--schema-only"),
+)?;
+source.close()?;
+let mut target = Oliphaunt::open()?;
+tools::psql(&mut target, tools::PsqlOptions::new().script(sql))?;
+target.close()?;
+# Ok(())
+# }
+```
 
-- ⚡ **No service tax**: no Docker, no local Postgres, no testcontainers.
-- 🔌 **Use your real stack**: SQLx, `tokio-postgres`, CLIs, and other clients
-  connect through a normal local URL.
-- 🌉 **Proxy included**: expose an embedded database to non-Rust tools with
-  `oliphaunt-wasix-proxy`.
-- 🧪 **Clean tests**: temporary databases are isolated, fast, and removed on
-  drop.
-- 💾 **Persistent apps**: keep local app data across restarts when you want it.
-- 🧩 **Extensions available**: install exact extension release assets owned by
-  your application.
-- 📦 **Portable tools**: enable the `tools` feature to resolve the matching
-  `oliphaunt-wasix-tools` `pg_dump` and `psql` artifacts for logical backups,
-  checks, and upgrade paths.
-- 🚀 **Near-native feel**: close to native Postgres, fully embedded.
+`pg_dump` returns standard plain PostgreSQL SQL unchanged. `psql` is
+non-interactive and accepts a command, a script, or ordinary passthrough
+arguments. Connection, file input/output, format, compression, encoding, and
+parallel-job flags are managed and rejected from passthrough arguments. Direct
+tools are exclusive operations on the database handle and reset session state
+before and after the tool run.
 
-## Near-Native Performance 🚀
+TCP endpoints are loopback-only because the embedded proxy uses PostgreSQL
+trust authentication. The default listener uses an automatically assigned
+loopback port. `ServerListen::tcp_port` selects a fixed port and
+`ServerListen::unix` selects a PostgreSQL-style Unix socket directory. The
+server deliberately owns one connected client at a time; use the separate
+postmaster product for concurrent sessions.
 
-Current local snapshot on `Apple M1 Pro`, `16 GB RAM`, and `macOS 26.4.1`.
-Full numbers and reproduction steps live in the
-[performance guide](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/reference/performance.md). Lower is better.
-
-| Operation | native pg + SQLx | oliphaunt-wasix + SQLx | vanilla Oliphaunt + SQLx |
-|---|---:|---:|---:|
-| 25,000 INSERTs in one transaction | 132.36 ms | 149.54 ms | 257.02 ms |
-| 25,000 INSERTs in one statement | 46.14 ms | 59.39 ms | 117.19 ms |
-| 25,000 INSERTs into an indexed table | 188.72 ms | 253.38 ms | 352.64 ms |
-| 5,000 indexed SELECTs | 81.39 ms | 125.31 ms | 203.05 ms |
-| 25,000 indexed UPDATEs | 351.05 ms | 578.96 ms | 720.63 ms |
-
-`oliphaunt-wasix` stays close to native Postgres while running entirely embedded
-and consistently performs better than vanilla Oliphaunt.
-
-## Extensions 🧩
-
-WASIX extensions are exact package artifacts. The base runtime does not include
-optional extension payloads. Applications select only the extension packages
-they use.
-
-## Docs
-
-- [WASM guide](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/guide.mdx)
-- [Extensions](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/reference/extensions.mdx)
-- [Performance guide](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/reference/performance.md)
-- [Dump and upgrade guide](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/dump-restore.md)
-- [Tauri usage](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/learn/tauri.md)
-- [WASIX runtime guide](https://github.com/f0rr0/oliphaunt/blob/main/src/docs/content/sdk/wasm/runtime.md)
+The crate packages no mutable runtime downloads. Cargo resolves the matching
+runtime, AOT, tool, and selected extension artifacts built from the same
+`liboliphaunt-wasix` source identity.

@@ -62,10 +62,11 @@ liboliphaunt_sources=(
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_native.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_runtime.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_protocol.c"
-  "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_bootstrap.c"
+  "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_config.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_process.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_trace.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_fs.c"
+  "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_backup_state.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_archive.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_archive_tar.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_static_extensions.c"
@@ -271,7 +272,7 @@ patched_source_ready() {
     grep -Fq 'oliphaunt_embedded_main' "$build_dir/src/backend/tcop/postgres.c" &&
     grep -Fq 'oliphaunt_embedded_kill' "$build_dir/src/port/pqsignal.c" &&
     grep -Fq 'oliphaunt_embedded_raise' "$build_dir/src/port/pqsignal.c" &&
-    grep -Fq 'getenv("ICU_DATA")' "$build_dir/src/bin/initdb/initdb.c" &&
+    grep -Fq 'OLIPHAUNT_INTERNAL_ICU_READY' "$build_dir/src/bin/initdb/initdb.c" &&
     grep -Fq 'oliphaunt_embedded' "$build_dir/meson_options.txt" &&
     grep -Fq 'OLIPHAUNT_EMBEDDED' "$build_dir/meson.build"
 }
@@ -296,11 +297,9 @@ artifact_ready() {
   local symbol
   for symbol in \
     _oliphaunt_init \
-    _oliphaunt_init_ex \
     _oliphaunt_exec_protocol \
     _oliphaunt_exec_protocol_stream \
     _oliphaunt_backup \
-    _oliphaunt_backup_ex \
     _oliphaunt_restore \
     _oliphaunt_cancel \
     _oliphaunt_detach \
@@ -310,7 +309,6 @@ artifact_ready() {
     _oliphaunt_register_static_extensions \
     _oliphaunt_last_error \
     _oliphaunt_version \
-    _oliphaunt_capabilities \
     _oliphaunt_free_response \
     _oliphaunt_embedded_kill \
     _oliphaunt_embedded_raise

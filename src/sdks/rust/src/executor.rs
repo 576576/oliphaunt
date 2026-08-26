@@ -1,40 +1,37 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Sender, unbounded};
 
-use crate::engine::{EngineCancel, EngineCapabilities, EngineSession};
+use crate::engine::{EngineCancel, EngineSession};
 use crate::error::{Error, Result};
-use crate::lifecycle::{
-    BackgroundCheckpointSkipReason, BackgroundPreparationOptions, BackgroundPreparationResult,
-};
 use crate::protocol::{ProtocolRequest, ProtocolResponse};
 use crate::reply;
-use crate::storage::{BackupArtifact, BackupRequest};
 
-type StreamSink = Box<dyn FnMut(&[u8]) -> Result<()> + Send>;
+type ProtocolChunkCallback = Box<dyn FnMut(&[u8]) -> Result<()> + Send>;
 
 pub(crate) struct EngineExecutor {
     sender: Sender<Command>,
-    capabilities: EngineCapabilities,
-    connection_string: Option<String>,
+    admission: Mutex<()>,
     cancel: Option<Arc<dyn EngineCancel>>,
     active_work: Arc<AtomicBool>,
     session_pinned: Arc<AtomicBool>,
+    transaction_poisoned: AtomicBool,
+    closing: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     owner: Option<JoinHandle<()>>,
 }
 
 impl EngineExecutor {
     pub(crate) fn spawn(mut session: Box<dyn EngineSession>) -> Arc<Self> {
-        let capabilities = session.capabilities();
-        let connection_string = session.connection_string();
         let cancel = session.cancel_handle();
         let active_work = Arc::new(AtomicBool::new(false));
         let owner_active_work = Arc::clone(&active_work);
         let session_pinned = Arc::new(AtomicBool::new(false));
         let owner_session_pinned = Arc::clone(&session_pinned);
+        let closing = Arc::new(AtomicBool::new(false));
+        let owner_closing = Arc::clone(&closing);
         let closed = Arc::new(AtomicBool::new(false));
         let owner_closed = Arc::clone(&closed);
         let (sender, receiver) = unbounded::<Command>();
@@ -48,23 +45,22 @@ impl EngineExecutor {
                         command.reply_engine_stopped();
                         continue;
                     }
+                    // A close request is a queue barrier, not merely another
+                    // FIFO item. Work already waiting behind the active owner
+                    // operation must not extend the database lifetime after
+                    // close begins. Internal pin cleanup is still admitted so
+                    // a failed close leaves the retained session recoverable.
+                    if owner_closing.load(Ordering::SeqCst) && command.reject_when_closing() {
+                        command.reply_engine_stopped();
+                        continue;
+                    }
                     match command {
                         Command::Exec { request, reply } => {
                             let result = if active_pin.is_some() {
-                                Err(Error::SessionPinned)
+                                Err(Error::TransactionActive)
                             } else {
                                 run_active_work(&owner_active_work, || {
                                     session.exec_protocol_raw(request)
-                                })
-                            };
-                            reply.send(result);
-                        }
-                        Command::SimpleQuery { sql, reply } => {
-                            let result = if active_pin.is_some() {
-                                Err(Error::SessionPinned)
-                            } else {
-                                run_active_work(&owner_active_work, || {
-                                    session.exec_simple_query(&sql)
                                 })
                             };
                             reply.send(result);
@@ -79,7 +75,21 @@ impl EngineExecutor {
                                     session.exec_protocol_raw(request)
                                 })
                             } else {
-                                Err(Error::InvalidSessionPin)
+                                Err(inactive_transaction_error())
+                            };
+                            reply.send(result);
+                        }
+                        Command::Stream {
+                            request,
+                            mut on_chunk,
+                            reply,
+                        } => {
+                            let result = if active_pin.is_some() {
+                                Err(Error::TransactionActive)
+                            } else {
+                                run_active_work(&owner_active_work, || {
+                                    session.exec_protocol_stream(request, &mut on_chunk)
+                                })
                             };
                             reply.send(result);
                         }
@@ -94,27 +104,13 @@ impl EngineExecutor {
                                     session.exec_protocol_stream(request, &mut on_chunk)
                                 })
                             } else {
-                                Err(Error::InvalidSessionPin)
-                            };
-                            reply.send(result);
-                        }
-                        Command::Stream {
-                            request,
-                            mut on_chunk,
-                            reply,
-                        } => {
-                            let result = if active_pin.is_some() {
-                                Err(Error::SessionPinned)
-                            } else {
-                                run_active_work(&owner_active_work, || {
-                                    session.exec_protocol_stream(request, &mut on_chunk)
-                                })
+                                Err(inactive_transaction_error())
                             };
                             reply.send(result);
                         }
                         Command::Pin { reply } => {
                             if active_pin.is_some() {
-                                reply.send(Err(Error::SessionPinned));
+                                reply.send(Err(Error::TransactionActive));
                             } else {
                                 let token = next_pin;
                                 next_pin = next_pin.saturating_add(1);
@@ -129,7 +125,7 @@ impl EngineExecutor {
                                 owner_session_pinned.store(false, Ordering::SeqCst);
                                 Ok(())
                             } else {
-                                Err(Error::InvalidSessionPin)
+                                Err(inactive_transaction_error())
                             };
                             if let Some(reply) = reply {
                                 reply.send(result);
@@ -145,30 +141,50 @@ impl EngineExecutor {
                                 owner_session_pinned.store(false, Ordering::SeqCst);
                             }
                         }
-                        Command::Checkpoint { reply } => {
+                        Command::Backup { reply } => {
                             let result = if active_pin.is_some() {
-                                Err(Error::SessionPinned)
+                                Err(Error::TransactionActive)
                             } else {
-                                run_active_work(&owner_active_work, || session.checkpoint())
-                            };
-                            reply.send(result);
-                        }
-                        Command::Backup { request, reply } => {
-                            let result = if active_pin.is_some() {
-                                Err(Error::SessionPinned)
-                            } else {
-                                run_active_work(&owner_active_work, || session.backup(request))
+                                run_active_work(&owner_active_work, || session.backup())
                             };
                             reply.send(result);
                         }
                         Command::Close { reply } => {
+                            if active_pin.is_some() {
+                                owner_closing.store(false, Ordering::SeqCst);
+                                if let Some(reply) = reply {
+                                    reply.send(Err(Error::TransactionActive));
+                                }
+                                continue;
+                            }
+                            let terminal_drop = reply.is_none();
                             let result = session.close();
-                            drop(session);
-                            owner_session_pinned.store(false, Ordering::SeqCst);
+                            if result.is_ok() {
+                                owner_closed.store(true, Ordering::SeqCst);
+                                owner_session_pinned.store(false, Ordering::SeqCst);
+                                owner_closing.store(false, Ordering::SeqCst);
+                                // Successful close includes releasing every
+                                // session-owned root lock. Do that before
+                                // waking a caller that may immediately reopen.
+                                drop(session);
+                                if let Some(reply) = reply {
+                                    reply.send(result);
+                                }
+                                return;
+                            }
+                            owner_closing.store(false, Ordering::SeqCst);
                             if let Some(reply) = reply {
                                 reply.send(result);
                             }
-                            return;
+                            if terminal_drop {
+                                // The public executor no longer exists, but the
+                                // native session still owns process-resident
+                                // code, locks, and possibly temporary storage.
+                                // Preserve that ownership through process exit
+                                // instead of dropping it after a failed detach.
+                                std::mem::forget(session);
+                                return;
+                            }
                         }
                     }
                 }
@@ -177,28 +193,28 @@ impl EngineExecutor {
 
         Arc::new(Self {
             sender,
-            capabilities,
-            connection_string,
+            admission: Mutex::new(()),
             cancel,
             active_work,
             session_pinned,
+            transaction_poisoned: AtomicBool::new(false),
+            closing,
             closed,
             owner: Some(owner),
         })
     }
 
-    pub(crate) fn capabilities(&self) -> EngineCapabilities {
-        self.capabilities.clone()
-    }
-
-    pub(crate) fn connection_string(&self) -> Option<String> {
-        self.connection_string.clone()
-    }
-
     pub(crate) fn cancel(&self) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        let _admission = self.admission.lock().map_err(|_| {
+            Error::Engine("database command admission lock was poisoned".to_owned())
+        })?;
+        if self.closed.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
             return Err(Error::EngineStopped);
         }
+        self.cancel_unchecked()
+    }
+
+    fn cancel_unchecked(&self) -> Result<()> {
         let cancel = self.cancel.as_ref().ok_or_else(|| {
             Error::Engine("query cancellation is not supported by this engine".to_owned())
         })?;
@@ -211,12 +227,6 @@ impl EngineExecutor {
     ) -> Result<ProtocolResponse> {
         let (reply, receiver) = reply::channel();
         self.send(Command::Exec { request, reply })?;
-        receiver.await
-    }
-
-    pub(crate) async fn exec_simple_query(&self, sql: String) -> Result<ProtocolResponse> {
-        let (reply, receiver) = reply::channel();
-        self.send(Command::SimpleQuery { sql, reply })?;
         receiver.await
     }
 
@@ -278,7 +288,7 @@ impl EngineExecutor {
 
     pub(crate) async fn release_pin(&self, token: u64) -> Result<()> {
         let (reply, receiver) = reply::channel();
-        self.send(Command::ReleasePin {
+        self.send_cleanup(Command::ReleasePin {
             token,
             reply: Some(reply),
         })?;
@@ -286,94 +296,79 @@ impl EngineExecutor {
     }
 
     pub(crate) fn release_pin_best_effort(&self, token: u64) {
-        let _ = self.sender.send(Command::ReleasePin { token, reply: None });
+        let _ = self.send_cleanup(Command::ReleasePin { token, reply: None });
     }
 
     pub(crate) fn rollback_and_release_pin_best_effort(&self, token: u64) {
-        let _ = self.sender.send(Command::RollbackAndReleasePin { token });
+        let _ = self.send_cleanup(Command::RollbackAndReleasePin { token });
     }
 
-    pub(crate) async fn checkpoint(&self) -> Result<()> {
+    pub(crate) fn poison_transaction_state(&self) {
+        self.transaction_poisoned.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn backup(&self) -> Result<Vec<u8>> {
         let (reply, receiver) = reply::channel();
-        self.send(Command::Checkpoint { reply })?;
-        receiver.await
-    }
-
-    pub(crate) async fn prepare_for_background(
-        &self,
-        options: BackgroundPreparationOptions,
-    ) -> Result<BackgroundPreparationResult> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(Error::EngineStopped);
-        }
-
-        let had_active_work = self.active_work.load(Ordering::SeqCst);
-        let cancelled_active_work = if options.cancel_active_work && had_active_work {
-            self.cancel_active_work()?;
-            true
-        } else {
-            false
-        };
-
-        if !options.checkpoint_when_idle {
-            return Ok(BackgroundPreparationResult::skipped(
-                cancelled_active_work,
-                None,
-            ));
-        }
-        if self.session_pinned.load(Ordering::SeqCst) {
-            return Ok(BackgroundPreparationResult::skipped(
-                cancelled_active_work,
-                Some(BackgroundCheckpointSkipReason::SessionPinned),
-            ));
-        }
-        if had_active_work || self.active_work.load(Ordering::SeqCst) {
-            return Ok(BackgroundPreparationResult::skipped(
-                cancelled_active_work,
-                Some(BackgroundCheckpointSkipReason::ActiveWork),
-            ));
-        }
-
-        match self.checkpoint().await {
-            Ok(()) => Ok(BackgroundPreparationResult::checkpointed()),
-            Err(Error::SessionPinned) => Ok(BackgroundPreparationResult::skipped(
-                cancelled_active_work,
-                Some(BackgroundCheckpointSkipReason::SessionPinned),
-            )),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) async fn resume_from_background(&self) -> Result<()> {
-        self.exec_simple_query("SELECT 1".to_owned())
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) async fn backup(&self, request: BackupRequest) -> Result<BackupArtifact> {
-        if !self.capabilities.supports_backup_format(request.format) {
-            return Err(Error::Engine(format!(
-                "{:?} backup is not supported by {}",
-                request.format, self.capabilities.mode
-            )));
-        }
-        let (reply, receiver) = reply::channel();
-        self.send(Command::Backup { request, reply })?;
+        self.send(Command::Backup { reply })?;
         receiver.await
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let (reply, receiver) = reply::channel();
-        self.sender
-            .send(Command::Close { reply: Some(reply) })
-            .map_err(|_| Error::EngineStopped)?;
-        receiver.await
+        {
+            // The admission lock makes the state transition and close enqueue
+            // indivisible with respect to every public command submission.
+            // Commands either enter the queue before Close or observe closing.
+            let _admission = self.admission.lock().map_err(|_| {
+                Error::Engine("database command admission lock was poisoned".to_owned())
+            })?;
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if self.session_pinned.load(Ordering::SeqCst) {
+                return Err(Error::TransactionActive);
+            }
+            self.closing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| Error::Engine("database close is already in progress".to_owned()))?;
+            if self
+                .sender
+                .send(Command::Close { reply: Some(reply) })
+                .is_err()
+            {
+                self.closing.store(false, Ordering::SeqCst);
+                return Err(Error::EngineStopped);
+            }
+        }
+        let result = receiver.await;
+        if result.is_ok() {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        result
     }
 
     fn send(&self, command: Command) -> Result<()> {
+        let _admission = self.admission.lock().map_err(|_| {
+            Error::Engine("database command admission lock was poisoned".to_owned())
+        })?;
+        if self.closed.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
+            return Err(Error::EngineStopped);
+        }
+        if self.transaction_poisoned.load(Ordering::SeqCst) {
+            return Err(Error::Engine(
+                "transaction state is unknown; close the database".to_owned(),
+            ));
+        }
+        self.sender.send(command).map_err(|_| Error::EngineStopped)
+    }
+
+    /// Admit pin cleanup even after transaction state is poisoned. Cleanup is
+    /// the only safe operation before close and must not strand the owner on an
+    /// active pin.
+    fn send_cleanup(&self, command: Command) -> Result<()> {
+        let _admission = self.admission.lock().map_err(|_| {
+            Error::Engine("database command admission lock was poisoned".to_owned())
+        })?;
         if self.closed.load(Ordering::SeqCst) {
             return Err(Error::EngineStopped);
         }
@@ -384,20 +379,14 @@ impl EngineExecutor {
         if !self.active_work.load(Ordering::SeqCst) {
             return;
         }
-        let _ = self.cancel_active_work();
-    }
-
-    fn cancel_active_work(&self) -> Result<()> {
-        let cancel = self.cancel.as_ref().ok_or_else(|| {
-            Error::Engine("query cancellation is not supported by this engine".to_owned())
-        })?;
-        cancel.cancel()
+        let _ = self.cancel_unchecked();
     }
 }
 
 impl Drop for EngineExecutor {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            self.closing.store(true, Ordering::SeqCst);
             self.cancel_active_work_best_effort();
             let _ = self.sender.send(Command::Close { reply: None });
         }
@@ -412,24 +401,20 @@ enum Command {
         request: ProtocolRequest,
         reply: reply::Sender<Result<ProtocolResponse>>,
     },
-    SimpleQuery {
-        sql: String,
-        reply: reply::Sender<Result<ProtocolResponse>>,
-    },
     PinnedExec {
         token: u64,
         request: ProtocolRequest,
         reply: reply::Sender<Result<ProtocolResponse>>,
     },
+    Stream {
+        request: ProtocolRequest,
+        on_chunk: ProtocolChunkCallback,
+        reply: reply::Sender<Result<()>>,
+    },
     PinnedStream {
         token: u64,
         request: ProtocolRequest,
-        on_chunk: StreamSink,
-        reply: reply::Sender<Result<()>>,
-    },
-    Stream {
-        request: ProtocolRequest,
-        on_chunk: StreamSink,
+        on_chunk: ProtocolChunkCallback,
         reply: reply::Sender<Result<()>>,
     },
     Pin {
@@ -442,12 +427,8 @@ enum Command {
     RollbackAndReleasePin {
         token: u64,
     },
-    Checkpoint {
-        reply: reply::Sender<Result<()>>,
-    },
     Backup {
-        request: BackupRequest,
-        reply: reply::Sender<Result<BackupArtifact>>,
+        reply: reply::Sender<Result<Vec<u8>>>,
     },
     Close {
         reply: Option<reply::Sender<Result<()>>>,
@@ -459,17 +440,27 @@ impl Command {
         matches!(self, Self::Close { .. })
     }
 
+    fn reject_when_closing(&self) -> bool {
+        matches!(
+            self,
+            Self::Exec { .. }
+                | Self::PinnedExec { .. }
+                | Self::Stream { .. }
+                | Self::PinnedStream { .. }
+                | Self::Pin { .. }
+                | Self::Backup { .. }
+        )
+    }
+
     fn reply_engine_stopped(self) {
         match self {
-            Self::Exec { reply, .. }
-            | Self::SimpleQuery { reply, .. }
-            | Self::PinnedExec { reply, .. } => {
+            Self::Exec { reply, .. } | Self::PinnedExec { reply, .. } => {
                 reply.send(Err(Error::EngineStopped));
             }
-            Self::PinnedStream { reply, .. } => reply.send(Err(Error::EngineStopped)),
-            Self::Stream { reply, .. } => reply.send(Err(Error::EngineStopped)),
+            Self::Stream { reply, .. } | Self::PinnedStream { reply, .. } => {
+                reply.send(Err(Error::EngineStopped));
+            }
             Self::Pin { reply } => reply.send(Err(Error::EngineStopped)),
-            Self::Checkpoint { reply } => reply.send(Err(Error::EngineStopped)),
             Self::Backup { reply, .. } => reply.send(Err(Error::EngineStopped)),
             Self::RollbackAndReleasePin { .. } => {}
             Self::ReleasePin { reply, .. } | Self::Close { reply } => {
@@ -486,6 +477,10 @@ fn run_active_work<T>(active_work: &AtomicBool, work: impl FnOnce() -> T) -> T {
     work()
 }
 
+fn inactive_transaction_error() -> Error {
+    Error::Engine("transaction is no longer active".to_owned())
+}
+
 struct ActiveWorkGuard<'a> {
     active_work: &'a AtomicBool,
 }
@@ -500,5 +495,249 @@ impl<'a> ActiveWorkGuard<'a> {
 impl Drop for ActiveWorkGuard<'_> {
     fn drop(&mut self) {
         self.active_work.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crossbeam_channel::{Receiver, Sender};
+
+    struct FailOnceCloseSession {
+        close_attempts: Arc<AtomicUsize>,
+    }
+
+    impl EngineSession for FailOnceCloseSession {
+        fn exec_protocol_raw(&mut self, request: ProtocolRequest) -> Result<ProtocolResponse> {
+            Ok(ProtocolResponse::new(request.as_bytes()))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            if self.close_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::Engine("injected detach failure".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct DropObservedSession {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl EngineSession for DropObservedSession {
+        fn exec_protocol_raw(&mut self, request: ProtocolRequest) -> Result<ProtocolResponse> {
+            Ok(ProtocolResponse::new(request.as_bytes()))
+        }
+    }
+
+    impl Drop for DropObservedSession {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn successful_close_releases_the_session_before_it_resolves() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let executor = EngineExecutor::spawn(Box::new(DropObservedSession {
+            dropped: Arc::clone(&dropped),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread test runtime");
+
+        runtime.block_on(executor.close()).expect("close session");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "close must not resolve while the session still owns its root lock"
+        );
+    }
+
+    #[test]
+    fn failed_close_keeps_the_session_usable_and_retryable() {
+        let close_attempts = Arc::new(AtomicUsize::new(0));
+        let executor = EngineExecutor::spawn(Box::new(FailOnceCloseSession {
+            close_attempts: Arc::clone(&close_attempts),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread test runtime");
+
+        let first_error = runtime.block_on(executor.close()).unwrap_err();
+        assert_eq!(
+            first_error,
+            Error::Engine("injected detach failure".to_owned())
+        );
+        let response = runtime
+            .block_on(executor.exec_protocol_raw(ProtocolRequest::new([1, 2, 3])))
+            .expect("session remains usable after failed close");
+        assert_eq!(response.as_bytes(), &[1, 2, 3]);
+
+        runtime
+            .block_on(executor.close())
+            .expect("second close retries the same session");
+        runtime
+            .block_on(executor.close())
+            .expect("close is idempotent after success");
+        assert_eq!(close_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    struct FailThenBlockCloseSession {
+        close_attempts: Arc<AtomicUsize>,
+        second_started: Sender<()>,
+        release_second: Receiver<()>,
+    }
+
+    impl EngineSession for FailThenBlockCloseSession {
+        fn exec_protocol_raw(&mut self, request: ProtocolRequest) -> Result<ProtocolResponse> {
+            Ok(ProtocolResponse::new(request.as_bytes()))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            if self.close_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Error::Engine("injected first detach failure".to_owned()));
+            }
+            self.second_started
+                .send(())
+                .expect("announce second close attempt");
+            self.release_second
+                .recv()
+                .expect("release second close attempt");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retrying_close_retains_its_admission_barrier_until_the_owner_finishes() {
+        let close_attempts = Arc::new(AtomicUsize::new(0));
+        let (second_started, second_started_rx) = unbounded();
+        let (release_second, release_second_rx) = unbounded();
+        let executor = EngineExecutor::spawn(Box::new(FailThenBlockCloseSession {
+            close_attempts: Arc::clone(&close_attempts),
+            second_started,
+            release_second: release_second_rx,
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread test runtime");
+
+        assert_eq!(
+            runtime.block_on(executor.close()).unwrap_err(),
+            Error::Engine("injected first detach failure".to_owned())
+        );
+
+        let retry_executor = Arc::clone(&executor);
+        let retry = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build retry runtime");
+            runtime.block_on(retry_executor.close())
+        });
+        second_started_rx
+            .recv()
+            .expect("second close reaches the retained session");
+
+        assert_eq!(
+            runtime
+                .block_on(executor.exec_protocol_raw(ProtocolRequest::new([9])))
+                .unwrap_err(),
+            Error::EngineStopped
+        );
+        release_second.send(()).expect("finish second close");
+        retry
+            .join()
+            .expect("join retry close")
+            .expect("retry closes");
+        assert_eq!(close_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    struct DrainBeforeCloseSession {
+        work_started: Sender<()>,
+        release_work: Receiver<()>,
+        close_started: Sender<()>,
+    }
+
+    impl EngineSession for DrainBeforeCloseSession {
+        fn exec_protocol_raw(&mut self, request: ProtocolRequest) -> Result<ProtocolResponse> {
+            self.work_started.send(()).expect("announce active work");
+            self.release_work.recv().expect("release active work");
+            Ok(ProtocolResponse::new(request.as_bytes()))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.close_started.send(()).expect("announce close");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn close_drains_active_work_and_rejects_new_admission() {
+        let (work_started, work_started_rx) = unbounded();
+        let (release_work, release_work_rx) = unbounded();
+        let (close_started, close_started_rx) = unbounded();
+        let executor = EngineExecutor::spawn(Box::new(DrainBeforeCloseSession {
+            work_started,
+            release_work: release_work_rx,
+            close_started,
+        }));
+
+        let work_executor = Arc::clone(&executor);
+        let work = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build active-work runtime");
+            runtime.block_on(work_executor.exec_protocol_raw(ProtocolRequest::new([6])))
+        });
+        work_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("work reaches the owner");
+
+        let close_executor = Arc::clone(&executor);
+        let close = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build close runtime");
+            runtime.block_on(close_executor.close())
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !executor.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let barrier_established = executor.closing.load(Ordering::SeqCst);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build admission test runtime");
+        let admission = barrier_established.then(|| {
+            runtime
+                .block_on(executor.exec_protocol_raw(ProtocolRequest::new([7])))
+                .expect_err("new work is rejected while close drains")
+        });
+        let close_waited_for_work = close_started_rx.try_recv().is_err();
+
+        release_work.send(()).expect("finish active work");
+        assert_eq!(
+            work.join()
+                .expect("join active work")
+                .expect("active work completes")
+                .as_bytes(),
+            &[6]
+        );
+        close_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("session closes after active work");
+        close.join().expect("join close").expect("close completes");
+        assert!(
+            barrier_established,
+            "close establishes its admission barrier"
+        );
+        assert_eq!(admission, Some(Error::EngineStopped));
+        assert!(
+            close_waited_for_work,
+            "session close must wait for active work"
+        );
     }
 }

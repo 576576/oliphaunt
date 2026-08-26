@@ -264,20 +264,22 @@ fn select_artifacts(
             )?);
             selected.push(require_artifact(
                 artifacts,
-                "oliphaunt-tools",
-                Some(&metadata.runtime_version),
-                ArtifactKind::NativeTools,
-                target,
-                "selected native tools",
-            )?);
-            selected.push(require_artifact(
-                artifacts,
                 "oliphaunt-broker",
                 None,
                 ArtifactKind::BrokerHelper,
                 target,
                 "selected native broker helper",
             )?);
+            if app.depends_on("oliphaunt-tools") {
+                selected.push(require_artifact(
+                    artifacts,
+                    "oliphaunt-tools",
+                    Some(&metadata.runtime_version),
+                    ArtifactKind::NativeTools,
+                    target,
+                    "selected native PostgreSQL tools",
+                )?);
+            }
         }
         "liboliphaunt-wasix" => {
             selected.push(require_artifact(
@@ -673,6 +675,23 @@ fn dependencies_enable_feature(
         .any(|(name, spec)| dependency_enables_feature(name, spec, package, feature))
 }
 
+fn dependencies_contain_package(
+    dependencies: &BTreeMap<String, toml::Value>,
+    package: &str,
+) -> bool {
+    dependencies.iter().any(|(name, spec)| match spec {
+        toml::Value::String(_) => name == package,
+        toml::Value::Table(table) => {
+            table
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(name)
+                == package
+        }
+        _ => false,
+    })
+}
+
 fn dependency_enables_feature(
     name: &str,
     spec: &toml::Value,
@@ -707,6 +726,14 @@ struct ApplicationManifest {
 }
 
 impl ApplicationManifest {
+    fn depends_on(&self, package: &str) -> bool {
+        dependencies_contain_package(&self.dependencies, package)
+            || self
+                .target
+                .values()
+                .any(|target| dependencies_contain_package(&target.dependencies, package))
+    }
+
     fn oliphaunt_wasix_tools_enabled(&self) -> bool {
         self.package.metadata.oliphaunt.tools
             || dependencies_enable_feature(&self.dependencies, "oliphaunt-wasix", "tools")
@@ -1028,12 +1055,26 @@ impl ArtifactManifest {
                     &relatives,
                     &native_tool_paths(&self.target, &["postgres", "initdb", "pg_ctl"]),
                 )?;
-                self.reject_files(&relatives, &native_tool_path_variants(&["pg_dump", "psql"]))?;
+                self.require_files(
+                    &relatives,
+                    &[
+                        "cluster-seed/manifest.properties",
+                        "cluster-seed/files/PG_VERSION",
+                        "cluster-seed/files/global/pg_control",
+                        "cluster-seed-icu/manifest.properties",
+                        "cluster-seed-icu/files/PG_VERSION",
+                        "cluster-seed-icu/files/global/pg_control",
+                    ],
+                )?;
+                self.reject_files(
+                    &relatives,
+                    &native_tool_path_variants(&["pg_basebackup", "pg_dump", "psql"]),
+                )?;
             }
             ArtifactKind::NativeTools => {
                 self.require_files(
                     &relatives,
-                    &native_tool_paths(&self.target, &["pg_dump", "psql"]),
+                    &native_tool_paths(&self.target, &["pg_basebackup", "pg_dump", "psql"]),
                 )?;
                 self.reject_files(
                     &relatives,
@@ -1043,7 +1084,14 @@ impl ArtifactManifest {
             ArtifactKind::WasixRuntime => {
                 self.require_files(
                     &relatives,
-                    &["oliphaunt.wasix.tar.zst", "bin/initdb.wasix.wasm"],
+                    &[
+                        "oliphaunt.wasix.tar.zst",
+                        "bin/initdb.wasix.wasm",
+                        "cluster-seeds/standard.tar.zst",
+                        "cluster-seeds/standard.json",
+                        "cluster-seeds/icu.tar.zst",
+                        "cluster-seeds/icu.json",
+                    ],
                 )?;
                 self.reject_files(
                     &relatives,
@@ -1440,16 +1488,6 @@ icu = true
             None,
             "runtime/bin/postgres",
         );
-        let tools_manifest = write_artifact_manifest(
-            &temp,
-            "tools.toml",
-            "oliphaunt-tools",
-            "1.2.0",
-            "native-tools",
-            "x86_64-unknown-linux-gnu",
-            None,
-            "runtime/bin/pg_dump",
-        );
         let broker_manifest = write_artifact_manifest(
             &temp,
             "broker.toml",
@@ -1486,7 +1524,6 @@ icu = true
             target: "x86_64-unknown-linux-gnu".to_owned(),
             artifact_manifest_paths: vec![
                 runtime_manifest,
-                tools_manifest,
                 broker_manifest,
                 icu_manifest,
                 extension_manifest,
@@ -1500,7 +1537,7 @@ icu = true
         let lock = fs::read_to_string(output.lock_file).unwrap();
         assert!(lock.contains("product = \"liboliphaunt-native\""));
         assert!(lock.contains("version = \"1.2.0\""));
-        assert!(lock.contains("product = \"oliphaunt-tools\""));
+        assert!(!lock.contains("product = \"oliphaunt-tools\""));
         assert!(lock.contains("product = \"oliphaunt-broker\""));
         assert!(lock.contains("version = \"2.0.0\""));
         assert!(lock.contains("product = \"oliphaunt-icu\""));
@@ -1528,16 +1565,6 @@ runtime-version = "0.1.0"
             None,
             "runtime/bin/postgres",
         );
-        let tools_manifest = write_artifact_manifest(
-            &temp,
-            "tools.toml",
-            "oliphaunt-tools",
-            "0.1.0",
-            "native-tools",
-            "x86_64-unknown-linux-gnu",
-            None,
-            "runtime/bin/pg_dump",
-        );
         let broker_manifest = write_artifact_manifest(
             &temp,
             "broker.toml",
@@ -1562,12 +1589,7 @@ runtime-version = "0.1.0"
             manifest_dir: temp.path().to_path_buf(),
             out_dir: temp.path().join("out"),
             target: "x86_64-unknown-linux-gnu".to_owned(),
-            artifact_manifest_paths: vec![
-                runtime_manifest,
-                tools_manifest,
-                broker_manifest,
-                extension_manifest,
-            ],
+            artifact_manifest_paths: vec![runtime_manifest, broker_manifest, extension_manifest],
         };
         let error = context
             .configure()
@@ -1647,12 +1669,7 @@ extensions = ["vector"]
                 .join("native-runtime/liboliphaunt-native/runtime/bin/postgres")
                 .is_file()
         );
-        assert!(
-            output
-                .resources_dir
-                .join("native-tools/oliphaunt-tools/runtime/bin/pg_dump")
-                .is_file()
-        );
+        assert!(!output.resources_dir.join("native-tools").exists());
         assert!(
             output
                 .resources_dir
@@ -1672,6 +1689,66 @@ extensions = ["vector"]
         assert!(lock.contains("extension = \"vector\""));
         let generated = fs::read_to_string(output.generated_rust).unwrap();
         assert!(generated.contains("OLIPHAUNT_RESOURCES_DIR"));
+    }
+
+    #[test]
+    fn native_tools_are_staged_only_for_an_explicit_dependency() {
+        let temp = app_with_metadata(
+            r#"
+[package.metadata.oliphaunt]
+runtime = "liboliphaunt-native"
+runtime-version = "0.1.0"
+
+[dependencies]
+oliphaunt-tools = "0.1.0"
+"#,
+        );
+        let runtime_manifest = write_artifact_manifest(
+            &temp,
+            "runtime.toml",
+            "liboliphaunt-native",
+            "0.1.0",
+            "native-runtime",
+            "x86_64-unknown-linux-gnu",
+            None,
+            "runtime/bin/postgres",
+        );
+        let broker_manifest = write_artifact_manifest(
+            &temp,
+            "broker.toml",
+            "oliphaunt-broker",
+            "0.1.0",
+            "broker-helper",
+            "x86_64-unknown-linux-gnu",
+            None,
+            "bin/oliphaunt-broker",
+        );
+        let tools_manifest = write_artifact_manifest(
+            &temp,
+            "tools.toml",
+            "oliphaunt-tools",
+            "0.1.0",
+            "native-tools",
+            "x86_64-unknown-linux-gnu",
+            None,
+            "runtime/bin/pg_dump",
+        );
+        let context = BuildContext {
+            manifest_dir: temp.path().to_path_buf(),
+            out_dir: temp.path().join("out"),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            artifact_manifest_paths: vec![runtime_manifest, broker_manifest, tools_manifest],
+        };
+
+        let output = context.configure().expect("native tools should stage");
+        assert!(
+            output
+                .resources_dir
+                .join("native-tools/oliphaunt-tools/runtime/bin/pg_dump")
+                .is_file()
+        );
+        let lock = fs::read_to_string(output.lock_file).unwrap();
+        assert!(lock.contains("product = \"oliphaunt-tools\""));
     }
 
     #[test]
@@ -2209,35 +2286,51 @@ runtime-version = "0.1.0"
 
     #[test]
     fn artifact_manifest_rejects_incomplete_native_tools_payload() {
-        let temp = app_with_metadata("");
-        let tools_manifest = write_artifact_manifest_with_relatives(
-            &temp,
-            "tools.toml",
-            "oliphaunt-tools",
-            "0.1.0",
-            "native-tools",
-            "x86_64-unknown-linux-gnu",
-            None,
-            &["runtime/bin/pg_dump"],
-        );
-        let context = BuildContext {
-            manifest_dir: temp.path().to_path_buf(),
-            out_dir: temp.path().join("out"),
-            target: "x86_64-unknown-linux-gnu".to_owned(),
-            artifact_manifest_paths: vec![tools_manifest],
-        };
+        let required = [
+            "runtime/bin/pg_basebackup",
+            "runtime/bin/pg_dump",
+            "runtime/bin/psql",
+        ];
+        for missing in required {
+            let temp = app_with_metadata("");
+            let present = required
+                .iter()
+                .copied()
+                .filter(|relative| *relative != missing)
+                .collect::<Vec<_>>();
+            let tools_manifest = write_artifact_manifest_with_relatives(
+                &temp,
+                "tools.toml",
+                "oliphaunt-tools",
+                "0.1.0",
+                "native-tools",
+                "x86_64-unknown-linux-gnu",
+                None,
+                &present,
+            );
+            let context = BuildContext {
+                manifest_dir: temp.path().to_path_buf(),
+                out_dir: temp.path().join("out"),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                artifact_manifest_paths: vec![tools_manifest],
+            };
 
-        let error = context
-            .read_artifact_manifests()
-            .expect_err("native tools without psql must fail validation");
+            let error = context
+                .read_artifact_manifests()
+                .expect_err("incomplete native tools must fail validation");
 
-        assert!(error.to_string().contains("missing required payload"));
-        assert!(error.to_string().contains("runtime/bin/psql"));
+            assert!(error.to_string().contains("missing required payload"));
+            assert!(error.to_string().contains(missing));
+        }
     }
 
     #[test]
     fn artifact_manifest_rejects_native_runtime_client_tool_payloads() {
-        for tool in ["runtime/bin/pg_dump", "runtime/bin/psql"] {
+        for tool in [
+            "runtime/bin/pg_basebackup",
+            "runtime/bin/pg_dump",
+            "runtime/bin/psql",
+        ] {
             let temp = app_with_metadata("");
             let runtime_manifest = write_artifact_manifest_with_relatives(
                 &temp,
@@ -2252,6 +2345,12 @@ runtime-version = "0.1.0"
                     "runtime/bin/initdb",
                     "runtime/bin/pg_ctl",
                     tool,
+                    "cluster-seed/manifest.properties",
+                    "cluster-seed/files/PG_VERSION",
+                    "cluster-seed/files/global/pg_control",
+                    "cluster-seed-icu/manifest.properties",
+                    "cluster-seed-icu/files/PG_VERSION",
+                    "cluster-seed-icu/files/global/pg_control",
                 ],
             );
             let context = BuildContext {
@@ -2285,6 +2384,12 @@ runtime-version = "0.1.0"
                 "runtime/bin/postgres.exe",
                 "runtime/bin/initdb.exe",
                 "runtime/bin/pg_ctl.exe",
+                "cluster-seed/manifest.properties",
+                "cluster-seed/files/PG_VERSION",
+                "cluster-seed/files/global/pg_control",
+                "cluster-seed-icu/manifest.properties",
+                "cluster-seed-icu/files/PG_VERSION",
+                "cluster-seed-icu/files/global/pg_control",
             ],
         );
         let tools_manifest = write_artifact_manifest_with_relatives(
@@ -2295,7 +2400,11 @@ runtime-version = "0.1.0"
             "native-tools",
             "x86_64-pc-windows-msvc",
             None,
-            &["runtime/bin/pg_dump.exe", "runtime/bin/psql.exe"],
+            &[
+                "runtime/bin/pg_basebackup.exe",
+                "runtime/bin/pg_dump.exe",
+                "runtime/bin/psql.exe",
+            ],
         );
         let context = BuildContext {
             manifest_dir: temp.path().to_path_buf(),
@@ -2326,6 +2435,12 @@ runtime-version = "0.1.0"
                 "runtime/bin/postgres.exe",
                 "runtime/bin/initdb.exe",
                 "runtime/bin/pg_ctl.exe",
+                "cluster-seed/manifest.properties",
+                "cluster-seed/files/PG_VERSION",
+                "cluster-seed/files/global/pg_control",
+                "cluster-seed-icu/manifest.properties",
+                "cluster-seed-icu/files/PG_VERSION",
+                "cluster-seed-icu/files/global/pg_control",
             ],
         );
         let context = BuildContext {
@@ -2354,7 +2469,11 @@ runtime-version = "0.1.0"
             "native-tools",
             "x86_64-pc-windows-msvc",
             None,
-            &["runtime/bin/pg_dump", "runtime/bin/psql"],
+            &[
+                "runtime/bin/pg_basebackup",
+                "runtime/bin/pg_dump",
+                "runtime/bin/psql",
+            ],
         );
         let context = BuildContext {
             manifest_dir: temp.path().to_path_buf(),
@@ -2368,7 +2487,7 @@ runtime-version = "0.1.0"
             .expect_err("Windows native tools must use .exe tool names");
 
         assert!(error.to_string().contains("missing required payload"));
-        assert!(error.to_string().contains("runtime/bin/pg_dump.exe"));
+        assert!(error.to_string().contains("runtime/bin/pg_basebackup.exe"));
     }
 
     #[test]
@@ -2383,7 +2502,15 @@ runtime-version = "0.1.0"
                 "wasix-runtime",
                 "portable",
                 None,
-                &["oliphaunt.wasix.tar.zst", "bin/initdb.wasix.wasm", tool],
+                &[
+                    "oliphaunt.wasix.tar.zst",
+                    "bin/initdb.wasix.wasm",
+                    "cluster-seeds/standard.tar.zst",
+                    "cluster-seeds/standard.json",
+                    "cluster-seeds/icu.tar.zst",
+                    "cluster-seeds/icu.json",
+                    tool,
+                ],
             );
             let context = BuildContext {
                 manifest_dir: temp.path().to_path_buf(),
@@ -2597,16 +2724,25 @@ executable = false
                 "runtime/bin/postgres".to_owned(),
                 "runtime/bin/initdb".to_owned(),
                 "runtime/bin/pg_ctl".to_owned(),
+                "cluster-seed/manifest.properties".to_owned(),
+                "cluster-seed/files/PG_VERSION".to_owned(),
+                "cluster-seed/files/global/pg_control".to_owned(),
+                "cluster-seed-icu/manifest.properties".to_owned(),
+                "cluster-seed-icu/files/PG_VERSION".to_owned(),
+                "cluster-seed-icu/files/global/pg_control".to_owned(),
             ],
             "native-tools" => vec![
+                "runtime/bin/pg_basebackup".to_owned(),
                 "runtime/bin/pg_dump".to_owned(),
                 "runtime/bin/psql".to_owned(),
             ],
             "wasix-runtime" => vec![
                 "manifest.json".to_owned(),
                 "oliphaunt.wasix.tar.zst".to_owned(),
-                "prepopulated/pgdata-template.tar.zst".to_owned(),
-                "prepopulated/pgdata-template.json".to_owned(),
+                "cluster-seeds/standard.tar.zst".to_owned(),
+                "cluster-seeds/standard.json".to_owned(),
+                "cluster-seeds/icu.tar.zst".to_owned(),
+                "cluster-seeds/icu.json".to_owned(),
                 "bin/initdb.wasix.wasm".to_owned(),
             ],
             "wasix-tools" => vec![

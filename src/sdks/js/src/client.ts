@@ -1,211 +1,207 @@
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { normalizeOpenConfig, validateOptionalPathOverride, validateRootPath } from './config.js';
+import { normalizeOpenConfig, validateDirectoryPath } from './config.js';
 import { createDefaultNativeBinding } from './native/default.js';
 import type { NativeBinding, NativeBindingOptions } from './native/types.js';
 import { simpleQuery } from './protocol.js';
 import {
-  assertSuccessfulQueryResponse,
   extendedQuery,
+  parseCommandResponse,
   parseQueryResponse,
-  toUint8Array,
+  type CommandResult,
   type QueryParam,
   type QueryResult,
+  toUint8Array,
 } from './query.js';
+import { createBrokerRuntimeBinding } from './runtime/broker.js';
+import { directRuntimeBinding } from './runtime/direct.js';
+import { createServerRuntimeBinding } from './runtime/server.js';
+import type { RuntimeBinding, RuntimeHandle } from './runtime/types.js';
 import type {
-  BackupArtifact,
-  BackupFormat,
-  BackgroundPreparationOptions,
-  BackgroundPreparationResult,
   BinaryInput,
-  EngineCapabilities,
-  EngineMode,
-  EngineModeSupport,
-  JavaScriptRuntime,
+  DatabaseStorage,
   OliphauntClient,
+  OliphauntDatabase,
   OliphauntTransaction,
+  OliphauntServer,
   OpenConfig,
+  ServerOpenConfig,
   ProtocolChunkCallback,
   RestoreOptions,
-  SupportedModesOptions,
 } from './types.js';
-import {
-  brokerModeSupport,
-  createBrokerRuntimeBinding,
-  restorePhysicalArchiveWithBroker,
-} from './runtime/broker.js';
-import { directRuntimeBinding, nativeDirectCapabilities } from './runtime/direct.js';
-import { createServerRuntimeBinding, serverModeSupport } from './runtime/server.js';
-import type { RuntimeBinding, RuntimeHandle } from './runtime/types.js';
 
 export type NativeBindingFactory = (
   options?: NativeBindingOptions,
 ) => NativeBinding | Promise<NativeBinding>;
 
-export { nativeDirectCapabilities } from './runtime/direct.js';
+type RuntimeBindingOverrides = {
+  readonly broker?: RuntimeBinding;
+  readonly server?: RuntimeBinding;
+};
 
-export class OliphauntDatabase {
-  readonly #binding: RuntimeBinding;
-  readonly #handle: RuntimeHandle;
+class OliphauntDatabaseBase {
+  protected readonly binding: RuntimeBinding;
+  protected readonly handle: RuntimeHandle;
+  readonly #releaseOwnership?: () => void;
   #closed = false;
+  #closing = false;
+  #closeAttempt?: Promise<void>;
+  #operationTail = Promise.resolve();
+  #sessionOperationRunning = false;
   #activeTransaction = false;
-  #activeOperations = 0;
+  #transactionPoisoned = false;
 
-  constructor(
-    binding: RuntimeBinding,
-    handle: RuntimeHandle,
-    readonly root: string,
-  ) {
-    this.#binding = binding;
-    this.#handle = handle;
+  constructor(binding: RuntimeBinding, handle: RuntimeHandle, releaseOwnership?: () => void) {
+    this.binding = binding;
+    this.handle = handle;
+    this.#releaseOwnership = releaseOwnership;
   }
 
-  get handle(): RuntimeHandle {
-    return this.#handle;
-  }
-
-  async capabilities(): Promise<EngineCapabilities> {
-    this.#assertOpen();
-    return this.#binding.capabilities(this.#handle);
-  }
-
-  async connectionString(): Promise<string | undefined> {
-    return (await this.capabilities()).connectionString;
-  }
-
-  async supportsBackupFormat(format: BackupFormat): Promise<boolean> {
-    return supportsBackupFormat(await this.capabilities(), format);
-  }
-
-  async supportsRestoreFormat(format: BackupFormat): Promise<boolean> {
-    return supportsRestoreFormat(await this.capabilities(), format);
-  }
-
-  async execute(sql: string): Promise<Uint8Array> {
-    this.#assertOpen();
-    this.#assertNoActiveTransaction();
-    const response = await this.#executeSimpleUnlocked(sql);
-    assertSuccessfulQueryResponse(response);
-    return response;
+  async execute(sql: string, parameters: ReadonlyArray<QueryParam> = []): Promise<CommandResult> {
+    this.assertNoActiveTransaction();
+    return this.withSessionOperation(async () => {
+      const response = await this.#execProtocolRawUnlocked(extendedQuery(sql, parameters));
+      return parseCommandResponse(response);
+    });
   }
 
   async query(sql: string, parameters: ReadonlyArray<QueryParam> = []): Promise<QueryResult> {
-    if (parameters.length === 0) {
-      return parseQueryResponse(await this.execute(sql));
-    }
-    return parseQueryResponse(await this.execProtocolRaw(extendedQuery(sql, parameters)));
+    this.assertNoActiveTransaction();
+    return this.withSessionOperation(async () => {
+      return parseQueryResponse(
+        await this.#execProtocolRawUnlocked(extendedQuery(sql, parameters)),
+      );
+    });
   }
 
   async execProtocolRaw(input: BinaryInput): Promise<Uint8Array> {
-    this.#assertOpen();
-    this.#assertNoActiveTransaction();
-    return this.#execProtocolRawUnlocked(input);
+    this.assertNoActiveTransaction();
+    return this.withSessionOperation(() => {
+      return this.#execProtocolRawUnlocked(input);
+    });
   }
 
   async execProtocolStream(input: BinaryInput, onChunk: ProtocolChunkCallback): Promise<void> {
-    this.#assertOpen();
-    this.#assertNoActiveTransaction();
-    await this.#execProtocolStreamUnlocked(input, onChunk);
-  }
-
-  async backup(format: BackupFormat = 'physicalArchive'): Promise<BackupArtifact> {
-    this.#assertOpen();
-    this.#assertNoActiveTransaction();
-    const capabilities = await this.capabilities();
-    if (!supportsBackupFormat(capabilities, format)) {
-      throw new Error(`${format} backup is not supported by ${capabilities.engine}`);
-    }
-    return {
-      format,
-      bytes: await this.#runNativeOperation(() => this.#binding.backup(this.#handle, format)),
-    };
+    this.assertNoActiveTransaction();
+    await this.withSessionOperation(async () => {
+      await this.#execProtocolStreamUnlocked(input, onChunk);
+    });
   }
 
   async checkpoint(): Promise<void> {
-    await this.execute('CHECKPOINT');
-  }
-
-  async prepareForBackground(
-    options: BackgroundPreparationOptions = {},
-  ): Promise<BackgroundPreparationResult> {
-    this.#assertOpen();
-    const hadActiveWork = this.#activeOperations > 0;
-    const shouldCancel = options.cancelActiveWork !== false;
-    const shouldCheckpoint = options.checkpointWhenIdle !== false;
-    let cancelledActiveWork = false;
-
-    if (shouldCancel && hadActiveWork) {
-      await this.#binding.cancel(this.#handle);
-      cancelledActiveWork = true;
-    }
-    if (!shouldCheckpoint) {
-      return { cancelledActiveWork, checkpointed: false };
-    }
-    if (this.#activeTransaction) {
-      return {
-        cancelledActiveWork,
-        checkpointed: false,
-        skippedCheckpointReason: 'transactionActive',
-      };
-    }
-    if (hadActiveWork || this.#activeOperations > 0) {
-      return {
-        cancelledActiveWork,
-        checkpointed: false,
-        skippedCheckpointReason: 'activeWork',
-      };
-    }
-    await this.checkpoint();
-    return { cancelledActiveWork, checkpointed: true };
-  }
-
-  async resumeFromBackground(): Promise<void> {
-    await this.execute('SELECT 1');
+    this.assertNoActiveTransaction();
+    await this.withSessionOperation(async () => {
+      parseCommandResponse(await this.#executeSimpleUnlocked('CHECKPOINT'));
+    });
   }
 
   async cancel(): Promise<void> {
-    this.#assertOpen();
-    await this.#binding.cancel(this.#handle);
+    if (this.#closed) {
+      throw new Error('Oliphaunt database is closed');
+    }
+    if (this.#closing && !this.#sessionOperationRunning) {
+      throw new Error('Oliphaunt database is closing');
+    }
+    // Cancellation must remain independent of the physical-session queue so
+    // it can interrupt the operation currently holding that queue.
+    await this.#runNativeVoidOperation(() => this.binding.cancel(this.handle));
   }
 
   async transaction<T>(body: (transaction: OliphauntTransaction) => Promise<T> | T): Promise<T> {
-    this.#assertOpen();
-    if (this.#activeTransaction) {
-      throw new Error(transactionPinnedMessage);
-    }
-
-    this.#activeTransaction = true;
-    const transaction = new OliphauntTransactionHandle(
-      (input) => this.#execProtocolRawUnlocked(input),
-      (input, onChunk) => this.#execProtocolStreamUnlocked(input, onChunk),
-    );
-    try {
-      await transaction.execute('BEGIN');
-      const result = await body(transaction);
-      await transaction.execute('COMMIT');
-      transaction.deactivate();
-      return result;
-    } catch (error) {
+    this.assertNoActiveTransaction();
+    return this.withSessionOperation(async () => {
+      this.#activeTransaction = true;
+      const transaction = new OliphauntTransactionHandle(
+        (input) => this.#execProtocolRawUnlocked(input),
+        (input, onChunk) => this.#execProtocolStreamUnlocked(input, onChunk),
+      );
       try {
-        await transaction.execute('ROLLBACK');
-      } catch {
-        // Preserve the original transaction failure; rollback is best-effort cleanup.
+        try {
+          requireTransactionTag(await this.#executeTransactionControlUnlocked('BEGIN'), 'BEGIN');
+        } catch (error) {
+          try {
+            requireTransactionTag(
+              await this.#executeTransactionControlUnlocked('ROLLBACK'),
+              'ROLLBACK',
+            );
+          } catch {
+            this.#transactionPoisoned = true;
+          }
+          throw error;
+        }
+
+        let result: T;
+        try {
+          result = await body(transaction);
+          await transaction.deactivateAndDrain();
+        } catch (error) {
+          await transaction.deactivateAndDrain();
+          try {
+            requireTransactionTag(
+              await this.#executeTransactionControlUnlocked('ROLLBACK'),
+              'ROLLBACK',
+            );
+          } catch {
+            this.#transactionPoisoned = true;
+          }
+          throw error;
+        }
+
+        let commit: CommandResult;
+        try {
+          commit = await this.#executeTransactionControlUnlocked('COMMIT');
+        } catch (error) {
+          // PostgreSQL may already have committed. A follow-up ROLLBACK cannot
+          // undo that boundary and would misrepresent the outcome.
+          this.#transactionPoisoned = true;
+          throw error;
+        }
+        if (commit.commandTag !== 'COMMIT') {
+          if (commit.commandTag !== 'ROLLBACK') {
+            this.#transactionPoisoned = true;
+          }
+          throw transactionTagError('COMMIT', commit.commandTag);
+        }
+        return result;
+      } finally {
+        transaction.deactivate();
+        this.#activeTransaction = false;
       }
-      transaction.deactivate();
-      throw error;
-    } finally {
-      this.#activeTransaction = false;
-    }
+    });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     if (this.#closed) {
-      return;
+      return Promise.resolve();
     }
-    this.#closed = true;
-    await this.#binding.detach(this.#handle);
+    if (this.#closeAttempt !== undefined) {
+      return this.#closeAttempt;
+    }
+    if (this.#activeTransaction) {
+      return Promise.reject(new Error('cannot close Oliphaunt while a transaction is active'));
+    }
+
+    this.#closing = true;
+    const attempt = this.#operationTail
+      .then(() => this.binding.detach(this.handle))
+      .then(() => {
+        this.#closing = false;
+        this.#closed = true;
+        this.#releaseOwnership?.();
+      })
+      .catch((error: unknown) => {
+        this.#closing = false;
+        throw error;
+      })
+      .finally(() => {
+        if (this.#closeAttempt === attempt) {
+          this.#closeAttempt = undefined;
+        }
+      });
+    this.#closeAttempt = attempt;
+    return attempt;
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -213,65 +209,107 @@ export class OliphauntDatabase {
   }
 
   async #executeSimpleUnlocked(sql: string): Promise<Uint8Array> {
-    if (this.#binding.execSimpleQuery !== undefined) {
-      return this.#runNativeOperation(() => this.#binding.execSimpleQuery?.(this.#handle, sql));
+    if (this.binding.execSimpleQuery !== undefined) {
+      return this.runNativeOperation(() => this.binding.execSimpleQuery?.(this.handle, sql));
     }
     return this.#execProtocolRawUnlocked(simpleQuery(sql));
   }
 
+  async #executeTransactionControlUnlocked(
+    sql: 'BEGIN' | 'COMMIT' | 'ROLLBACK',
+  ): Promise<CommandResult> {
+    return parseCommandResponse(await this.#execProtocolRawUnlocked(extendedQuery(sql, [])));
+  }
+
   async #execProtocolRawUnlocked(input: BinaryInput): Promise<Uint8Array> {
     const requestBytes = toUint8Array(input);
-    return this.#runNativeOperation(() =>
-      this.#binding.execProtocolRaw(this.#handle, requestBytes),
-    );
+    return this.runNativeOperation(() => this.binding.execProtocolRaw(this.handle, requestBytes));
   }
 
   async #execProtocolStreamUnlocked(
     input: BinaryInput,
     onChunk: ProtocolChunkCallback,
   ): Promise<void> {
-    const requestBytes = toUint8Array(input);
-    if (this.#binding.protocolStream && this.#binding.execProtocolStream !== undefined) {
-      await this.#runNativeVoidOperation(() =>
-        this.#binding.execProtocolStream?.(this.#handle, requestBytes, onChunk),
-      );
-      return;
+    if (typeof onChunk !== 'function') {
+      throw new TypeError('protocol stream callback must be a function');
     }
-    onChunk(await this.#execProtocolRawUnlocked(requestBytes));
+    const requestBytes = toUint8Array(input);
+    await this.binding.execProtocolStream(this.handle, requestBytes, onChunk);
   }
 
   #assertOpen(): void {
     if (this.#closed) {
       throw new Error('Oliphaunt database is closed');
     }
+    if (this.#closing) {
+      throw new Error('Oliphaunt database is closing');
+    }
+    if (this.#transactionPoisoned) {
+      throw new Error('Oliphaunt transaction state is unknown; close the database');
+    }
   }
 
-  #assertNoActiveTransaction(): void {
+  protected assertNoActiveTransaction(): void {
     if (this.#activeTransaction) {
       throw new Error(transactionPinnedMessage);
     }
   }
 
-  async #runNativeOperation<T>(body: () => T | undefined | Promise<T | undefined>): Promise<T> {
-    this.#activeOperations += 1;
-    try {
-      const result = await body();
-      if (result === undefined) {
-        throw new Error('native oliphaunt runtime operation returned no result');
+  protected withSessionOperation<T>(body: () => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
+    const operation = this.#operationTail.then(async () => {
+      if (this.#transactionPoisoned) {
+        throw new Error('Oliphaunt transaction state is unknown; close the database');
       }
-      return result;
-    } finally {
-      this.#activeOperations -= 1;
+      this.#sessionOperationRunning = true;
+      try {
+        return await body();
+      } finally {
+        this.#sessionOperationRunning = false;
+      }
+    });
+    this.#operationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  protected async runNativeOperation<T>(
+    body: () => T | undefined | Promise<T | undefined>,
+  ): Promise<T> {
+    const result = await body();
+    if (result === undefined) {
+      throw new Error('native oliphaunt runtime operation returned no result');
     }
+    return result;
   }
 
   async #runNativeVoidOperation(body: () => void | Promise<void>): Promise<void> {
-    this.#activeOperations += 1;
-    try {
-      await body();
-    } finally {
-      this.#activeOperations -= 1;
-    }
+    await body();
+  }
+}
+
+class OliphauntDatabaseImpl extends OliphauntDatabaseBase implements OliphauntDatabase {
+  async backup(): Promise<Uint8Array> {
+    this.assertNoActiveTransaction();
+    return this.withSessionOperation(async () => {
+      const backup = this.binding.backup;
+      if (backup === undefined) {
+        throw new Error('database runtime binding does not implement backup');
+      }
+      return this.runNativeOperation(() => backup(this.handle));
+    });
+  }
+}
+
+class OliphauntServerImpl extends OliphauntDatabaseBase implements OliphauntServer {
+  constructor(
+    binding: RuntimeBinding,
+    handle: RuntimeHandle,
+    readonly connectionString: string,
+  ) {
+    super(binding, handle);
   }
 }
 
@@ -279,6 +317,7 @@ class OliphauntTransactionHandle implements OliphauntTransaction {
   readonly #execRaw: (input: BinaryInput) => Promise<Uint8Array>;
   readonly #execStream: (input: BinaryInput, onChunk: ProtocolChunkCallback) => Promise<void>;
   #active = true;
+  #tail = Promise.resolve();
 
   constructor(
     execRaw: (input: BinaryInput) => Promise<Uint8Array>,
@@ -288,31 +327,32 @@ class OliphauntTransactionHandle implements OliphauntTransaction {
     this.#execStream = execStream;
   }
 
-  async execute(sql: string): Promise<Uint8Array> {
-    const response = await this.execProtocolRaw(simpleQuery(sql));
-    assertSuccessfulQueryResponse(response);
-    return response;
+  async execute(sql: string, parameters: ReadonlyArray<QueryParam> = []): Promise<CommandResult> {
+    const response = await this.execProtocolRaw(extendedQuery(sql, parameters));
+    return parseCommandResponse(response);
   }
 
   async query(sql: string, parameters: ReadonlyArray<QueryParam> = []): Promise<QueryResult> {
-    if (parameters.length === 0) {
-      return parseQueryResponse(await this.execute(sql));
-    }
     return parseQueryResponse(await this.execProtocolRaw(extendedQuery(sql, parameters)));
   }
 
   async execProtocolRaw(input: BinaryInput): Promise<Uint8Array> {
     this.#assertActive();
-    return this.#execRaw(input);
+    return this.#enqueue(() => this.#execRaw(input));
   }
 
   async execProtocolStream(input: BinaryInput, onChunk: ProtocolChunkCallback): Promise<void> {
     this.#assertActive();
-    await this.#execStream(input, onChunk);
+    await this.#enqueue(() => this.#execStream(input, onChunk));
   }
 
   deactivate(): void {
     this.#active = false;
+  }
+
+  async deactivateAndDrain(): Promise<void> {
+    this.#active = false;
+    await this.#tail;
   }
 
   #assertActive(): void {
@@ -320,16 +360,43 @@ class OliphauntTransactionHandle implements OliphauntTransaction {
       throw new Error('transaction is no longer active');
     }
   }
+
+  #enqueue<T>(body: () => Promise<T>): Promise<T> {
+    const operation = this.#tail.then(body);
+    this.#tail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
 }
 
 const transactionPinnedMessage = 'physical session is pinned; use the active OliphauntTransaction';
 
+function requireTransactionTag(result: CommandResult, expected: string): void {
+  if (result.commandTag !== expected) {
+    throw transactionTagError(expected, result.commandTag);
+  }
+}
+
+function transactionTagError(expected: string, actual: string | undefined): Error {
+  return new Error(
+    `PostgreSQL transaction command expected ${expected}, got ${actual ?? 'no command tag'}`,
+  );
+}
+
 export function createOliphauntClient(
   bindingFactory: NativeBindingFactory = createDefaultNativeBinding,
+  runtimeOverrides: RuntimeBindingOverrides = {},
 ): OliphauntClient {
   const bindings = new Map<string, Promise<NativeBinding>>();
   const brokerBindings = new Map<string, RuntimeBinding>();
-  const serverBinding = createServerRuntimeBinding();
+  const serverBinding = runtimeOverrides.server ?? createServerRuntimeBinding();
+  const directResident = {
+    temporaryDirectory: undefined as string | undefined,
+    activeOwner: undefined as symbol | undefined,
+    openQueue: Promise.resolve() as Promise<void>,
+  };
 
   function bindingFor(options: NativeBindingOptions = {}): Promise<NativeBinding> {
     const key = options.libraryPath ?? '';
@@ -347,240 +414,168 @@ export function createOliphauntClient(
     return created;
   }
 
-  function brokerBindingFor(config: {
-    brokerExecutable?: string;
-    brokerMaxRoots?: number;
-  }): RuntimeBinding {
-    const key = `${config.brokerExecutable ?? ''}:${config.brokerMaxRoots ?? 1}`;
+  function brokerBindingFor(config: { brokerExecutable?: string }): RuntimeBinding {
+    if (runtimeOverrides.broker !== undefined) {
+      return runtimeOverrides.broker;
+    }
+    const key = config.brokerExecutable ?? '';
     const cached = brokerBindings.get(key);
     if (cached !== undefined) {
       return cached;
     }
     const created = createBrokerRuntimeBinding({
       executable: config.brokerExecutable,
-      maxRoots: config.brokerMaxRoots,
     });
     brokerBindings.set(key, created);
     return created;
   }
 
-  return {
-    async supportedModes(options: SupportedModesOptions = {}): Promise<EngineModeSupport[]> {
-      const support: EngineModeSupport[] = [];
-      const libraryPath = validateOptionalPathOverride(options.libraryPath, 'libraryPath');
-      try {
-        const binding = await bindingFor({ libraryPath });
-        const directCapabilities = nativeDirectCapabilities(await binding.capabilities(), binding);
-        support.push({
-          engine: 'nativeDirect',
-          available: true,
-          capabilities: directCapabilities,
-        });
-      } catch (error) {
-        support.push({
-          engine: 'nativeDirect',
-          available: false,
-          capabilities: baseCapabilitiesForMode('nativeDirect'),
-          unavailableReason: `native liboliphaunt is unavailable: ${errorString(error)}`,
-        });
-      }
+  function serializeDirectOpen<T>(body: () => Promise<T>): Promise<T> {
+    const result = directResident.openQueue.then(body, body);
+    directResident.openQueue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
 
-      const brokerExecutable = validateOptionalPathOverride(
-        options.brokerExecutable,
-        'brokerExecutable',
-      );
-      const runtimeDirectory = validateOptionalPathOverride(
-        options.runtimeDirectory,
-        'runtimeDirectory',
-      );
-      support.push(await brokerModeSupport({ brokerExecutable, libraryPath, runtimeDirectory }));
-      const serverExecutable = validateOptionalPathOverride(
-        options.serverExecutable,
-        'serverExecutable',
-      );
-      const serverToolDirectory = validateOptionalPathOverride(
-        options.serverToolDirectory,
-        'serverToolDirectory',
-      );
-      support.push(await serverModeSupport({ serverExecutable, serverToolDirectory }));
-      return support;
-    },
+  async function openDatabase(
+    effectiveConfig: OpenConfig | (ServerOpenConfig & { execution: 'server' }),
+  ): Promise<OliphauntDatabaseImpl | OliphauntServerImpl> {
+    const direct = effectiveConfig.execution === 'direct';
+    if (direct && directResident.activeOwner !== undefined) {
+      throw new Error('native direct already has an active process-wide instance');
+    }
 
-    async open(config: OpenConfig = {}): Promise<OliphauntDatabase> {
-      const root = await resolveOpenRoot(config);
-      const normalized = normalizeOpenConfig(withDefaultEngine(config), root);
+    const reusableTemporaryDirectory = direct ? directResident.temporaryDirectory : undefined;
+    const resolvedStorage = await materializeStorage(
+      effectiveConfig.storage,
+      reusableTemporaryDirectory,
+    );
+    let runtimeOpenAttempted = false;
+    try {
+      const normalized = normalizeOpenConfig(effectiveConfig, resolvedStorage);
       let binding: RuntimeBinding;
-      if (normalized.engine === 'nativeDirect') {
+      if (normalized.execution === 'direct') {
         binding = directRuntimeBinding(await bindingFor({ libraryPath: normalized.libraryPath }));
-      } else if (normalized.engine === 'nativeBroker') {
+      } else if (normalized.execution === 'broker') {
         binding = brokerBindingFor({
           brokerExecutable: normalized.brokerExecutable,
-          brokerMaxRoots: normalized.brokerMaxRoots,
         });
       } else {
         binding = serverBinding;
       }
+
+      runtimeOpenAttempted = true;
       const handle = await binding.open(normalized);
-      return new OliphauntDatabase(binding, handle, normalized.root);
+      if (normalized.execution === 'server') {
+        const connectionString = binding.connectionString?.(handle);
+        if (connectionString === undefined) {
+          await Promise.resolve(binding.detach(handle)).catch(() => {});
+          throw new Error('native server did not expose its connection string');
+        }
+        return new OliphauntServerImpl(binding, handle, connectionString);
+      }
+      if (!direct) {
+        return new OliphauntDatabaseImpl(binding, handle);
+      }
+
+      if (resolvedStorage.temporaryDirectory) {
+        directResident.temporaryDirectory ??= resolvedStorage.instanceDirectory;
+      }
+      const owner = Symbol('native-direct-owner');
+      directResident.activeOwner = owner;
+      return new OliphauntDatabaseImpl(binding, handle, () => {
+        if (directResident.activeOwner === owner) {
+          directResident.activeOwner = undefined;
+        }
+      });
+    } catch (error) {
+      if (resolvedStorage.createdTemporaryDirectory) {
+        if (direct && runtimeOpenAttempted) {
+          // A native adapter can surface an error after liboliphaunt has claimed
+          // its process-resident PGDATA. Retain the candidate for a coherent
+          // retry, but do not publish it before the native open is entered.
+          directResident.temporaryDirectory ??= resolvedStorage.instanceDirectory;
+        } else if (!runtimeOpenAttempted) {
+          await removeDirectory(resolvedStorage.instanceDirectory);
+        }
+      }
+      throw error;
+    }
+  }
+
+  return {
+    async open(config: OpenConfig = {}): Promise<OliphauntDatabase> {
+      const effectiveConfig: OpenConfig =
+        config.execution === undefined ? { ...config, execution: 'direct' } : config;
+      const database = await (effectiveConfig.execution === 'direct'
+        ? serializeDirectOpen(() => openDatabase(effectiveConfig))
+        : openDatabase(effectiveConfig));
+      if (database instanceof OliphauntServerImpl) {
+        throw new Error('generic database opener returned a native server');
+      }
+      return database;
     },
 
-    async restore(options: RestoreOptions): Promise<string> {
-      validateRootPath(options.root, 'restore root');
-      const artifact = options.artifact;
-      if (artifact.format !== 'physicalArchive') {
-        throw new Error(
-          `restore currently requires a physicalArchive artifact, got ${artifact.format}`,
-        );
+    async openServer(config: ServerOpenConfig = {}): Promise<OliphauntServer> {
+      const database = await openDatabase({ ...config, execution: 'server' });
+      if (!(database instanceof OliphauntServerImpl)) {
+        throw new Error('native server opener returned a non-server database');
       }
-      const engine = options.engine ?? defaultEngineForRuntime();
-      if (engine === 'nativeDirect') {
-        const libraryPath = validateOptionalPathOverride(options.libraryPath, 'libraryPath');
-        const binding = await bindingFor({ libraryPath });
-        await binding.restore({
-          root: options.root,
-          format: artifact.format,
-          bytes: toUint8Array(artifact.bytes),
-          replaceExisting: options.replaceExisting === true,
-        });
-        return options.root;
-      }
-      if (engine === 'nativeBroker') {
-        const brokerExecutable = validateOptionalPathOverride(
-          options.brokerExecutable,
-          'brokerExecutable',
-        );
-        const libraryPath = validateOptionalPathOverride(options.libraryPath, 'libraryPath');
-        return restorePhysicalArchiveWithBroker({
-          root: options.root,
-          bytes: toUint8Array(artifact.bytes),
-          replaceExisting: options.replaceExisting,
-          brokerExecutable,
-          libraryPath,
-        });
-      }
-      throw new Error('nativeServer restore is not supported by the TypeScript SDK');
+      return database;
+    },
+
+    async restore(
+      destination: string,
+      backup: BinaryInput,
+      options: RestoreOptions = {},
+    ): Promise<void> {
+      validateDirectoryPath(destination, 'restore destination');
+      const binding = await bindingFor({ libraryPath: options.libraryPath });
+      await binding.restore({
+        destination,
+        bytes: toUint8Array(backup),
+      });
     },
   };
 }
 
-export function defaultEngineForRuntime(runtime: JavaScriptRuntime = currentRuntime()): EngineMode {
-  switch (runtime) {
-    case 'node':
-    case 'bun':
-    case 'deno':
-      return 'nativeDirect';
-  }
-}
-
-function withDefaultEngine(config: OpenConfig): OpenConfig {
-  if (config.engine !== undefined) {
-    return config;
-  }
-  return { ...config, engine: defaultEngineForRuntime() };
-}
-
-function currentRuntime(): JavaScriptRuntime {
-  if (
-    typeof (globalThis as { Deno?: { version?: { deno?: string } } }).Deno?.version?.deno ===
-    'string'
-  ) {
-    return 'deno';
-  }
-  if (typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined') {
-    return 'bun';
-  }
-  return 'node';
-}
-
-export function supportsBackupFormat(
-  capabilities: EngineCapabilities,
-  format: BackupFormat,
-): boolean {
-  return capabilities.backupRestore && capabilities.backupFormats.includes(format);
-}
-
-export function supportsRestoreFormat(
-  capabilities: EngineCapabilities,
-  format: BackupFormat,
-): boolean {
-  return capabilities.backupRestore && capabilities.restoreFormats.includes(format);
-}
-
-function baseCapabilitiesForMode(engine: EngineMode): EngineCapabilities {
-  switch (engine) {
-    case 'nativeDirect':
+async function materializeStorage(
+  storage: DatabaseStorage | undefined,
+  reusableTemporaryDirectory?: string,
+): Promise<{
+  instanceDirectory: string;
+  temporaryDirectory: boolean;
+  createdTemporaryDirectory: boolean;
+}> {
+  if (storage === undefined || storage.kind === 'temporaryDirectory') {
+    if (reusableTemporaryDirectory !== undefined) {
       return {
-        engine,
-        processIsolated: false,
-        multiRoot: false,
-        reopenable: true,
-        sameRootLogicalReopen: true,
-        rootSwitchable: false,
-        crashRestartable: false,
-        independentSessions: false,
-        maxClientSessions: 1,
-        protocolRaw: true,
-        protocolStream: true,
-        queryCancel: true,
-        backupRestore: true,
-        backupFormats: ['physicalArchive'],
-        restoreFormats: ['physicalArchive'],
-        simpleQuery: true,
-        extensions: true,
+        instanceDirectory: reusableTemporaryDirectory,
+        temporaryDirectory: true,
+        createdTemporaryDirectory: false,
       };
-    case 'nativeBroker':
-      return {
-        engine,
-        processIsolated: true,
-        multiRoot: false,
-        reopenable: true,
-        sameRootLogicalReopen: false,
-        rootSwitchable: true,
-        crashRestartable: true,
-        independentSessions: false,
-        maxClientSessions: 1,
-        protocolRaw: true,
-        protocolStream: true,
-        queryCancel: true,
-        backupRestore: true,
-        backupFormats: ['physicalArchive'],
-        restoreFormats: ['physicalArchive'],
-        simpleQuery: true,
-        extensions: true,
-      };
-    case 'nativeServer':
-      return {
-        engine,
-        processIsolated: true,
-        multiRoot: false,
-        reopenable: true,
-        sameRootLogicalReopen: false,
-        rootSwitchable: true,
-        crashRestartable: false,
-        independentSessions: true,
-        maxClientSessions: 32,
-        protocolRaw: true,
-        protocolStream: true,
-        queryCancel: true,
-        backupRestore: true,
-        backupFormats: ['sql', 'physicalArchive'],
-        restoreFormats: ['physicalArchive'],
-        simpleQuery: true,
-        extensions: true,
-      };
+    }
+    return {
+      instanceDirectory: await mkdtemp(join(tmpdir(), 'liboliphaunt-js-')),
+      temporaryDirectory: true,
+      createdTemporaryDirectory: true,
+    };
   }
+  if (storage.kind === 'directory') {
+    await mkdir(storage.path, { recursive: true });
+    return {
+      instanceDirectory: storage.path,
+      temporaryDirectory: false,
+      createdTemporaryDirectory: false,
+    };
+  }
+  throw new Error(
+    `unknown native database storage kind '${String((storage as { kind?: unknown }).kind)}'`,
+  );
 }
 
-async function resolveOpenRoot(config: OpenConfig): Promise<string> {
-  if (config.root !== undefined) {
-    return config.root;
-  }
-  if (config.temporary === false) {
-    throw new Error('database root is not configured; pass root or set temporary true');
-  }
-  return mkdtemp(join(tmpdir(), 'liboliphaunt-js-'));
-}
-
-function errorString(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+async function removeDirectory(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true }).catch(() => {});
 }

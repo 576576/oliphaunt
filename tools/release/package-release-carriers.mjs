@@ -30,7 +30,7 @@ import {
 } from "./release-artifact-targets.mjs";
 import {
   packageNativeExtensionCargoCrates,
-  stageExtensionNpmPackages,
+  stageExtensionNpmPackagesForTargets,
 } from "./package-extension-release-carriers.mjs";
 import { packageExtensionCargoFacades } from "./package-extension-cargo-facades.mjs";
 import {
@@ -68,9 +68,10 @@ import {
 } from "./broker-dependency-license-contract.mjs";
 import {
   ICU_DATA_RELATIVE_PATH,
+  ICU_MANIFEST_RELATIVE_PATH,
   ICU_PODSPEC,
   ICU_REACT_NATIVE_CONFIG,
-  assertIcuPackedDataMatchesSource,
+  assertIcuPackedClosureMatchesSource,
   assertIcuPackageManifest,
   assertIcuPodspec,
   assertIcuReactNativeConfig,
@@ -79,6 +80,9 @@ import {
 import { stageMavenArtifactManifest } from "./maven-artifact-staging.mjs";
 import { buildMavenArtifactManifest } from "./build_maven_artifact_manifest.mjs";
 import { readPortableArchiveEntries } from "./portable-archive.mjs";
+import { packWasixRuntimeNpmCarrier } from "./wasix-runtime-npm-carrier.mjs";
+import { packWasixIcuNpmCarrier } from "./wasix-icu-npm-carrier.mjs";
+import { packWasixToolsNpmCarrier } from "./wasix-tools-npm-carrier.mjs";
 
 const TOOL = "package-release-carriers.mjs";
 const LIBOLIPHAUNT_NATIVE_PRODUCT = "liboliphaunt-native";
@@ -87,6 +91,8 @@ const LIBOLIPHAUNT_NATIVE_TOOLS_PRODUCT = "oliphaunt-tools";
 const LIBOLIPHAUNT_NATIVE_TOOLS_KIND = "native-tools";
 const LIBOLIPHAUNT_NATIVE_PACKAGE_ROOT = path.join(ROOT, "src/runtimes/liboliphaunt/native/packages");
 const LIBOLIPHAUNT_NATIVE_TOOLS_PACKAGE_ROOT = path.join(ROOT, "src/runtimes/liboliphaunt/native/tools-packages");
+const LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_PACKAGE = "@oliphaunt/tools";
+const LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_ROOT = path.join(ROOT, "src/runtimes/liboliphaunt/native/tools-npm");
 const LIBOLIPHAUNT_ICU_PACKAGE_NAME = "@oliphaunt/icu";
 const LIBOLIPHAUNT_ICU_PACKAGE_ROOT = path.join(ROOT, "src/runtimes/liboliphaunt/native/icu-npm");
 const BROKER_PRODUCT = "oliphaunt-broker";
@@ -921,6 +927,9 @@ function stageLiboliphauntNpmPayloads(version) {
     extractReleaseArchiveFile(archive, libraryRelativePath, path.join(stage, libraryRelativePath));
     extractReleaseArchiveTree(archive, "lib/modules", path.join(stage, "lib/modules"));
     extractReleaseArchiveTree(archive, "runtime", path.join(stage, "runtime"));
+    extractReleaseArchiveTree(archive, "cluster-seed", path.join(stage, "cluster-seed"));
+    extractReleaseArchiveTree(archive, "cluster-seed-icu", path.join(stage, "cluster-seed-icu"));
+    extractReleaseArchiveFile(archive, "manifest.properties", path.join(stage, "manifest.properties"));
     const vcRuntimeMembers = [
       ...stageWindowsVcRuntimeMembers(archive, stage, target.target, "bin", { profile: "provider" }),
       ...stageWindowsVcRuntimeMembers(archive, stage, target.target, "runtime/bin", {
@@ -936,10 +945,31 @@ function stageLiboliphauntNpmPayloads(version) {
   return stages;
 }
 
-function stageLiboliphauntToolsNpmPayloads(version) {
-  const assetDir = path.join(ROOT, "target/liboliphaunt/release-assets");
+function selectedLiboliphauntToolsNpmPackageTargets(version, targetIds) {
+  const targets = liboliphauntToolsNpmPackageTargets(version);
+  if (targetIds === undefined) return targets;
+  const selected = new Set(targetIds);
+  const filtered = targets.filter(([, , target]) => selected.has(target.target));
+  const actual = new Set(filtered.map(([, , target]) => target.target));
+  const missing = [...selected].filter((target) => !actual.has(target)).sort(compareText);
+  if (missing.length > 0) {
+    fail(`unknown native tools npm target(s): ${missing.join(", ")}`);
+  }
+  return filtered;
+}
+
+function stageLiboliphauntToolsNpmPayloads(
+  version,
+  {
+    assetDir = path.join(ROOT, "target/liboliphaunt/release-assets"),
+    targetIds,
+  } = {},
+) {
   const stages = new Map();
-  for (const [packageName, packageDir, target] of liboliphauntToolsNpmPackageTargets(version)) {
+  for (const [packageName, packageDir, target] of selectedLiboliphauntToolsNpmPackageTargets(
+    version,
+    targetIds,
+  )) {
     const stage = stageNpmPackageDescriptor(packageName, packageDir, version, { target: target.target });
     stageReleaseNotices(stage, { profile: "native-tools" });
     const archive = path.join(assetDir, target.asset.replaceAll("{version}", version));
@@ -956,6 +986,31 @@ function stageLiboliphauntToolsNpmPayloads(version) {
   return stages;
 }
 
+function stageLiboliphauntToolsNpmFacade(version) {
+  const stage = stageNpmPackageDescriptor(
+    LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_PACKAGE,
+    LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_ROOT,
+    version,
+  );
+  for (const descriptor of ["index.js", "index.d.ts"]) {
+    copyFileSync(
+      path.join(LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_ROOT, descriptor),
+      path.join(stage, descriptor),
+    );
+  }
+  const manifestFile = path.join(stage, "package.json");
+  const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+  manifest.optionalDependencies = Object.fromEntries(
+    Object.keys(manifest.optionalDependencies ?? {})
+      .sort(compareText)
+      .map((name) => [name, version]),
+  );
+  writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  stageReleaseNotices(stage, { profile: "source-sdk" });
+  assertReleaseNoticesInDirectory(stage, { profile: "source-sdk" });
+  return stage;
+}
+
 function stageLiboliphauntIcuNpmPayload(version) {
   const stage = stageNpmPackageDescriptor(
     LIBOLIPHAUNT_ICU_PACKAGE_NAME,
@@ -966,11 +1021,30 @@ function stageLiboliphauntIcuNpmPayload(version) {
       target: "portable",
     },
   );
+  const sourceArchive = path.join(
+    ROOT,
+    "target/liboliphaunt/release-assets",
+    `liboliphaunt-${version}-icu-data.tar.gz`,
+  );
   extractReleaseArchiveTree(
-    path.join(ROOT, "target/liboliphaunt/release-assets", `liboliphaunt-${version}-icu-data.tar.gz`),
+    sourceArchive,
     "share/icu",
     path.join(stage, ...ICU_DATA_RELATIVE_PATH.split("/")),
   );
+  extractReleaseArchiveFile(
+    sourceArchive,
+    "manifest.properties",
+    path.join(stage, ...ICU_MANIFEST_RELATIVE_PATH.split("/")),
+  );
+  const manifestFile = path.join(stage, "package.json");
+  const packageJson = JSON.parse(readFileSync(manifestFile, "utf8"));
+  const icuReceipt = readFileSync(path.join(stage, ...ICU_MANIFEST_RELATIVE_PATH.split("/")), "utf8");
+  const digest = /^icuDataTreeSha256=([0-9a-f]{64})$/mu.exec(icuReceipt)?.[1];
+  if (digest === undefined) {
+    fail(`${rel(sourceArchive)} has no canonical ICU data tree digest`);
+  }
+  packageJson.oliphaunt.icuDataTreeSha256 = digest;
+  writeFileSync(manifestFile, `${JSON.stringify(packageJson, null, 2)}\n`);
   stageReleaseNotices(stage, { profile: "native-icu-data" });
   assertReleaseNoticesInDirectory(stage, { profile: "native-icu-data" });
   try {
@@ -1030,9 +1104,10 @@ function validatePackedIcuPackage(packageName, version, tarball, sourceArchive) 
       sourcePodspec: readFileSync(path.join(LIBOLIPHAUNT_ICU_PACKAGE_ROOT, ICU_PODSPEC)),
       label: rel(tarball),
     });
-    assertIcuPackedDataMatchesSource({
+    assertIcuPackedClosureMatchesSource({
       packedEntries: entries,
       sourceEntries,
+      packageJson,
       label: rel(tarball),
       sourceLabel: rel(sourceArchive),
     });
@@ -1045,7 +1120,6 @@ function validatePackedIcuPackage(packageName, version, tarball, sourceArchive) 
 export function liboliphauntNpmTarballs(version) {
   const packages = [];
   const runtimeStages = stageLiboliphauntNpmPayloads(version);
-  const toolsStages = stageLiboliphauntToolsNpmPayloads(version);
   for (const [packageName, , target] of liboliphauntRuntimeNpmPackageTargets(version)) {
     const payload = runtimeStages.get(packageName);
     const libraryRelativePath = target.libraryRelativePath ?? target.library_relative_path;
@@ -1055,6 +1129,13 @@ export function liboliphauntNpmTarballs(version) {
     );
     const requiredMembers = [
       `package/${libraryRelativePath}`,
+      "package/cluster-seed/manifest.properties",
+      "package/cluster-seed/files/PG_VERSION",
+      "package/cluster-seed/files/global/pg_control",
+      "package/cluster-seed-icu/manifest.properties",
+      "package/cluster-seed-icu/files/PG_VERSION",
+      "package/cluster-seed-icu/files/global/pg_control",
+      "package/manifest.properties",
       ...embeddedCoreModuleMembers(target.target, "package/lib/modules"),
       ...runtimeMembers,
       ...coreRuntimeMembers,
@@ -1072,7 +1153,26 @@ export function liboliphauntNpmTarballs(version) {
     assertReleaseNoticesInArchive(tarball, { profile: "native-runtime", prefix: "package" });
     packages.push([packageName, tarball]);
   }
-  for (const [packageName, , target] of liboliphauntToolsNpmPackageTargets(version)) {
+  packages.push(...liboliphauntToolsNpmTarballs(version));
+  const icuStage = stageLiboliphauntIcuNpmPayload(version);
+  const icuTarball = pnpmPackForNpmPublish(icuStage);
+  validatePackedIcuPackage(
+    LIBOLIPHAUNT_ICU_PACKAGE_NAME,
+    version,
+    icuTarball,
+    path.join(ROOT, "target/liboliphaunt/release-assets", `liboliphaunt-${version}-icu-data.tar.gz`),
+  );
+  packages.push([LIBOLIPHAUNT_ICU_PACKAGE_NAME, icuTarball]);
+  return packages;
+}
+
+export function liboliphauntToolsNpmTarballs(version, options = {}) {
+  const packages = [];
+  const toolsStages = stageLiboliphauntToolsNpmPayloads(version, options);
+  for (const [packageName, , target] of selectedLiboliphauntToolsNpmPackageTargets(
+    version,
+    options.targetIds,
+  )) {
     const payload = toolsStages.get(packageName);
     const runtimeMembers = requiredToolsMemberPaths(target.target, "package/runtime/bin");
     const tarball = pnpmPackForNpmPublish(payload.stage);
@@ -1090,15 +1190,23 @@ export function liboliphauntNpmTarballs(version) {
     assertReleaseNoticesInArchive(tarball, { profile: "native-tools", prefix: "package" });
     packages.push([packageName, tarball]);
   }
-  const icuStage = stageLiboliphauntIcuNpmPayload(version);
-  const icuTarball = pnpmPackForNpmPublish(icuStage);
-  validatePackedIcuPackage(
-    LIBOLIPHAUNT_ICU_PACKAGE_NAME,
+  const toolsFacadeStage = stageLiboliphauntToolsNpmFacade(version);
+  const toolsFacadeTarball = pnpmPackForNpmPublish(toolsFacadeStage);
+  validatePackedNpmPackage({
+    packageName: LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_PACKAGE,
     version,
-    icuTarball,
-    path.join(ROOT, "target/liboliphaunt/release-assets", `liboliphaunt-${version}-icu-data.tar.gz`),
-  );
-  packages.push([LIBOLIPHAUNT_ICU_PACKAGE_NAME, icuTarball]);
+    tarball: toolsFacadeTarball,
+    requiredMembers: [
+      "package/index.js",
+      "package/index.d.ts",
+      ...releaseNoticeRows({ profile: "source-sdk" }).map((row) => `package/${row.member}`),
+    ],
+  });
+  assertReleaseNoticesInArchive(toolsFacadeTarball, {
+    profile: "source-sdk",
+    prefix: "package",
+  });
+  packages.push([LIBOLIPHAUNT_NATIVE_TOOLS_FACADE_PACKAGE, toolsFacadeTarball]);
   return packages;
 }
 
@@ -1506,9 +1614,28 @@ export function liboliphauntWasixCargoArtifactPackages(
 
 function packageWasixRuntimeCarriers() {
   const contrib = contribCarrierDescriptor(TOOL);
-  liboliphauntWasixCargoArtifactPackages(currentProductVersionSync(WASIX_PRODUCT, TOOL), {
+  const version = currentProductVersionSync(WASIX_PRODUCT, TOOL);
+  liboliphauntWasixCargoArtifactPackages(version, {
     extensionArtifactRoots: [extensionPackageDir(contrib.artifactProduct, "wasix")],
   });
+  const portableReleaseArchive = path.join(
+    ROOT,
+    `target/oliphaunt-wasix/release-assets/liboliphaunt-wasix-${version}-runtime-portable.tar.zst`,
+  );
+  packWasixRuntimeNpmCarrier({
+    version,
+    portableReleaseArchive,
+  });
+  packWasixIcuNpmCarrier({
+    version,
+    portableReleaseArchive,
+    icuDataReleaseArchive: path.join(
+      ROOT,
+      `target/oliphaunt-wasix/release-assets/liboliphaunt-wasix-${version}-icu-data.tar.zst`,
+    ),
+  });
+  packWasixToolsNpmCarrier({ version, portableReleaseArchive });
+  packageExtensionNpmCarriers(contrib.artifactProduct, { family: "wasix" });
 }
 
 function extensionPackageDir(product, family = "native") {
@@ -1548,20 +1675,30 @@ async function packageExtensionMavenCarriers(product) {
   );
 }
 
-function packageExtensionNpmCarriers(product) {
-  const targets = extensionRegistryPackageTargetSets(product, TOOL).npmTargets;
-  for (const target of targets) {
-    const result = releaseSurfaceResult(`${product}-npm-${target}`);
-    const output = stageExtensionNpmPackages(
-      [extensionPackageDir(product, "native")],
-      path.join(ROOT, "target/release/extension-carriers/npm", product, target),
-      target,
-      result,
-      { metaTargets: targets },
+function packageExtensionNpmCarriers(product, { family = null } = {}) {
+  const roots = [extensionPackageDir(product, family ?? "native")];
+  const targetSets = extensionRegistryPackageTargetSets(product, TOOL);
+  const targets = targetSets.npmTargets;
+  const result = releaseSurfaceResult(`${product}-npm${family === null ? "" : `-${family}`}`);
+  const staged = stageExtensionNpmPackagesForTargets(
+    roots,
+    path.join(ROOT, "target/release/extension-carriers/npm", product, family ?? "all"),
+    targets,
+    result,
+    { metaTargets: targets },
+  );
+  const missingNativeTargets = family === "wasix"
+    ? []
+    : targets.filter((target) => staged.nativeRoots[target] === null);
+  const missingWasix = family === "native"
+    ? false
+    : targetSets.includeWasixNpm && staged.wasixRoot === null;
+  if (missingNativeTargets.length > 0 || missingWasix || result.staged.length === 0) {
+    fail(
+      `${product} npm carrier packaging failed: missing native targets=${missingNativeTargets.join(",") || "none"}; `
+      + `missing portable WASIX=${missingWasix ? "yes" : "no"}; `
+      + `details=${result.skipped.join("; ") || "none"}`,
     );
-    if (output === null || result.staged.length === 0) {
-      fail(`${product} npm carrier packaging failed for ${target}: ${result.skipped.join("; ")}`);
-    }
   }
 }
 
@@ -1635,7 +1772,7 @@ async function packageContribNativeCarriers() {
   if (!isFile(manifest)) {
     fail(`${LIBOLIPHAUNT_NATIVE_PRODUCT} requires staged contrib native artifacts at ${rel(manifest)}`);
   }
-  packageExtensionNpmCarriers(product);
+  packageExtensionNpmCarriers(product, { family: "native" });
   packageExtensionNativeCargoCarriers(product);
   packageExtensionFacade(product);
 }

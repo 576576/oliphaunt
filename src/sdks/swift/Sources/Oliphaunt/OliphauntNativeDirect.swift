@@ -1,43 +1,25 @@
 import Foundation
 import COliphaunt
 
-public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSupportProvider {
-    public var libraryURL: URL?
-    public var runtimeDirectory: URL?
-    public var runtimeResources: OliphauntRuntimeResources?
-    public var username: String
-    public var database: String
+struct OliphauntNativeDirectEngine: OliphauntEngine {
+    var libraryURL: URL?
+    var runtimeDirectory: URL?
+    var runtimeResources: OliphauntRuntimeResources?
 
-    public init(
+    init(
         libraryURL: URL? = nil,
         runtimeDirectory: URL? = nil,
-        runtimeResources: OliphauntRuntimeResources? = nil,
-        username: String = "postgres",
-        database: String = "postgres"
+        runtimeResources: OliphauntRuntimeResources? = nil
     ) {
         self.libraryURL = libraryURL
         self.runtimeDirectory = runtimeDirectory
         self.runtimeResources = runtimeResources
-        self.username = username
-        self.database = database
     }
 
-    public var supportedModes: [OliphauntEngineModeSupport] {
-        OliphauntSDKSupport.nativeDirectOnly(
-            brokerReason: OliphauntDefaultEngine.brokerUnavailableReason,
-            serverReason: OliphauntDefaultEngine.serverUnavailableReason
-        )
-    }
-
-    public func open(configuration: OliphauntConfiguration) async throws -> any OliphauntSession {
-        guard configuration.mode == .nativeDirect else {
-            throw OliphauntError.engine(
-                "OliphauntNativeDirectEngine supports nativeDirect, got \(configuration.mode.rawValue)"
-            )
-        }
-        try validateOliphauntRoot(configuration.root, label: "database root")
-        try validateOliphauntStartupIdentity(configuration.username ?? username, label: "username")
-        try validateOliphauntStartupIdentity(configuration.database ?? database, label: "database")
+    func open(configuration: OliphauntConfiguration) async throws -> any OliphauntSession {
+        try validateOliphauntStorage(configuration.storage)
+        try validateOliphauntStartupIdentity(configuration.username, label: "username")
+        try validateOliphauntStartupIdentity(configuration.database, label: "database")
         try validateOliphauntStartupGUCs(configuration.startupGUCs)
         _ = try OliphauntRuntimeResources.validateExtensionIds(configuration.extensions)
         let packagedRuntimeResources = try runtimeResources ?? OliphauntRuntimeResources.bundled(
@@ -47,27 +29,69 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
             extensions: configuration.extensions,
             runtimeResources: packagedRuntimeResources
         )
+        let username = configuration.username ?? "postgres"
+        let database = configuration.database ?? "postgres"
 
-        let root = try Self.resolveRoot(configuration.root)
-        let pgdata = root.appendingPathComponent("pgdata", isDirectory: true)
-        let preparedPgdata = try packagedRuntimeResources?.preparePgdata(at: pgdata) ?? false
-        let hasPgVersion = FileManager.default.fileExists(
-            atPath: pgdata.appendingPathComponent("PG_VERSION").path
-        )
-        if !hasPgVersion {
-            try Self.requireHostInitdbSupport(
-                preparedPgdata: preparedPgdata,
-                temporaryRoot: configuration.root == nil,
-                root: root
-            )
-            try FileManager.default.createDirectory(
-                at: pgdata,
-                withIntermediateDirectories: true
-            )
+        let storageDirectory = try Self.resolveStorage(configuration.storage)
+        let pgdata = storageDirectory.appendingPathComponent("pgdata", isDirectory: true)
+        switch try Self.classifyManagedRoot(storageDirectory) {
+        case .managed:
+            try validateOliphauntCompletePgdata(pgdata)
+        case .empty:
+            try requireOliphauntFreshRootRole(username)
+            var ownsPublishedPgdata = false
+            do {
+                let preparation = try resolvedRuntime.resources?.preparePgdata(
+                    at: pgdata,
+                    profile: resolvedRuntime.catalogProfile,
+                    didPublishDestination: { ownsPublishedPgdata = true }
+                )
+                if preparation == nil {
+                    let staging = storageDirectory.appendingPathComponent(
+                        ".pgdata-initdb-\(UUID().uuidString)",
+                        isDirectory: true
+                    )
+                    let result: Result<OliphauntPgdataPublication, Error> = Result {
+                        try Self.runPackagedInitdb(
+                            pgdata: staging,
+                            runtimeDirectory: resolvedRuntime.directory,
+                            username: "postgres",
+                            catalogProfile: resolvedRuntime.catalogProfile
+                        )
+                        return try publishOliphauntPreparedPgdata(
+                            staging,
+                            to: pgdata,
+                            didPublishDestination: { ownsPublishedPgdata = true }
+                        )
+                    }
+                    _ = try finishOliphauntStaging(result, operation: "PGDATA preparation") {
+                        try removeOliphauntStagingIfPresent(staging)
+                    }
+                }
+                try validateOliphauntCompletePgdata(pgdata)
+                try Self.writeManagedRootDescriptor(storageDirectory)
+            } catch let publicationError {
+                try recoverOliphauntManagedRootPublicationFailure(
+                    publicationError,
+                    ownsPublishedPgdata: ownsPublishedPgdata,
+                    descriptorDefinitelyAbsent: {
+                        try isOliphauntPathDefinitelyAbsent(
+                            storageDirectory.appendingPathComponent(
+                                ".oliphaunt.json",
+                                isDirectory: false
+                            )
+                        )
+                    },
+                    removePublishedPgdata: {
+                        if !(try isOliphauntPathDefinitelyAbsent(pgdata)) {
+                            try FileManager.default.removeItem(at: pgdata)
+                        }
+                    },
+                    syncRoot: { try syncOliphauntDirectory(storageDirectory) }
+                )
+            }
         }
 
-        let username = configuration.username ?? self.username
-        let database = configuration.database ?? self.database
         let startupArgs = configuration.postgresStartupArgs(
             sharedPreloadLibraries: resolvedRuntime.sharedPreloadLibraries
         )
@@ -84,6 +108,7 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
                                     abi_version: UInt32(OLIPHAUNT_ABI_VERSION),
                                     pgdata: pgdataCString,
                                     runtime_dir: runtimeCString,
+                                    module_dir: nil,
                                     username: usernameCString,
                                     database: databaseCString,
                                     reserved_flags: 0,
@@ -98,39 +123,26 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
             }
         }
         guard rc == 0, let session else {
-            if configuration.root == nil {
-                try? FileManager.default.removeItem(at: root)
-            }
+            // The native direct runtime is process-resident and may still own
+            // this directory after rejecting an incompatible logical reopen.
+            // Process-temporary storage is therefore reclaimed only with the
+            // process, never on a failed native open.
             throw OliphauntError.engine(Self.lastError(nil))
         }
-        return NativeDirectSession(
-            session: session,
-            root: root,
-            deleteRootOnClose: configuration.root == nil
-        )
+        return NativeDirectSession(session: session)
     }
 
-    public func restore(_ request: OliphauntRestoreRequest) async throws -> URL {
-        try validateOliphauntRoot(request.root, label: "restore root")
-        guard request.artifact.format == .physicalArchive else {
-            throw OliphauntError.engine(
-                "Swift native restore currently requires physicalArchive, got \(request.artifact.format.rawValue)"
-            )
-        }
+    func restore(destination: URL, bytes: Data) async throws {
+        try validateOliphauntDirectory(destination, label: "restore destination")
         let libraryPath = libraryURL?.path
-        let flags: UInt64 = request.targetPolicy == .replaceExisting
-            ? UInt64(OLIPHAUNT_RESTORE_REPLACE_EXISTING)
-            : 0
-        let rc = request.root.path.withCString { rootCString in
+        let rc = destination.path.withCString { destinationCString in
             libraryPath.withOptionalCString { libraryCString in
-                request.artifact.bytes.withUnsafeBytes { rawBuffer in
+                bytes.withUnsafeBytes { rawBuffer in
                     var options = OliphauntRestoreOptions(
                         abi_version: UInt32(OLIPHAUNT_ABI_VERSION),
-                        root: rootCString,
-                        format: UInt32(OLIPHAUNT_BACKUP_FORMAT_PHYSICAL_ARCHIVE),
+                        destination: destinationCString,
                         data: rawBuffer.bindMemory(to: UInt8.self).baseAddress,
-                        len: request.artifact.bytes.count,
-                        flags: flags
+                        len: bytes.count
                     )
                     return oliphaunt_swift_restore(libraryCString, &options)
                 }
@@ -139,7 +151,6 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
         guard rc == 0 else {
             throw OliphauntError.engine(Self.lastError(nil))
         }
-        return request.root
     }
 
     private func resolveRuntime(
@@ -154,9 +165,12 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
             )
         }
         if let runtimeResources {
+            let closure = try runtimeResources.resolveRuntime(requestedExtensions: extensions)
             return ResolvedNativeRuntime(
-                directory: try runtimeResources.materializeRuntime(requestedExtensions: extensions),
-                sharedPreloadLibraries: try runtimeResources.sharedPreloadLibraries(requestedExtensions: extensions)
+                directory: closure.directory,
+                sharedPreloadLibraries: closure.sharedPreloadLibraries,
+                catalogProfile: closure.catalogProfile,
+                resources: closure.owner
             )
         }
         if let environmentRuntimeDirectory = Self.environmentRuntimeDirectory() {
@@ -185,12 +199,15 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
                 runtimeResources: runtimeResources
             )
         if let resources {
+            let closure = try resources.resolveRuntime(
+                at: directory,
+                requestedExtensions: extensions
+            )
             return ResolvedNativeRuntime(
-                directory: directory,
-                sharedPreloadLibraries: try resources.sharedPreloadLibraries(
-                    forRuntimeDirectory: directory,
-                    requestedExtensions: extensions
-                )
+                directory: closure.directory,
+                sharedPreloadLibraries: closure.sharedPreloadLibraries,
+                catalogProfile: closure.catalogProfile,
+                resources: closure.owner
             )
         }
         if !extensions.isEmpty {
@@ -219,6 +236,8 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
     private struct ResolvedNativeRuntime {
         var directory: URL? = nil
         var sharedPreloadLibraries: [String] = []
+        var catalogProfile: OliphauntNativeCatalogProfile = .standard
+        var resources: OliphauntRuntimeResources? = nil
     }
 
     private static func environmentRuntimeDirectory() -> URL? {
@@ -234,44 +253,207 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
         return nil
     }
 
-    private static func requireHostInitdbSupport(
-        preparedPgdata: Bool,
-        temporaryRoot: Bool,
-        root: URL
+    private static func runPackagedInitdb(
+        pgdata: URL,
+        runtimeDirectory: URL?,
+        username: String,
+        catalogProfile: OliphauntNativeCatalogProfile
     ) throws {
-        if preparedPgdata {
-            return
+#if os(macOS)
+        let environment = ProcessInfo.processInfo.environment
+        let initdb: URL
+        if let configured = environment["OLIPHAUNT_INITDB"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty
+        {
+            initdb = URL(fileURLWithPath: configured, isDirectory: false)
+        } else if let runtimeDirectory {
+            initdb = runtimeDirectory.appendingPathComponent("bin/initdb", isDirectory: false)
+        } else {
+            throw OliphauntError.engine(
+                "new Swift database storage requires packaged initdb; provide packaged runtime resources or OLIPHAUNT_INSTALL_DIR"
+            )
         }
-#if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
-        if temporaryRoot {
-            try? FileManager.default.removeItem(at: root)
+        guard FileManager.default.isExecutableFile(atPath: initdb.path) else {
+            throw OliphauntError.engine("packaged initdb is not executable: \(initdb.path)")
         }
-        throw OliphauntError.engine(
-            "Swift Oliphaunt native-direct requires packaged template PGDATA or an existing PGDATA root on Apple mobile platforms; initdb cannot be assumed executable from app storage"
-        )
+
+        let process = Process()
+        process.executableURL = initdb
+        process.arguments = [
+            "-D", pgdata.path,
+            "-U", username,
+            "--auth=trust",
+            "--locale-provider=libc",
+            "--locale=C",
+            "--encoding=UTF8",
+        ]
+        var childEnvironment = environment
+        childEnvironment.removeValue(forKey: "ICU_DATA")
+        childEnvironment.removeValue(forKey: "OLIPHAUNT_INTERNAL_ICU_READY")
+        childEnvironment.removeValue(forKey: "OLIPHAUNT_INTERNAL_SKIP_SYSTEM_COLLATION_DISCOVERY")
+        childEnvironment.removeValue(forKey: "OLIPHAUNT_INTERNAL_SKIP_ICU_DISCOVERY")
+        if catalogProfile == .standard {
+            childEnvironment["OLIPHAUNT_INTERNAL_SKIP_ICU_DISCOVERY"] = "1"
+        }
+        if let runtimeDirectory {
+            let libraryDirectory = runtimeDirectory.appendingPathComponent("lib", isDirectory: true).path
+            let inherited = environment["DYLD_LIBRARY_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            childEnvironment["DYLD_LIBRARY_PATH"] = [libraryDirectory, inherited]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: ":")
+            if catalogProfile == .icu {
+                let icuData = runtimeDirectory.appendingPathComponent("share/icu", isDirectory: true)
+                guard FileManager.default.fileExists(atPath: icuData.path) else {
+                    throw OliphauntError.engine(
+                        "verified ICU runtime closure is missing share/icu at \(icuData.path)"
+                    )
+                }
+                childEnvironment["ICU_DATA"] = icuData.path
+                childEnvironment["OLIPHAUNT_INTERNAL_ICU_READY"] = "1"
+            }
+        }
+        process.environment = childEnvironment
+        process.standardOutput = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw OliphauntError.engine("could not execute packaged initdb \(initdb.path): \(error)")
+        }
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw OliphauntError.engine(
+                "packaged initdb \(initdb.path) failed with status \(process.terminationStatus)"
+            )
+        }
 #else
-        _ = temporaryRoot
-        _ = root
+        throw OliphauntError.engine(
+            "new Swift database storage requires a packaged cluster seed on this platform"
+        )
 #endif
     }
 
-    private static func resolveRoot(_ configuredRoot: URL?) throws -> URL {
-        if let configuredRoot {
-            try FileManager.default.createDirectory(
-                at: configuredRoot,
-                withIntermediateDirectories: true
-            )
-            return configuredRoot
+    private static func resolveStorage(_ storage: OliphauntDatabaseStorage) throws -> URL {
+        let directory: URL
+        switch storage {
+        case .temporaryDirectory:
+            directory = processTemporaryDirectory
+        case .directory(let configuredDirectory):
+            directory = configuredDirectory
         }
-        let root = processTemporaryRoot
+        if FileManager.default.fileExists(atPath: directory.path) {
+            let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw OliphauntError.engine(
+                    "database storage directory must be a real directory: \(directory.path)"
+                )
+            }
+        }
         try FileManager.default.createDirectory(
-            at: root,
+            at: directory,
             withIntermediateDirectories: true
         )
-        return root
+        return directory
     }
 
-    private static let processTemporaryRoot: URL = {
+    private enum ManagedRootState: Equatable {
+        case empty
+        case managed
+    }
+
+    private static func classifyManagedRoot(_ directory: URL) throws -> ManagedRootState {
+        let descriptor = directory.appendingPathComponent(".oliphaunt.json", isDirectory: false)
+        if FileManager.default.fileExists(atPath: descriptor.path) {
+            try validateManagedRootDescriptor(descriptor)
+            let contents = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            guard contents.count == 2, Set(contents) == Set([".oliphaunt.json", "pgdata"]) else {
+                throw OliphauntError.engine(
+                    "managed database storage directory must contain exactly .oliphaunt.json and pgdata: \(directory.path)"
+                )
+            }
+            return .managed
+        }
+        let contents = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        guard contents.isEmpty else {
+            throw OliphauntError.engine(
+                "database storage directory is nonempty but has no .oliphaunt.json descriptor: \(directory.path)"
+            )
+        }
+        return .empty
+    }
+
+    private static func writeManagedRootDescriptor(_ directory: URL) throws {
+        let descriptor = directory.appendingPathComponent(".oliphaunt.json", isDirectory: false)
+        let staging = directory.appendingPathComponent(
+            ".oliphaunt.json.tmp-\(UUID().uuidString)",
+            isDirectory: false
+        )
+        let json =
+            "{\"schema\":\"oliphaunt-database-root-v1\",\"engineFamily\":\"native\",\"pgdata\":\"pgdata\",\"postgresMajor\":18,\"physicalFormat\":\"native-pg18-v1\"}\n"
+        let result: Result<Void, Error> = Result {
+            guard FileManager.default.createFile(
+                atPath: staging.path,
+                contents: Data(json.utf8),
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw OliphauntError.engine(
+                    "failed to create database root descriptor staging file at \(staging.path)"
+                )
+            }
+            let handle = try FileHandle(forWritingTo: staging)
+            try handle.synchronize()
+            try handle.close()
+            do {
+                try FileManager.default.moveItem(at: staging, to: descriptor)
+            } catch let publicationError {
+                do {
+                    try validateManagedRootDescriptor(descriptor)
+                } catch {
+                    throw publicationError
+                }
+            }
+            try syncOliphauntDirectory(directory)
+        }
+        try finishOliphauntStaging(
+            result,
+            operation: "database root descriptor publication"
+        ) {
+            try removeOliphauntStagingIfPresent(staging)
+        }
+    }
+
+    private static func validateManagedRootDescriptor(_ descriptor: URL) throws {
+        let resourceValues = try descriptor.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        )
+        guard resourceValues.isRegularFile == true,
+              resourceValues.isSymbolicLink != true,
+              (resourceValues.fileSize ?? 0) > 0
+        else {
+            throw OliphauntError.engine(
+                "database root descriptor must be a nonempty real file: \(descriptor.path)"
+            )
+        }
+        let value: [String: OliphauntDescriptorJSONValue]
+        do {
+            var parser = OliphauntFlatJSONParser(data: try Data(contentsOf: descriptor))
+            value = try parser.parse()
+        } catch {
+            throw OliphauntError.engine("invalid database root descriptor: \(descriptor.path)")
+        }
+        guard Set(value.keys) == Set(["schema", "engineFamily", "pgdata", "postgresMajor", "physicalFormat"]),
+              value["schema"] == .string("oliphaunt-database-root-v1"),
+              value["pgdata"] == .string("pgdata"),
+              value["postgresMajor"] == .integer(18),
+              case .string(let family)? = value["engineFamily"],
+              case .string(let format)? = value["physicalFormat"],
+              ["native": "native-pg18-v1", "wasix": "wasix-pg18-v1"][family] == format
+        else {
+            throw OliphauntError.engine("invalid database root descriptor: \(descriptor.path)")
+        }
+    }
+
+    private static let processTemporaryDirectory: URL = {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "liboliphaunt-swift-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)",
@@ -289,42 +471,147 @@ public struct OliphauntNativeDirectEngine: OliphauntEngine, OliphauntEngineSuppo
 
 }
 
+private enum OliphauntDescriptorJSONValue: Equatable {
+    case string(String)
+    case integer(Int64)
+}
+
+private struct OliphauntFlatJSONParser {
+    private let bytes: [UInt8]
+    private var offset = 0
+
+    init(data: Data) {
+        bytes = Array(data)
+    }
+
+    mutating func parse() throws -> [String: OliphauntDescriptorJSONValue] {
+        skipWhitespace()
+        try expect(ascii: 0x7b)
+        skipWhitespace()
+        var values: [String: OliphauntDescriptorJSONValue] = [:]
+        if consume(ascii: 0x7d) {
+            try finish()
+            return values
+        }
+        while true {
+            let key = try parseString()
+            guard values[key] == nil else {
+                throw ParseError.invalid
+            }
+            skipWhitespace()
+            try expect(ascii: 0x3a)
+            skipWhitespace()
+            if peek() == 0x22 {
+                values[key] = .string(try parseString())
+            } else {
+                values[key] = .integer(try parseInteger())
+            }
+            skipWhitespace()
+            if consume(ascii: 0x7d) {
+                break
+            }
+            try expect(ascii: 0x2c)
+            skipWhitespace()
+        }
+        try finish()
+        return values
+    }
+
+    private mutating func parseString() throws -> String {
+        let start = offset
+        try expect(ascii: 0x22)
+        while offset < bytes.count {
+            let byte = bytes[offset]
+            offset += 1
+            if byte == 0x22 {
+                let token = Data(bytes[start..<offset])
+                guard let value = try JSONSerialization.jsonObject(
+                    with: token,
+                    options: .fragmentsAllowed
+                ) as? String else {
+                    throw ParseError.invalid
+                }
+                return value
+            }
+            if byte == 0x5c {
+                guard offset < bytes.count else {
+                    throw ParseError.invalid
+                }
+                offset += 1
+            }
+        }
+        throw ParseError.invalid
+    }
+
+    private mutating func parseInteger() throws -> Int64 {
+        let start = offset
+        _ = consume(ascii: 0x2d)
+        guard let first = peek() else {
+            throw ParseError.invalid
+        }
+        if first == 0x30 {
+            offset += 1
+            if let byte = peek(), (0x30...0x39).contains(byte) {
+                throw ParseError.invalid
+            }
+        } else if (0x31...0x39).contains(first) {
+            while let byte = peek(), (0x30...0x39).contains(byte) {
+                offset += 1
+            }
+        } else {
+            throw ParseError.invalid
+        }
+        guard let value = Int64(String(decoding: bytes[start..<offset], as: UTF8.self)) else {
+            throw ParseError.invalid
+        }
+        return value
+    }
+
+    private mutating func finish() throws {
+        skipWhitespace()
+        guard offset == bytes.count else {
+            throw ParseError.invalid
+        }
+    }
+
+    private mutating func skipWhitespace() {
+        while let byte = peek(), [0x20, 0x09, 0x0a, 0x0d].contains(byte) {
+            offset += 1
+        }
+    }
+
+    private func peek() -> UInt8? {
+        bytes.indices.contains(offset) ? bytes[offset] : nil
+    }
+
+    private mutating func consume(ascii: UInt8) -> Bool {
+        guard peek() == ascii else {
+            return false
+        }
+        offset += 1
+        return true
+    }
+
+    private mutating func expect(ascii: UInt8) throws {
+        guard consume(ascii: ascii) else {
+            throw ParseError.invalid
+        }
+    }
+
+    private enum ParseError: Error {
+        case invalid
+    }
+}
+
 private actor NativeDirectSession: OliphauntSession {
     private let box: NativeSessionBox
 
-    init(session: OpaquePointer, root: URL, deleteRootOnClose: Bool) {
-        self.box = NativeSessionBox(
-            pointer: session,
-            root: root,
-            deleteRootOnClose: deleteRootOnClose
-        )
+    init(session: OpaquePointer) {
+        self.box = NativeSessionBox(pointer: session)
     }
 
     deinit {
         box.closeBestEffort()
-    }
-
-    func capabilities() async -> OliphauntCapabilities {
-        let flags = box.capabilityFlags()
-        return OliphauntCapabilities(
-            mode: .nativeDirect,
-            processIsolated: false,
-            multiRoot: flags & OLIPHAUNT_CAP_MULTI_INSTANCE != 0,
-            reopenable: flags & OLIPHAUNT_CAP_LOGICAL_REOPEN != 0,
-            sameRootLogicalReopen: flags & OLIPHAUNT_CAP_LOGICAL_REOPEN != 0,
-            rootSwitchable: false,
-            crashRestartable: false,
-            independentSessions: false,
-            maxClientSessions: 1,
-            protocolRaw: flags & OLIPHAUNT_CAP_PROTOCOL_RAW != 0,
-            protocolStream: flags & OLIPHAUNT_CAP_PROTOCOL_STREAM != 0,
-            queryCancel: flags & OLIPHAUNT_CAP_QUERY_CANCEL != 0,
-            backupRestore: flags & OLIPHAUNT_CAP_BACKUP_RESTORE != 0,
-            backupFormats: [.physicalArchive],
-            restoreFormats: [.physicalArchive],
-            simpleQuery: flags & OLIPHAUNT_CAP_SIMPLE_QUERY != 0,
-            extensions: flags & OLIPHAUNT_CAP_EXTENSIONS != 0
-        )
     }
 
     func execProtocolRaw(_ bytes: Data) async throws -> Data {
@@ -338,8 +625,8 @@ private actor NativeDirectSession: OliphauntSession {
         try box.execProtocolStream(bytes, onChunk: onChunk)
     }
 
-    func backup(_ request: OliphauntBackupRequest) async throws -> OliphauntBackupArtifact {
-        try box.backup(request)
+    func backup() async throws -> Data {
+        try box.backup()
     }
 
     nonisolated func cancel() async throws {
@@ -354,29 +641,16 @@ private actor NativeDirectSession: OliphauntSession {
 private final class NativeSessionBox: @unchecked Sendable {
     private let condition = NSCondition()
     private var pointer: OpaquePointer?
+    private var closing = false
     private var closed = false
     private var activeCalls = 0
-    private let root: URL
-    private let deleteRootOnClose: Bool
 
-    init(pointer: OpaquePointer, root: URL, deleteRootOnClose: Bool) {
+    init(pointer: OpaquePointer) {
         self.pointer = pointer
-        self.root = root
-        self.deleteRootOnClose = deleteRootOnClose
     }
 
     deinit {
         closeBestEffort()
-    }
-
-    func capabilityFlags() -> UInt64 {
-        guard let pointer = try? beginCall() else {
-            return 0
-        }
-        defer {
-            endCall()
-        }
-        return oliphaunt_swift_capabilities(pointer)
     }
 
     func execProtocolRaw(_ bytes: Data) throws -> Data {
@@ -449,23 +723,14 @@ private final class NativeSessionBox: @unchecked Sendable {
         }
     }
 
-    func backup(_ request: OliphauntBackupRequest) throws -> OliphauntBackupArtifact {
-        guard request.format == .physicalArchive else {
-            throw OliphauntError.engine(
-                "Swift native-direct backup currently supports physicalArchive, got \(request.format.rawValue)"
-            )
-        }
+    func backup() throws -> Data {
         let pointer = try beginCall()
         defer {
             endCall()
         }
 
         var response = OliphauntResponse(data: nil, len: 0)
-        let rc = oliphaunt_swift_backup(
-            pointer,
-            UInt32(OLIPHAUNT_BACKUP_FORMAT_PHYSICAL_ARCHIVE),
-            &response
-        )
+        let rc = oliphaunt_swift_backup(pointer, &response)
         guard rc == 0 else {
             throw OliphauntError.engine(OliphauntNativeDirectEngine.lastError(pointer))
         }
@@ -473,22 +738,15 @@ private final class NativeSessionBox: @unchecked Sendable {
             oliphaunt_swift_free_response(pointer, &response)
         }
         guard let data = response.data, response.len > 0 else {
-            return OliphauntBackupArtifact(format: .physicalArchive, bytes: Data())
+            return Data()
         }
-        return OliphauntBackupArtifact(
-            format: .physicalArchive,
-            bytes: Data(bytes: data, count: response.len)
-        )
+        return Data(bytes: data, count: response.len)
     }
 
     func cancel() throws {
-        condition.lock()
-        let pointer = self.pointer
-        let isClosed = closed
-        condition.unlock()
-
-        guard let pointer, !isClosed else {
-            throw OliphauntError.databaseClosed
+        let pointer = try beginCancellation()
+        defer {
+            endCall()
         }
         let rc = oliphaunt_swift_cancel(pointer)
         guard rc == 0 else {
@@ -497,24 +755,26 @@ private final class NativeSessionBox: @unchecked Sendable {
     }
 
     func close() throws {
-        let pointer = prepareClose()
+        let pointer = beginClose()
         guard let pointer else {
-            cleanupRoot()
             return
         }
         let rc = oliphaunt_swift_close(pointer)
-        cleanupRoot()
-        guard rc == 0 else {
-            throw OliphauntError.engine(OliphauntNativeDirectEngine.lastError(nil))
+        if rc == 0 {
+            finishClose(detached: true)
+            return
         }
+        let message = OliphauntNativeDirectEngine.lastError(pointer)
+        finishClose(detached: false)
+        throw OliphauntError.engine(message)
     }
 
     func closeBestEffort() {
-        let pointer = prepareClose()
+        let pointer = beginClose()
         if let pointer {
-            _ = oliphaunt_swift_close(pointer)
+            let rc = oliphaunt_swift_close(pointer)
+            finishClose(detached: rc == 0)
         }
-        cleanupRoot()
     }
 
     private func beginCall() throws -> OpaquePointer {
@@ -522,12 +782,27 @@ private final class NativeSessionBox: @unchecked Sendable {
         defer {
             condition.unlock()
         }
-        while !closed && activeCalls > 0 {
+        while !closing && !closed && activeCalls > 0 {
             condition.wait()
         }
-        guard let pointer, !closed else {
+        guard let pointer, !closing, !closed else {
             throw OliphauntError.databaseClosed
         }
+        activeCalls += 1
+        return pointer
+    }
+
+    private func beginCancellation() throws -> OpaquePointer {
+        condition.lock()
+        defer {
+            condition.unlock()
+        }
+        guard let pointer, !closing, !closed else {
+            throw OliphauntError.databaseClosed
+        }
+        // Cancellation is intentionally out of band and may overlap the
+        // serialized query call it interrupts. Counting it here still makes
+        // close wait until the native cancel call has released the pointer.
         activeCalls += 1
         return pointer
     }
@@ -539,32 +814,35 @@ private final class NativeSessionBox: @unchecked Sendable {
         condition.unlock()
     }
 
-    private func prepareClose() -> OpaquePointer? {
+    private func beginClose() -> OpaquePointer? {
         condition.lock()
+        while closing {
+            condition.wait()
+        }
         if closed {
             condition.unlock()
             return nil
         }
-        closed = true
+        closing = true
         let pointer = self.pointer
         while activeCalls > 0 {
             condition.wait()
         }
-        self.pointer = nil
         condition.unlock()
         return pointer
     }
 
-    private func cleanupRoot() {
-        if deleteRootOnClose {
-            /*
-             Native direct close is a logical detach. The resident PostgreSQL
-             backend may still own PGDATA until process exit, so deleting a
-             temporary root here would corrupt the live runtime.
-             */
-            _ = root
+    private func finishClose(detached: Bool) {
+        condition.lock()
+        if detached {
+            pointer = nil
+            closed = true
         }
+        closing = false
+        condition.broadcast()
+        condition.unlock()
     }
+
 }
 
 private final class NativeStreamCallbackBox: @unchecked Sendable {
@@ -575,6 +853,7 @@ private final class NativeStreamCallbackBox: @unchecked Sendable {
         self.onChunk = onChunk
     }
 }
+
 
 private func withCStringArray<T>(
     _ strings: [String],

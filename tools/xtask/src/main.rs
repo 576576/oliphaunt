@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,12 +14,12 @@ mod asset_checks;
 mod asset_io;
 mod asset_manifest;
 mod asset_pipeline;
+mod cluster_seed_runner;
 mod extension_catalog;
 mod fs_utils;
 mod postgres_guard;
 mod release_workspace;
 mod source_spine;
-mod template_runner;
 
 use crate::aot_serializer::aot_serializer;
 use crate::asset_checks::*;
@@ -39,7 +39,7 @@ use crate::release_workspace::{
 };
 use crate::source_spine::{
     SourceFetchScope, check_source_spine_for_source_lane, check_sources_manifest,
-    check_sources_manifest_for_asset_build, fetch_pinned_sources_for_source_lane,
+    check_sources_manifest_for_wasix_asset_build, fetch_pinned_sources_for_source_lane,
     load_sources_manifest, load_wasix_toolchain_manifest, validate_sources_manifest,
 };
 
@@ -71,6 +71,7 @@ const DEFAULT_ASSET_BUILD_PROFILE: &str = "release";
 const SOURCE_CHECKOUT_ROOT: &str = "target/oliphaunt-sources/checkouts";
 const GENERATED_ASSETS_DIR: &str = "target/oliphaunt-wasix/assets";
 const GENERATED_AOT_DIR: &str = "target/oliphaunt-wasix/aot";
+const RUNTIME_MODULE_ARCHIVE_MEMBER: &str = "oliphaunt/bin/postgres";
 const ASSET_CRATE_PAYLOAD_DIR: &str = "src/runtimes/liboliphaunt/wasix/crates/assets/payload";
 const RELEASE_STAGE_DIR: &str = "target/oliphaunt-wasix/release";
 const RELEASE_ASSET_BUNDLE_DIR: &str = "target/oliphaunt-wasix/release-assets";
@@ -89,22 +90,45 @@ const RUST_HOST_REQUIRED_RUNTIME_EXPORTS: &[&str] = &[
     "PostgresMainLongJmp",
     "oliphaunt_wasix_protocol_stream_active",
     "oliphaunt_wasix_input_reset",
-    "oliphaunt_wasix_input_write",
+    "oliphaunt_wasix_input_reserve",
+    "oliphaunt_wasix_input_commit",
     "oliphaunt_wasix_input_available",
     "oliphaunt_wasix_output_reset",
     "oliphaunt_wasix_output_len",
-    "oliphaunt_wasix_output_read",
+    "oliphaunt_wasix_output_data",
+    "oliphaunt_wasix_output_contains_error",
 ];
 const RUST_HOST_OPTIONAL_RUNTIME_EXPORTS: &[&str] = &[
     "oliphaunt_wasix_set_force_host_error_recovery",
     "oliphaunt_wasix_run_atexit_funcs",
-    "oliphaunt_wasix_backend_timing_reset",
-    "oliphaunt_wasix_backend_timing_elapsed_us",
     "oliphaunt_wasix_set_protocol_transport",
 ];
 const RUNTIME_EXPORT_LIST_COMPAT_EXPORTS: &[&str] = &[
-    "oliphaunt_wasix_set_protocol_stdio",
     "oliphaunt_wasix_set_force_host_error_recovery",
+    "oliphaunt_wasix_set_protocol_transport",
+];
+const REQUIRED_RUNTIME_ABI_EXPORTS: &[&str] = &[
+    "_start",
+    "oliphaunt_wasix_set_active",
+    "oliphaunt_wasix_start",
+    "oliphaunt_wasix_get_proc_port",
+    "ProcessStartupPacket",
+    "oliphaunt_wasix_send_conn_data",
+    "oliphaunt_wasix_pq_flush",
+    "pq_buffer_remaining_data",
+    "PostgresMainLoopOnce",
+    "PostgresSendReadyForQueryIfNecessary",
+    "PostgresMainLongJmp",
+    "oliphaunt_wasix_set_force_host_error_recovery",
+    "oliphaunt_wasix_protocol_stream_active",
+    "oliphaunt_wasix_input_reset",
+    "oliphaunt_wasix_input_reserve",
+    "oliphaunt_wasix_input_commit",
+    "oliphaunt_wasix_input_available",
+    "oliphaunt_wasix_output_reset",
+    "oliphaunt_wasix_output_len",
+    "oliphaunt_wasix_output_data",
+    "oliphaunt_wasix_output_contains_error",
     "oliphaunt_wasix_set_protocol_transport",
 ];
 const PG18_POSTGRES_HOST_EXPORTS: &[&str] = &[
@@ -171,10 +195,10 @@ fn assets(args: Vec<String>) -> Result<()> {
             let target = value_after(&args, "--target-triple").unwrap_or(env::consts::ARCH);
             build_asset_spine(&manifest, profile, target, &args)
         }
-        Some("template") => {
+        Some("cluster-seeds") => {
             let manifest = check_sources_manifest(false)?;
             let source_lane = value_after(&args, "--source-lane").unwrap_or(DEFAULT_SOURCE_LANE);
-            generate_pgdata_template_asset(&manifest, source_lane)
+            generate_cluster_seed_assets(&manifest, source_lane)
         }
         Some("fetch") => {
             let manifest = load_sources_manifest()?;
@@ -182,7 +206,7 @@ fn assets(args: Vec<String>) -> Result<()> {
             let source_lane = value_after(&args, "--source-lane").unwrap_or(DEFAULT_SOURCE_LANE);
             let prepare_postgres_source = !args.iter().any(|arg| arg == "--skip-postgres-prepare");
             let source_scope =
-                SourceFetchScope::parse(value_after(&args, "--scope").unwrap_or("all"))?;
+                SourceFetchScope::parse(value_after(&args, "--scope").unwrap_or("production-all"))?;
             fetch_pinned_sources_for_source_lane(
                 &manifest,
                 source_lane,
@@ -191,13 +215,13 @@ fn assets(args: Vec<String>) -> Result<()> {
             )
         }
         Some("release-build") => {
-            let manifest = check_sources_manifest_for_asset_build(&args)?;
+            let manifest = check_sources_manifest_for_wasix_asset_build(&args)?;
             let profile = value_after(&args, "--profile").unwrap_or(DEFAULT_ASSET_BUILD_PROFILE);
             let target = value_after(&args, "--target-triple").unwrap_or(host_target_triple());
             release_build_assets(&manifest, profile, target, &args)
         }
         Some("build-host") => {
-            let manifest = check_sources_manifest_for_asset_build(&args)?;
+            let manifest = check_sources_manifest_for_wasix_asset_build(&args)?;
             release_build_assets(
                 &manifest,
                 DEFAULT_ASSET_BUILD_PROFILE,
@@ -268,7 +292,7 @@ fn assets(args: Vec<String>) -> Result<()> {
         Some(other) => bail!("unknown assets subcommand: {other}"),
         None => {
             bail!(
-                "usage: cargo run -p xtask -- assets <check|verify-committed|audit-upstream|source-spine|fetch|build|template|build-host|release-build|download|install-local|update-root-metadata|ci-matrix|ci-artifacts|aot-targets|internal-packages|package|package-aot|check-aot|smoke>"
+                "usage: cargo run -p xtask -- assets <check|verify-committed|audit-upstream|source-spine|fetch|build|cluster-seeds|build-host|release-build|download|install-local|update-root-metadata|ci-matrix|ci-artifacts|aot-targets|internal-packages|package|package-aot|check-aot|smoke>"
             )
         }
     }
@@ -489,7 +513,7 @@ fn print_usage() {
         "  cargo run -p xtask -- assets source-spine [--strict-local] [--check-patch-applies]"
     );
     eprintln!(
-        "  cargo run -p xtask -- assets fetch [--skip-postgres-prepare] [--scope all|native-runtime|wasix-runtime|extensions]"
+        "  cargo run -p xtask -- assets fetch [--skip-postgres-prepare] [--scope production-all|all|native-runtime|wasix-runtime|extensions]"
     );
     eprintln!("  cargo run -p xtask --features aot-serializer -- assets build-host");
     eprintln!(
@@ -507,9 +531,9 @@ fn print_usage() {
     eprintln!(
         "  cargo run -p xtask -- assets build --profile release --target-triple <triple> [--execute]"
     );
-    eprintln!("  cargo run -p xtask --features template-runner -- assets template");
+    eprintln!("  cargo run -p xtask --features cluster-seed-runner -- assets cluster-seeds");
     eprintln!(
-        "  cargo run -p xtask --features template-runner -- assets release-build --profile release --target-triple <triple> [--fetch]"
+        "  cargo run -p xtask --features cluster-seed-runner -- assets release-build --profile release --target-triple <triple> [--fetch]"
     );
     eprintln!("  cargo run -p xtask -- assets aot --target-triple <triple>");
     eprintln!(

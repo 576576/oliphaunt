@@ -157,16 +157,26 @@ async function runWorker() {
   throw new Error(`unknown cleanup lifecycle worker role: ${role}`);
 }
 
-async function collectGarbageUntilFinalized(logPath) {
+async function collectGarbageUntilFinalized(logPath, expectedEvent = "detach") {
   assert.equal(typeof globalThis.gc, "function", "GC lifecycle child must run with --expose-gc");
   for (let attempt = 0; attempt < 200; attempt += 1) {
     globalThis.gc();
     await new Promise((resolve) => setImmediate(resolve));
-    if (eventsFrom(logPath).includes("detach")) {
+    if (eventsFrom(logPath).includes(expectedEvent)) {
       return;
     }
   }
   throw new Error("Node did not finalize the unreachable native handle after 200 forced GC cycles");
+}
+
+async function waitForEvent(logPath, expectedEvent) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (eventsFrom(logPath).includes(expectedEvent)) {
+      return;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`native lifecycle event did not arrive: ${expectedEvent}`);
 }
 
 async function runChild(options) {
@@ -214,6 +224,54 @@ async function runChild(options) {
       handle = undefined;
       assert.equal(handle, undefined);
       await collectGarbageUntilFinalized(options.log);
+      return;
+    }
+    case "gc-detach-recovery": {
+      let handle = openFake(addon, options.library, options.root);
+      handle = undefined;
+      assert.equal(handle, undefined);
+      await collectGarbageUntilFinalized(options.log, "detach-failed");
+      const recovered = openFake(addon, options.library, options.root);
+      addon.detach(recovered);
+      assert.equal(
+        eventsFrom(options.log).includes("init-while-active"),
+        false,
+        "reopen must recover the retained failed-detach owner before init",
+      );
+      return;
+    }
+    case "async-query-cancel": {
+      const handle = openFake(addon, options.library, options.root);
+      const query = addon.execProtocolRaw(handle, new Uint8Array([1]));
+      assert.equal(query instanceof Promise, true, "native query must return a Promise");
+      await waitForEvent(options.log, "query-started");
+      addon.cancel(handle);
+      await assert.rejects(query, /fake query was cancelled/u);
+      addon.detach(handle);
+      return;
+    }
+    case "async-archive-timers": {
+      const handle = openFake(addon, options.library, options.root);
+      let backupSettled = false;
+      const backup = addon.backup(handle).finally(() => {
+        backupSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(backupSettled, false, "backup must not block the Node.js event loop");
+      assert.deepEqual([...await backup], [1, 2, 3]);
+
+      let restoreSettled = false;
+      const restore = addon.restore({
+        libraryPath: options.library,
+        destination: path.join(options.root, "restored"),
+        bytes: new Uint8Array([1, 2, 3]),
+      }).finally(() => {
+        restoreSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(restoreSettled, false, "restore must not block the Node.js event loop");
+      await restore;
+      addon.detach(handle);
       return;
     }
     case "generation-acquisition-race": {
@@ -496,6 +554,29 @@ async function runParent(options) {
         exposeGc: true,
       },
       {
+        name: "gc-detach-recovery",
+        expectedBeforeClose: ["init", "detach-failed", "detach", "init", "detach"],
+        exposeGc: true,
+        failDetachOnce: true,
+      },
+      {
+        name: "async-query-cancel",
+        expectedBeforeClose: ["init", "query-started", "cancel", "query-cancelled", "detach"],
+        blockQuery: true,
+      },
+      {
+        name: "async-archive-timers",
+        expectedBeforeClose: [
+          "init",
+          "backup-started",
+          "backup-finished",
+          "restore-started",
+          "restore-finished",
+          "detach",
+        ],
+        blockArchive: true,
+      },
+      {
         name: "generation-acquisition-race",
         generationAcquisitionRace: true,
       },
@@ -573,6 +654,15 @@ async function runParent(options) {
             ...(scenario.generationAcquisitionRace
               ? { OLIPHAUNT_NODE_CLEANUP_TEST_CLOSE_BEFORE_GENERATION: "1" }
               : {}),
+            ...(scenario.failDetachOnce
+              ? { OLIPHAUNT_NODE_CLEANUP_TEST_FAIL_DETACH_ONCE: "1" }
+              : {}),
+            ...(scenario.blockQuery
+              ? { OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_QUERY: "1" }
+              : {}),
+            ...(scenario.blockArchive
+              ? { OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_ARCHIVE: "1" }
+              : {}),
           },
           timeout: 30_000,
         });
@@ -619,7 +709,7 @@ async function runParent(options) {
   }
 
   console.log(
-    "Node direct environment cleanup lifecycle passed (32 single-image + 5 copied-image + 1 stale-acquisition cases)",
+    "Node direct environment cleanup lifecycle passed (35 single-image + 5 copied-image + 1 stale-acquisition cases)",
   );
 }
 

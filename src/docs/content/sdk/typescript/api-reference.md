@@ -1,25 +1,29 @@
 ---
-title: API Reference
-description: TypeScript SDK API map for desktop JavaScript, native assets, broker helpers, SQL, lifecycle, and data movement.
+title: TypeScript API Reference
+description: TypeScript API map for desktop JavaScript, native engines, SQL, lifecycle, and data movement.
 ---
 
-# API Reference
+# TypeScript API Reference
 
-Use the TypeDoc reference for exact declarations. This page maps the TypeScript
-SDK by task.
+Use the TypeDoc reference for exact declarations. This page maps native
+`@oliphaunt/ts` by task; WASIX TypeScript is documented separately.
 
 | Area | Public surface | Use it for |
 | --- | --- | --- |
-| Opening | `Oliphaunt.open`, `OpenConfig` | Open a native direct, broker, or server-backed database from Node.js, Bun, or Deno |
-| Native assets | asset resolver exports | Locate released runtime artifacts from the package |
-| Runtime mode | `engine`, `supportedModes()` | Choose direct, broker, or server where the desktop runtime supports it |
-| Capabilities | `capabilities()` | Check protocol, streaming, backup, restore, extension, and lifecycle support |
+| Opening | `Oliphaunt.open`, `OpenConfig`, `DatabaseStorage` | Open with temporary storage by default or an explicit persistent directory |
+| Execution | `execution` | Use direct execution (the default) or select broker execution |
+| Server | `Oliphaunt.openServer` | Start PostgreSQL as a server for tools and independent clients |
 | SQL | `query`, `execute`, typed result helpers | Run SQL and read typed values from JavaScript |
-| Raw protocol | `execProtocolRaw`, protocol utilities | Send PostgreSQL protocol bytes through the selected native path |
-| Streaming | `execProtocolStream` | Consume large result sets without materializing one huge JS buffer |
-| Broker/server helpers | helper process APIs | Start or connect to a local helper when isolation or PostgreSQL-compatible clients are needed |
-| Data movement | `backup`, `restore`, archive helpers | Move roots through validated physical archives |
-| Errors | `OliphauntError`, `PostgresError` | Handle SDK errors and SQLSTATE data |
+| Raw protocol | `execProtocolRaw`, `execProtocolStream` | Send PostgreSQL protocol bytes as one owned response or callback chunks through the selected native path |
+| Data movement | `backup`, `restore` | Move the native physical archive to a new or empty destination |
+| Optional tools | `pgDump`, `psql`, `PostgresToolError` from `@oliphaunt/tools` | Run standard logical tools against a native server connection string without adding tools to the core SDK |
+| Errors | `PostgresError` | Handle SQLSTATE-bearing PostgreSQL failures |
+
+The root package is the only native runtime entrypoint. It detects Node.js,
+Bun, or Deno and resolves the matching installed runtime internally; native
+binding factories, runtime handles, and runtime-specific package subpaths are
+not consumer APIs.
 
 React Native apps use `@oliphaunt/react-native`. This package is for desktop
-JavaScript runtimes.
+JavaScript runtimes over the native runtime family. Browser applications use
+[`@oliphaunt/wasix-ts`](/docs/sdk/wasix-typescript).

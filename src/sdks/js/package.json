@@ -34,11 +34,7 @@
     "@oliphaunt/node-direct-darwin-arm64": "workspace:0.1.1",
     "@oliphaunt/node-direct-linux-arm64-gnu": "workspace:0.1.1",
     "@oliphaunt/node-direct-linux-x64-gnu": "workspace:0.1.1",
-    "@oliphaunt/node-direct-win32-x64-msvc": "workspace:0.1.1",
-    "@oliphaunt/tools-darwin-arm64": "workspace:0.1.1",
-    "@oliphaunt/tools-linux-arm64-gnu": "workspace:0.1.1",
-    "@oliphaunt/tools-linux-x64-gnu": "workspace:0.1.1",
-    "@oliphaunt/tools-win32-x64-msvc": "workspace:0.1.1"
+    "@oliphaunt/node-direct-win32-x64-msvc": "workspace:0.1.1"
   },
   "publishConfig": {
     "access": "public",
@@ -48,18 +44,6 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
-    },
-    "./node": {
-      "types": "./lib/native/node.d.ts",
-      "default": "./lib/native/node.js"
-    },
-    "./bun": {
-      "types": "./lib/native/bun.d.ts",
-      "default": "./lib/native/bun.js"
-    },
-    "./deno": {
-      "types": "./lib/native/deno.d.ts",
-      "default": "./lib/native/deno.js"
     },
     "./protocol": {
       "types": "./lib/protocol.d.ts",
@@ -79,7 +63,6 @@
   "files": [
     "lib",
     "src",
-    "jsr.json",
     "README.md",
     "ARCHITECTURE.md",
     "CHANGELOG.md",
@@ -88,11 +71,11 @@
     "!src/__tests__"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node ../../../tools/dev/clean-package-lib.mjs && tsc -p tsconfig.build.json",
     "docs:api": "typedoc --options typedoc.json",
     "test": "node ../../../tools/test/run-js-tests.mjs src/__tests__",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf lib"
+    "clean": "node ../../../tools/dev/clean-package-lib.mjs"
   },
   "engines": {
     "node": ">=22.13 <25"
@@ -100,7 +83,6 @@
   "devDependencies": {
     "@types/node": "^24.10.1",
     "@vitest/coverage-v8": "catalog:",
-    "jsr": "^0.14.3",
     "tsx": "catalog:",
     "typedoc": "catalog:",
     "typescript": "catalog:",

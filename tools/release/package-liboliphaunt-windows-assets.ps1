@@ -141,7 +141,7 @@ foreach ($EmbeddedModule in $EmbeddedModuleEntries) {
         Fail "Windows embedded module must be a regular non-link file: $($EmbeddedModule.FullName)"
     }
 }
-foreach ($Tool in @("initdb.exe", "pg_ctl.exe", "pg_dump.exe", "postgres.exe", "psql.exe")) {
+foreach ($Tool in @("initdb.exe", "pg_basebackup.exe", "pg_ctl.exe", "pg_dump.exe", "postgres.exe", "psql.exe")) {
     $ToolPath = Join-Path (Join-Path $Runtime "bin") $Tool
     if (-not (Test-Path $ToolPath)) {
         Fail "missing Windows $Tool at $ToolPath"
@@ -149,7 +149,7 @@ foreach ($Tool in @("initdb.exe", "pg_ctl.exe", "pg_dump.exe", "postgres.exe", "
 }
 
 Write-Output "==> Verifying base liboliphaunt $TargetId runtime is extension-clean"
-cargo run -p oliphaunt --bin oliphaunt-resources --locked -- --list-extensions > $CatalogFile
+cargo run -p oliphaunt-native-packaging --bin oliphaunt-resources --locked -- --list-extensions > $CatalogFile
 if ($LASTEXITCODE -ne 0) {
     Fail "failed to read exact extension catalog"
 }
@@ -157,6 +157,13 @@ Assert-BaseRuntimeHasNoOptionalExtensions $CatalogFile $Runtime
 
 Copy-Item -Recurse -Force (Join-Path $HeadersDir "*") (Join-Path $Stage "include")
 Copy-Item -Force $Dll (Join-Path $Stage "bin")
+foreach ($IcuDll in @("icudt76.dll", "icuin76.dll", "icuuc76.dll")) {
+    $IcuDllPath = Join-Path $WorkRoot "out/bin/$IcuDll"
+    if (-not (Test-Path -LiteralPath $IcuDllPath -PathType Leaf)) {
+        Fail "missing Windows ICU runtime DLL at $IcuDllPath"
+    }
+    Copy-Item -LiteralPath $IcuDllPath -Destination (Join-Path $Stage "bin/$IcuDll") -Force
+}
 Copy-Item -Force $ImportLib (Join-Path $Stage "lib")
 Copy-Item -Recurse -Force (Join-Path $EmbeddedModules "*") (Join-Path $Stage "lib/modules")
 Copy-Item -Recurse -Force (Join-Path $Runtime "*") (Join-Path $Stage "runtime")
@@ -169,7 +176,7 @@ Copy-Item -Recurse -Force (Join-Path $Runtime "*") (Join-Path $Stage "runtime")
 if ($LASTEXITCODE -ne 0) {
     Fail "failed to stage the app-local VC runtime beside oliphaunt.dll"
 }
-foreach ($Tool in @("pg_dump.exe", "psql.exe")) {
+foreach ($Tool in @("pg_basebackup.exe", "pg_dump.exe", "psql.exe")) {
     Copy-Item -Force (Join-Path (Join-Path $Runtime "bin") $Tool) (Join-Path (Join-Path $ToolsStage "runtime/bin") $Tool)
     Remove-Item -Force (Join-Path (Join-Path $Stage "runtime/bin") $Tool)
 }
@@ -183,6 +190,33 @@ if ($LASTEXITCODE -ne 0) {
 $StagedIcu = Join-Path $Stage "runtime/share/icu"
 if (Test-Path $StagedIcu) {
     Remove-Item -Recurse -Force $StagedIcu
+}
+& bun tools/release/stage-native-cluster-seed.mjs `
+    --runtime $Runtime `
+    --destination (Join-Path $Stage "cluster-seed") `
+    --target $TargetId `
+    --profile standard
+if ($LASTEXITCODE -ne 0) {
+    Fail "failed to stage the standard native cluster seed"
+}
+$IcuData = Join-Path $WorkRoot "icu/share/icu"
+& bun tools/release/stage-native-cluster-seed.mjs `
+    --runtime $Runtime `
+    --destination (Join-Path $Stage "cluster-seed-icu") `
+    --target $TargetId `
+    --profile icu `
+    --icu-data $IcuData
+if ($LASTEXITCODE -ne 0) {
+    Fail "failed to stage the ICU native cluster seed"
+}
+& bun tools/release/finalize-native-runtime-carrier.mjs `
+    --root $Stage `
+    --target $TargetId `
+    --icu-data $IcuData `
+    --runtime-source $Runtime `
+    --embedded-modules $EmbeddedModules
+if ($LASTEXITCODE -ne 0) {
+    Fail "failed to validate the native runtime carrier"
 }
 
 Write-Output "==> Optimizing staged liboliphaunt $TargetId release payload"
@@ -216,7 +250,10 @@ $env:LIBOLIPHAUNT_PATH = Join-Path $Stage "bin/oliphaunt.dll"
 $env:OLIPHAUNT_INSTALL_DIR = Join-Path $Stage "runtime"
 $env:OLIPHAUNT_SMOKE_BIN_DIR = Join-Path $StageRoot "smoke-bin-$TargetId"
 $env:OLIPHAUNT_SMOKE_ROOT = $SmokeRoot
-node src/runtimes/liboliphaunt/native/tools/run-host-c-smoke.mjs
+$env:OLIPHAUNT_STANDARD_CLUSTER_SEED = Join-Path $Stage "cluster-seed"
+$env:OLIPHAUNT_ICU_CLUSTER_SEED = Join-Path $Stage "cluster-seed-icu"
+$env:OLIPHAUNT_ICU_DATA_DIR = $IcuData
+node src/runtimes/liboliphaunt/native/tools/run-host-c-smoke.mjs --cluster-seeds
 if ($LASTEXITCODE -ne 0) {
     Fail "staged Windows liboliphaunt release smoke failed"
 }

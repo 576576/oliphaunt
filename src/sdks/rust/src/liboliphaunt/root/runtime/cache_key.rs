@@ -12,33 +12,45 @@ use super::super::fingerprint::{
     fingerprint_named_extension_sql_files, fingerprint_optional_file, hash_path, hash_str,
     new_state,
 };
-use super::super::{
-    NATIVE_RUNTIME_TOOLS, NATIVE_TOOLS_PACKAGE_TOOLS, existing_native_tool_path, native_tool_path,
-};
+use super::super::{NATIVE_RUNTIME_TOOLS, existing_native_tool_path, native_tool_path};
 use super::extension_artifact_root_for;
 use crate::error::{Error, Result};
 use crate::extension::Extension;
 
-const RUNTIME_CACHE_VERSION: &str = "pg18-runtime-cache-v6";
+const RUNTIME_CACHE_VERSION: &str = "pg18-runtime-cache-v7";
 
+#[cfg(test)]
 pub(super) fn runtime_cache_key(
     profile: NativeRuntimeProfile,
     install_dir: &Path,
-    tools_dir: Option<&Path>,
     embedded_modules: Option<&Path>,
     extension_artifact_dirs: &[PathBuf],
     extensions: &[Extension],
+) -> Result<String> {
+    runtime_cache_key_with_icu(
+        profile,
+        install_dir,
+        embedded_modules,
+        extension_artifact_dirs,
+        extensions,
+        None,
+        None,
+    )
+}
+
+pub(super) fn runtime_cache_key_with_icu(
+    profile: NativeRuntimeProfile,
+    install_dir: &Path,
+    embedded_modules: Option<&Path>,
+    extension_artifact_dirs: &[PathBuf],
+    extensions: &[Extension],
+    icu_data: Option<&Path>,
+    icu_data_tree_sha256: Option<&str>,
 ) -> Result<String> {
     let mut state = new_state();
     hash_str(&mut state, RUNTIME_CACHE_VERSION);
     hash_str(&mut state, profile.cache_id());
     hash_path(&mut state, &canonical_or_original(install_dir));
-    if let Some(tools_dir) = tools_dir {
-        hash_str(&mut state, "native-tools");
-        hash_path(&mut state, &canonical_or_original(tools_dir));
-    } else {
-        hash_str(&mut state, "native-tools:none");
-    }
     if let Some(embedded_modules) = embedded_modules {
         hash_path(&mut state, &canonical_or_original(embedded_modules));
     }
@@ -46,6 +58,22 @@ pub(super) fn runtime_cache_key(
 
     for name in selected_extension_names(extensions) {
         hash_str(&mut state, name);
+    }
+    hash_str(
+        &mut state,
+        if icu_data.is_some() {
+            "catalog-icu"
+        } else {
+            "catalog-standard"
+        },
+    );
+    if let Some(icu_data) = icu_data {
+        if let Some(digest) = icu_data_tree_sha256 {
+            hash_str(&mut state, "package-icu-data-tree-sha256");
+            hash_str(&mut state, digest);
+        } else {
+            fingerprint_directory_filtered(&mut state, icu_data, icu_data, |_| true)?;
+        }
     }
 
     for tool in NATIVE_RUNTIME_TOOLS {
@@ -55,15 +83,6 @@ pub(super) fn runtime_cache_key(
             &existing_native_tool_path(install_dir, tool),
         )?;
     }
-    let tools_dir = tools_dir.unwrap_or(install_dir);
-    for tool in NATIVE_TOOLS_PACKAGE_TOOLS {
-        fingerprint_optional_file(
-            &mut state,
-            tools_dir,
-            &existing_native_tool_path(tools_dir, tool),
-        )?;
-    }
-
     let source_share = install_dir.join("share/postgresql");
     fingerprint_directory_filtered(&mut state, &source_share, &source_share, core_share_file)?;
     fingerprint_named_extension_sql_files(&mut state, &source_share, "plpgsql")?;
@@ -165,17 +184,25 @@ pub(super) fn runtime_cache_key(
     Ok(format!("{state:016x}"))
 }
 
+#[cfg(test)]
 pub(super) fn cached_runtime_is_valid(
     profile: NativeRuntimeProfile,
     cache_dir: &Path,
     key: &str,
     extensions: &[Extension],
 ) -> bool {
+    cached_runtime_is_valid_with_icu(profile, cache_dir, key, extensions, false)
+}
+
+pub(super) fn cached_runtime_is_valid_with_icu(
+    profile: NativeRuntimeProfile,
+    cache_dir: &Path,
+    key: &str,
+    extensions: &[Extension],
+    has_icu_data: bool,
+) -> bool {
     if !cache_dir.join(".complete").is_file()
         || !NATIVE_RUNTIME_TOOLS
-            .iter()
-            .all(|tool| native_tool_path(cache_dir, tool).is_file())
-        || !NATIVE_TOOLS_PACKAGE_TOOLS
             .iter()
             .all(|tool| native_tool_path(cache_dir, tool).is_file())
         || !cache_dir
@@ -197,6 +224,13 @@ pub(super) fn cached_runtime_is_valid(
             .lines()
             .any(|line| line == format!("profile={}", profile.cache_id()))
         || !manifest.lines().any(|line| line == format!("key={key}"))
+        || !manifest.lines().any(|line| {
+            line == format!(
+                "catalogProfile={}",
+                if has_icu_data { "icu" } else { "standard" }
+            )
+        })
+        || (has_icu_data && !cache_dir.join("share/icu").is_dir())
     {
         return false;
     }
@@ -247,15 +281,26 @@ fn cache_contains_extension_sql_file(cache_dir: &Path, extension: Extension) -> 
     })
 }
 
+#[cfg(test)]
 pub(super) fn runtime_cache_manifest(
     profile: NativeRuntimeProfile,
     key: &str,
     extensions: &[Extension],
 ) -> String {
+    runtime_cache_manifest_with_icu(profile, key, extensions, false)
+}
+
+pub(super) fn runtime_cache_manifest_with_icu(
+    profile: NativeRuntimeProfile,
+    key: &str,
+    extensions: &[Extension],
+    has_icu_data: bool,
+) -> String {
     let extension_names = selected_extension_names(extensions);
     format!(
-        "version={RUNTIME_CACHE_VERSION}\nprofile={}\nkey={key}\nextensions={}\n",
+        "version={RUNTIME_CACHE_VERSION}\nprofile={}\ncatalogProfile={}\nkey={key}\nextensions={}\n",
         profile.cache_id(),
+        if has_icu_data { "icu" } else { "standard" },
         extension_names.join(",")
     )
 }
@@ -307,7 +352,6 @@ mod tests {
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
             None,
-            None,
             &[],
             &[Extension::Hstore],
         )
@@ -320,7 +364,6 @@ mod tests {
         let changed_sql = runtime_cache_key(
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
-            None,
             None,
             &[],
             &[Extension::Hstore],
@@ -340,7 +383,6 @@ mod tests {
         let changed_module = runtime_cache_key(
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
-            None,
             None,
             &[],
             &[Extension::Hstore],
@@ -370,7 +412,6 @@ mod tests {
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
             None,
-            None,
             std::slice::from_ref(&extension_dir),
             &[Extension::Hstore],
         )
@@ -384,7 +425,6 @@ mod tests {
         let second = runtime_cache_key(
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
-            None,
             None,
             std::slice::from_ref(&extension_dir),
             &[Extension::Hstore],
@@ -425,7 +465,6 @@ mod tests {
         let first = runtime_cache_key(
             NativeRuntimeProfile::OliphauntEmbedded,
             &install_dir,
-            None,
             Some(&embedded_modules),
             std::slice::from_ref(&extension_dir),
             &[Extension::Hstore],
@@ -439,7 +478,6 @@ mod tests {
         let server_changed = runtime_cache_key(
             NativeRuntimeProfile::OliphauntEmbedded,
             &install_dir,
-            None,
             Some(&embedded_modules),
             std::slice::from_ref(&extension_dir),
             &[Extension::Hstore],
@@ -457,7 +495,6 @@ mod tests {
         let embedded_changed = runtime_cache_key(
             NativeRuntimeProfile::OliphauntEmbedded,
             &install_dir,
-            None,
             Some(&embedded_modules),
             &[extension_dir],
             &[Extension::Hstore],
@@ -478,7 +515,6 @@ mod tests {
         let first = runtime_cache_key(
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
-            None,
             None,
             &[],
             &[],
@@ -503,7 +539,6 @@ mod tests {
         let second = runtime_cache_key(
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
-            None,
             None,
             &[],
             &[],
@@ -533,7 +568,6 @@ mod tests {
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
             None,
-            None,
             &[],
             &[],
         )
@@ -547,7 +581,6 @@ mod tests {
             NativeRuntimeProfile::PostgresServer,
             &install_dir,
             None,
-            None,
             &[],
             &[],
         )
@@ -557,6 +590,87 @@ mod tests {
             first, second,
             "external ICU package contents must not change the base runtime cache identity"
         );
+    }
+
+    #[test]
+    fn managed_icu_uses_receipt_identity_while_unmanaged_icu_hashes_the_tree() {
+        let temp = TempTree::new("icu-receipt-identity");
+        let install_dir = temp.path().join("install");
+        let icu_data = temp.path().join("icu");
+        let first_digest = "a".repeat(64);
+        let second_digest = "b".repeat(64);
+        write_fake_install(&install_dir);
+        write_file(&icu_data.join("icudt76l.dat"), b"icu-data-v1");
+
+        let managed_first = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&icu_data),
+            Some(&first_digest),
+        )
+        .expect("create managed ICU runtime key");
+        write_file(&icu_data.join("icudt76l.dat"), b"icu-data-v2");
+        let managed_same_receipt = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&icu_data),
+            Some(&first_digest),
+        )
+        .expect("create managed ICU runtime key after tree mutation");
+        let managed_without_tree_access = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&temp.path().join("missing-managed-icu-tree")),
+            Some(&first_digest),
+        )
+        .expect("create managed ICU runtime key without reading the tree");
+        let managed_changed_receipt = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&icu_data),
+            Some(&second_digest),
+        )
+        .expect("create managed ICU runtime key with changed receipt");
+
+        assert_eq!(managed_first, managed_same_receipt);
+        assert_eq!(managed_same_receipt, managed_without_tree_access);
+        assert_ne!(managed_same_receipt, managed_changed_receipt);
+
+        let unmanaged_first = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&icu_data),
+            None,
+        )
+        .expect("create unmanaged ICU runtime key");
+        write_file(&icu_data.join("icudt76l.dat"), b"icu-data-v3");
+        let unmanaged_changed = runtime_cache_key_with_icu(
+            NativeRuntimeProfile::PostgresServer,
+            &install_dir,
+            None,
+            &[],
+            &[],
+            Some(&icu_data),
+            None,
+        )
+        .expect("create changed unmanaged ICU runtime key");
+
+        assert_ne!(unmanaged_first, unmanaged_changed);
     }
 
     #[test]
@@ -642,24 +756,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_validation_requires_split_tools() {
-        let temp = TempTree::new("validation-tools");
-        let cache_dir = temp.path().join("cache");
-        write_minimal_cache_dir(&cache_dir, "cache-key");
-        std::fs::remove_file(cache_dir.join("bin/pg_dump")).expect("remove pg_dump");
-
-        assert!(
-            !cached_runtime_is_valid(
-                NativeRuntimeProfile::PostgresServer,
-                &cache_dir,
-                "cache-key",
-                &[],
-            ),
-            "runtime cache must require tools from the split oliphaunt-tools artifact"
-        );
-    }
-
-    #[test]
     fn embedded_runtime_validation_requires_profile_and_core_modules() {
         let temp = TempTree::new("validation-embedded-core");
         let cache_dir = temp.path().join("cache");
@@ -708,7 +804,14 @@ mod tests {
     }
 
     fn write_fake_install(install_dir: &Path) {
-        for tool in ["postgres", "initdb", "pg_ctl", "pg_dump", "psql"] {
+        for tool in [
+            "postgres",
+            "initdb",
+            "pg_ctl",
+            "pg_basebackup",
+            "pg_dump",
+            "psql",
+        ] {
             write_file(&install_dir.join("bin").join(tool), tool.as_bytes());
         }
         write_file(
@@ -765,6 +868,7 @@ mod tests {
         write_file(&cache_dir.join("bin/postgres"), b"postgres");
         write_file(&cache_dir.join("bin/initdb"), b"initdb");
         write_file(&cache_dir.join("bin/pg_ctl"), b"pg_ctl");
+        write_file(&cache_dir.join("bin/pg_basebackup"), b"pg_basebackup");
         write_file(&cache_dir.join("bin/pg_dump"), b"pg_dump");
         write_file(&cache_dir.join("bin/psql"), b"psql");
         write_file(

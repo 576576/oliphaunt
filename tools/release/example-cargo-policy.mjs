@@ -59,7 +59,6 @@ export const EXAMPLE_CARGO_POLICIES = Object.freeze([
     dependencyBindings: [
       dependencyBinding("oliphaunt-build", ["build-dependencies"]),
       dependencyBinding("oliphaunt", ["dependencies"]),
-      dependencyBinding("oliphaunt-tools", ["dependencies"]),
       dependencyBinding("liboliphaunt-native-linux-x64-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
       dependencyBinding("oliphaunt-broker-linux-x64-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
       dependencyBinding("oliphaunt-extension-contrib-pg18-linux-x64-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
@@ -72,7 +71,6 @@ export const EXAMPLE_CARGO_POLICIES = Object.freeze([
     requiredPackages: Object.freeze([
       "oliphaunt",
       "oliphaunt-build",
-      "oliphaunt-tools",
       "liboliphaunt-native-linux-x64-gnu",
       "oliphaunt-broker-linux-x64-gnu",
       "oliphaunt-extension-contrib-pg18-linux-x64-gnu",
@@ -85,9 +83,10 @@ export const EXAMPLE_CARGO_POLICIES = Object.freeze([
     wasixToolchain: true,
     dependencyBindings: [
       dependencyBinding("oliphaunt-wasix", ["dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools", ["dependencies"]),
+      dependencyBinding("oliphaunt-wasix", ["dev-dependencies"]),
+      dependencyBinding("oliphaunt-wasix-tools", ["dev-dependencies"]),
       dependencyBinding("liboliphaunt-wasix-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
+      dependencyBinding("oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dev-dependencies"]),
     ],
     requiredPackages: Object.freeze([
       "oliphaunt-wasix",
@@ -105,9 +104,10 @@ export const EXAMPLE_CARGO_POLICIES = Object.freeze([
     wasixToolchain: true,
     dependencyBindings: [
       dependencyBinding("oliphaunt-wasix", ["dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools", ["dependencies"]),
+      dependencyBinding("oliphaunt-wasix", ["dev-dependencies"]),
+      dependencyBinding("oliphaunt-wasix-tools", ["dev-dependencies"]),
       dependencyBinding("liboliphaunt-wasix-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
+      dependencyBinding("oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dev-dependencies"]),
     ],
     requiredPackages: Object.freeze([
       "oliphaunt-wasix",
@@ -116,24 +116,6 @@ export const EXAMPLE_CARGO_POLICIES = Object.freeze([
       "oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu",
       "oliphaunt-extension-contrib-pg18-wasix",
       "oliphaunt-extension-contrib-pg18-aot-linux-x64",
-    ]),
-  }),
-  exampleCargoPolicy({
-    id: "wasix-tauri-sqlx",
-    crateDir: "src/bindings/wasix-rust/examples/tauri-sqlx-vanilla/src-tauri",
-    ignoredLock: "src/bindings/wasix-rust/examples/tauri-sqlx-vanilla/src-tauri/Cargo.lock",
-    wasixToolchain: true,
-    dependencyBindings: [
-      dependencyBinding("oliphaunt-wasix", ["dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools", ["dependencies"]),
-      dependencyBinding("liboliphaunt-wasix-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
-      dependencyBinding("oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu", ["target", LINUX_X64_GNU_TARGET, "dependencies"]),
-    ],
-    requiredPackages: Object.freeze([
-      "oliphaunt-wasix",
-      "oliphaunt-wasix-tools",
-      "liboliphaunt-wasix-aot-x86_64-unknown-linux-gnu",
-      "oliphaunt-wasix-tools-aot-x86_64-unknown-linux-gnu",
     ]),
   }),
 ]);

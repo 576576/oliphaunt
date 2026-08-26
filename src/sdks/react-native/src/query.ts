@@ -1,5 +1,8 @@
 import { simpleQuery } from './protocol.js';
 
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+
 export type QueryBinaryInput = ArrayBuffer | ArrayBufferView | Uint8Array | ReadonlyArray<number>;
 
 export type QueryParam =
@@ -28,13 +31,30 @@ export type QueryRow = {
   text(column: number): string | null;
 };
 
+class ParsedQueryRow implements QueryRow {
+  constructor(readonly values: Array<Uint8Array | null>) {}
+
+  text(column: number): string | null {
+    if (column < 0 || column >= this.values.length) {
+      throw new Error(`query row has no column at index ${column}`);
+    }
+    const value = this.values[column]!;
+    return value === null ? null : decodeUtf8Strict(value, 'query value');
+  }
+}
+
 export type QueryResult = {
   fields: QueryField[];
   rows: QueryRow[];
   commandTag?: string;
-  rowCount: number;
+  rowCount: number | null;
   fieldIndex(name: string): number | undefined;
   getText(row: number, column: string): string | null;
+};
+
+export type CommandResult = {
+  commandTag?: string;
+  rowCount: number | null;
 };
 
 export { simpleQuery };
@@ -60,7 +80,7 @@ export class PostgresError extends Error {
   readonly postgresMessage: string;
 
   constructor(fields: PostgresErrorField[]) {
-    const severity = fieldValue(fields, 0x53) ?? fieldValue(fields, 0x56);
+    const severity = fieldValue(fields, 0x56) ?? fieldValue(fields, 0x53);
     const sqlstate = fieldValue(fields, 0x43);
     const postgresMessage = fieldValue(fields, 0x4d) ?? 'PostgreSQL ErrorResponse';
     super(formatPostgresError(severity, sqlstate, postgresMessage));
@@ -79,10 +99,6 @@ export class PostgresError extends Error {
     this.constraintName = fieldValue(fields, 0x6e);
     this.fields = fields;
   }
-
-  static fallback(): PostgresError {
-    return new PostgresError([{ code: 0x4d, value: 'PostgreSQL ErrorResponse' }]);
-  }
 }
 
 export function extendedQuery(sql: string, parameters: ReadonlyArray<QueryParam>): Uint8Array {
@@ -95,13 +111,48 @@ export function extendedQuery(sql: string, parameters: ReadonlyArray<QueryParam>
     throw new Error('extended query SQL must not contain NUL bytes');
   }
 
-  const packet: number[] = [];
-  pushParse(packet, sql);
-  pushBind(packet, parameters.map(normalizeQueryParam));
-  pushDescribePortal(packet);
-  pushExecute(packet);
-  pushFrontendMessage(packet, 0x53, []);
-  return Uint8Array.from(packet);
+  const sqlBytes = utf8Encoder.encode(sql);
+  const normalized = parameters.map(normalizeQueryParam);
+  const parseBodyLength = sqlBytes.length + 4;
+  let bindBodyLength = 10 + normalized.length * 2;
+  for (const parameter of normalized) {
+    bindBodyLength += 4 + (parameter.kind === 'null' ? 0 : parameter.value.length);
+  }
+
+  const packet = new ByteWriter(parseBodyLength + bindBodyLength + 32);
+  packet.message(0x50, parseBodyLength);
+  packet.u8(0);
+  packet.bytes(sqlBytes);
+  packet.u8(0);
+  packet.i16(0);
+
+  packet.message(0x42, bindBodyLength);
+  packet.u8(0);
+  packet.u8(0);
+  packet.i16(normalized.length);
+  for (const parameter of normalized) {
+    packet.i16(parameter.kind === 'binary' ? 1 : 0);
+  }
+  packet.i16(normalized.length);
+  for (const parameter of normalized) {
+    if (parameter.kind === 'null') {
+      packet.i32(-1);
+    } else {
+      packet.i32(parameter.value.length);
+      packet.bytes(parameter.value);
+    }
+  }
+  packet.i16(1);
+  packet.i16(0);
+
+  packet.message(0x44, 2);
+  packet.u8(0x50);
+  packet.u8(0);
+  packet.message(0x45, 5);
+  packet.u8(0);
+  packet.i32(0);
+  packet.message(0x53, 0);
+  return packet.finish();
 }
 
 export function parseQueryResponse(bytes: Uint8Array): QueryResult {
@@ -148,7 +199,7 @@ export function parseQueryResponse(bytes: Uint8Array): QueryResult {
       case 0x64:
       case 0x63:
         throw new Error(
-          'query() does not support COPY protocol responses; use execProtocolRaw for COPY traffic',
+          'query() does not support COPY protocol responses; use a raw protocol API for COPY traffic',
         );
       case 0x5a:
         validateReadyForQuery(body);
@@ -195,7 +246,7 @@ export function parseQueryResponse(bytes: Uint8Array): QueryResult {
     fields: resultFields,
     rows,
     commandTag,
-    rowCount: rows.length,
+    rowCount: commandTagRowCount(commandTag),
     fieldIndex(name: string): number | undefined {
       const index = resultFields.findIndex((field) => field.name === name);
       return index >= 0 ? index : undefined;
@@ -214,9 +265,10 @@ export function parseQueryResponse(bytes: Uint8Array): QueryResult {
   };
 }
 
-export function assertSuccessfulQueryResponse(bytes: Uint8Array): void {
+export function parseCommandResponse(bytes: Uint8Array): CommandResult {
   const cursor = new ByteCursor(bytes);
   let sawReady = false;
+  let commandTag: string | undefined;
 
   while (!cursor.isAtEnd()) {
     const tag = cursor.readU8('backend message tag');
@@ -229,6 +281,10 @@ export function assertSuccessfulQueryResponse(bytes: Uint8Array): void {
     switch (tag) {
       case 0x45:
         throw parseErrorResponse(body);
+      case 0x43:
+        commandTag = body.readCString('CommandComplete tag');
+        body.requireEnd('CommandComplete');
+        break;
       case 0x5a:
         validateReadyForQuery(body);
         sawReady = true;
@@ -236,14 +292,72 @@ export function assertSuccessfulQueryResponse(bytes: Uint8Array): void {
           throw new Error('backend returned bytes after ReadyForQuery');
         }
         break;
-      default:
+      case 0x31:
+        body.requireEnd('ParseComplete');
         break;
+      case 0x32:
+        body.requireEnd('BindComplete');
+        break;
+      case 0x33:
+        body.requireEnd('CloseComplete');
+        break;
+      case 0x49:
+        body.requireEnd('EmptyQueryResponse');
+        break;
+      case 0x6e:
+        body.requireEnd('NoData');
+        break;
+      case 0x53:
+        validateParameterStatus(body);
+        break;
+      case 0x4e:
+        validateFieldResponse(body, 'NoticeResponse');
+        break;
+      case 0x41:
+        validateNotificationResponse(body);
+        break;
+      case 0x54:
+      case 0x44:
+        throw new Error('execute() received rows; use query() for row results');
+      case 0x47:
+      case 0x48:
+      case 0x57:
+      case 0x64:
+      case 0x63:
+        throw new Error(
+          'execute() does not support COPY protocol responses; use a raw protocol API for COPY traffic',
+        );
+      default:
+        throw new Error(`execute() received unexpected backend message tag ${hexBackendTag(tag)}`);
     }
   }
 
   if (!sawReady) {
     throw new Error('query response ended before ReadyForQuery');
   }
+
+  return { commandTag, rowCount: commandTagRowCount(commandTag) };
+}
+
+export function assertSuccessfulQueryResponse(bytes: Uint8Array): void {
+  parseCommandResponse(bytes);
+}
+
+function commandTagRowCount(commandTag: string | undefined): number | null {
+  if (commandTag === undefined) {
+    return null;
+  }
+  const parts = commandTag.trim().split(/\s+/);
+  const count = parts.at(-1);
+  if (
+    count === undefined ||
+    !/^[0-9]+$/.test(count) ||
+    !['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'MOVE', 'FETCH', 'COPY'].includes(parts[0]!)
+  ) {
+    return null;
+  }
+  const value = Number(count);
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 type NormalizedParam =
@@ -260,13 +374,13 @@ function normalizeQueryParam(parameter: QueryParam): NormalizedParam {
     typeof parameter === 'number' ||
     typeof parameter === 'boolean'
   ) {
-    return { kind: 'text', value: new TextEncoder().encode(String(parameter)) };
+    return { kind: 'text', value: utf8Encoder.encode(String(parameter)) };
   }
   if (isQueryBinaryInput(parameter)) {
     return { kind: 'binary', value: toUint8Array(parameter) };
   }
   if (parameter.format === 'text') {
-    return { kind: 'text', value: new TextEncoder().encode(String(parameter.value)) };
+    return { kind: 'text', value: utf8Encoder.encode(String(parameter.value)) };
   }
   return { kind: 'binary', value: toUint8Array(parameter.value) };
 }
@@ -275,84 +389,49 @@ function isQueryBinaryInput(value: unknown): value is QueryBinaryInput {
   return value instanceof ArrayBuffer || ArrayBuffer.isView(value) || Array.isArray(value);
 }
 
-function pushParse(out: number[], sql: string): void {
-  const body: number[] = [];
-  pushCString(body, '');
-  pushCString(body, sql);
-  pushI16(body, 0);
-  pushFrontendMessage(out, 0x50, body);
-}
+class ByteWriter {
+  readonly #bytes: Uint8Array;
+  #offset = 0;
 
-function pushBind(out: number[], parameters: NormalizedParam[]): void {
-  const body: number[] = [];
-  pushCString(body, '');
-  pushCString(body, '');
-
-  pushI16(body, parameters.length);
-  for (const parameter of parameters) {
-    pushI16(body, parameter.kind === 'binary' ? 1 : 0);
+  constructor(length: number) {
+    this.#bytes = new Uint8Array(length);
   }
 
-  pushI16(body, parameters.length);
-  for (const parameter of parameters) {
-    if (parameter.kind === 'null') {
-      pushI32(body, -1);
-    } else {
-      pushSizedValue(body, parameter.value);
+  message(tag: number, bodyLength: number): void {
+    this.u8(tag);
+    this.i32(bodyLength + 4);
+  }
+
+  u8(value: number): void {
+    this.#bytes[this.#offset] = value;
+    this.#offset += 1;
+  }
+
+  i16(value: number): void {
+    this.#bytes[this.#offset] = (value >>> 8) & 0xff;
+    this.#bytes[this.#offset + 1] = value & 0xff;
+    this.#offset += 2;
+  }
+
+  i32(value: number): void {
+    this.#bytes[this.#offset] = (value >>> 24) & 0xff;
+    this.#bytes[this.#offset + 1] = (value >>> 16) & 0xff;
+    this.#bytes[this.#offset + 2] = (value >>> 8) & 0xff;
+    this.#bytes[this.#offset + 3] = value & 0xff;
+    this.#offset += 4;
+  }
+
+  bytes(value: Uint8Array): void {
+    this.#bytes.set(value, this.#offset);
+    this.#offset += value.length;
+  }
+
+  finish(): Uint8Array {
+    if (this.#offset !== this.#bytes.length) {
+      throw new Error('extended query packet length invariant failed');
     }
+    return this.#bytes;
   }
-
-  pushI16(body, 1);
-  pushI16(body, 0);
-  pushFrontendMessage(out, 0x42, body);
-}
-
-function pushDescribePortal(out: number[]): void {
-  const body: number[] = [0x50];
-  pushCString(body, '');
-  pushFrontendMessage(out, 0x44, body);
-}
-
-function pushExecute(out: number[]): void {
-  const body: number[] = [];
-  pushCString(body, '');
-  pushI32(body, 0);
-  pushFrontendMessage(out, 0x45, body);
-}
-
-function pushFrontendMessage(out: number[], tag: number, body: ReadonlyArray<number>): void {
-  out.push(tag);
-  pushI32(out, body.length + 4);
-  out.push(...body);
-}
-
-function pushCString(out: number[], value: string): void {
-  if (value.includes('\0')) {
-    throw new Error('frontend protocol string must not contain NUL bytes');
-  }
-  out.push(...new TextEncoder().encode(value), 0);
-}
-
-function pushSizedValue(out: number[], value: Uint8Array): void {
-  pushI32(out, value.length);
-  out.push(...value);
-}
-
-function pushI32(out: number[], value: number): void {
-  pushU32(out, value >>> 0);
-}
-
-function pushU32(out: number[], value: number): void {
-  out.push((value >>> 24) & 0xff);
-  out.push((value >>> 16) & 0xff);
-  out.push((value >>> 8) & 0xff);
-  out.push(value & 0xff);
-}
-
-function pushI16(out: number[], value: number): void {
-  const bits = value & 0xffff;
-  out.push((bits >>> 8) & 0xff);
-  out.push(bits & 0xff);
 }
 
 export function toUint8Array(input: QueryBinaryInput): Uint8Array {
@@ -398,27 +477,18 @@ function parseDataRow(cursor: ByteCursor, expectedColumns: number): QueryRow {
       `DataRow column count ${count} does not match RowDescription count ${expectedColumns}`,
     );
   }
-  const values: Array<Uint8Array | null> = [];
+  const values = new Array<Uint8Array | null>(count);
   for (let index = 0; index < count; index += 1) {
     const length = cursor.readI32('DataRow value length');
     if (length === -1) {
-      values.push(null);
+      values[index] = null;
     } else if (length < 0) {
       throw new Error(`invalid DataRow value length ${length}`);
     } else {
-      values.push(cursor.readBytes(length, 'DataRow value'));
+      values[index] = cursor.readBytes(length, 'DataRow value');
     }
   }
-  return {
-    values,
-    text(column: number): string | null {
-      if (column < 0 || column >= values.length) {
-        throw new Error(`query row has no column at index ${column}`);
-      }
-      const value = values[column]!;
-      return value === null ? null : decodeUtf8Strict(value, 'query value');
-    },
-  };
+  return new ParsedQueryRow(values);
 }
 
 function parseErrorResponse(cursor: ByteCursor): PostgresError {
@@ -428,7 +498,7 @@ function parseErrorResponse(cursor: ByteCursor): PostgresError {
     try {
       code = cursor.readU8('ErrorResponse field code');
     } catch {
-      return PostgresError.fallback();
+      return fallbackPostgresError();
     }
     if (code === 0) {
       break;
@@ -437,11 +507,15 @@ function parseErrorResponse(cursor: ByteCursor): PostgresError {
     try {
       value = cursor.readCString('ErrorResponse field');
     } catch {
-      return PostgresError.fallback();
+      return fallbackPostgresError();
     }
     fields.push({ code, value });
   }
   return new PostgresError(fields);
+}
+
+function fallbackPostgresError(): PostgresError {
+  return new PostgresError([{ code: 0x4d, value: 'PostgreSQL ErrorResponse' }]);
 }
 
 function fieldValue(fields: ReadonlyArray<PostgresErrorField>, code: number): string | undefined {
@@ -540,15 +614,21 @@ class ByteCursor {
   }
 
   readU8(label: string): number {
-    return this.readBytes(1, label)[0]!;
+    this.#require(1, label);
+    const value = this.#bytes[this.#offset]!;
+    this.#offset += 1;
+    return value;
   }
 
   readU32(label: string): number {
+    this.#require(4, label);
+    const offset = this.#offset;
+    this.#offset += 4;
     return (
-      (this.readU8(label) * 0x1000000 +
-        (this.readU8(label) << 16) +
-        (this.readU8(label) << 8) +
-        this.readU8(label)) >>>
+      (this.#bytes[offset]! * 0x1000000 +
+        (this.#bytes[offset + 1]! << 16) +
+        (this.#bytes[offset + 2]! << 8) +
+        this.#bytes[offset + 3]!) >>>
       0
     );
   }
@@ -559,7 +639,9 @@ class ByteCursor {
   }
 
   readI16(label: string): number {
-    const value = (this.readU8(label) << 8) | this.readU8(label);
+    this.#require(2, label);
+    const value = (this.#bytes[this.#offset]! << 8) | this.#bytes[this.#offset + 1]!;
+    this.#offset += 2;
     return value > 0x7fff ? value - 0x10000 : value;
   }
 
@@ -574,18 +656,29 @@ class ByteCursor {
   }
 
   readBytes(count: number, label: string): Uint8Array {
-    if (count < 0 || this.#offset + count > this.#bytes.length) {
-      throw new Error(`truncated ${label}`);
-    }
-    const value = this.#bytes.slice(this.#offset, this.#offset + count);
+    this.#require(count, label);
+    const value = this.#bytes.subarray(this.#offset, this.#offset + count);
     this.#offset += count;
     return value;
+  }
+
+  #require(count: number, label: string): void {
+    if (count < 0 || count > this.#bytes.length - this.#offset) {
+      throw new Error(`truncated ${label}`);
+    }
   }
 }
 
 function decodeUtf8Strict(bytes: Uint8Array, label: string): string {
-  validateUtf8(bytes, label);
-  return new TextDecoder().decode(bytes);
+  try {
+    return utf8Decoder.decode(bytes);
+  } catch {
+    // Keep the precise protocol diagnostic off the valid-data hot path. The
+    // platform decoder performs the usual validation in native code; this
+    // scanner only runs after it has already rejected malformed UTF-8.
+    validateUtf8(bytes, label);
+    throw new Error(`${label} is not valid UTF-8`);
+  }
 }
 
 function validateUtf8(bytes: Uint8Array, label: string): void {

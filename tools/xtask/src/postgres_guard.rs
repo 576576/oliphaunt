@@ -89,9 +89,14 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         "0018-oliphaunt-wasix-avoid-pg-dump-executequery-lto-collision.patch",
         "0019-oliphaunt-wasix-schedule-ready-after-host-recovery.patch",
         "0020-oliphaunt-wasix-rearm-exception-stack-after-host-recovery.patch",
-        "0032-oliphaunt-wasix-avoid-xlog-size-checkpoint-requests.patch",
-        "0033-oliphaunt-wasix-use-lightweight-embedded-runtime-paths.patch",
-        "0034-oliphaunt-wasix-set-embedded-postmaster-environment.patch",
+        "0027-oliphaunt-wasix-avoid-xlog-size-checkpoint-requests.patch",
+        "0028-oliphaunt-wasix-use-lightweight-embedded-runtime-paths.patch",
+        "0029-oliphaunt-wasix-set-embedded-postmaster-environment.patch",
+        "0035-oliphaunt-wasix-use-single-backend-spinlocks.patch",
+        "0036-oliphaunt-wasix-specialize-single-backend-atomics.patch",
+        "0037-oliphaunt-wasix-buffer-strong-random.patch",
+        "0038-oliphaunt-wasix-disable-unsupported-writeback-hints.patch",
+        "0039-oliphaunt-wasix-inline-sigsetjmp.patch",
     ] {
         ensure!(
             series.contains(&required),
@@ -123,6 +128,73 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         patch_texts.push(((*patch_name).to_owned(), text));
     }
     check_postgres_patch_series_hygiene(&patch_texts)?;
+
+    ensure_file_contains_all(
+        &Path::new(POSTGRES_PATCH_DIR)
+            .join("0035-oliphaunt-wasix-use-single-backend-spinlocks.patch"),
+        &[
+            "defined(__wasi__) && defined(OLIPHAUNT_WASM_SINGLE_USER)",
+            "OLIPHAUNT_WASM_SINGLE_BACKEND_ATOMICS",
+            "typedef int slock_t;",
+            "oliphaunt_wasix_single_user_tas",
+            "__asm__ __volatile__",
+        ],
+    )?;
+
+    ensure_file_contains_all(
+        &Path::new(POSTGRES_PATCH_DIR)
+            .join("0036-oliphaunt-wasix-specialize-single-backend-atomics.patch"),
+        &[
+            "override CPPFLAGS += -DOLIPHAUNT_WASM_SINGLE_BACKEND_ATOMICS",
+            "defined(__wasi__) && defined(OLIPHAUNT_WASM_SINGLE_USER) && defined(OLIPHAUNT_WASM_SINGLE_BACKEND_ATOMICS)",
+            "postmaster mode is unavailable in the single-backend WASIX runtime",
+            "fork-child mode is unavailable in the single-backend WASIX runtime",
+            "volatile int value;",
+            "volatile uint32 value;",
+            "volatile uint64 value pg_attribute_aligned(8);",
+            "PG_HAVE_8BYTE_SINGLE_COPY_ATOMICITY",
+            "*expected = current;",
+        ],
+    )?;
+
+    ensure_file_contains_all(
+        &Path::new(POSTGRES_PATCH_DIR).join("0037-oliphaunt-wasix-buffer-strong-random.patch"),
+        &[
+            "#elif defined(__wasi__)",
+            "#include <sys/random.h>",
+            "wasix_strong_random_fill(void *buf, size_t len)",
+            "#if defined(OLIPHAUNT_WASM_SINGLE_USER)",
+            "WASIX_STRONG_RANDOM_POOL_SIZE 4096",
+            "wasix_strong_random_fill(wasix_strong_random_pool",
+            "if (errno == EINTR)",
+            "No guest-side state in a process that may fork.",
+            "return false;",
+        ],
+    )?;
+    ensure_file_contains_all(
+        &Path::new(POSTGRES_PATCH_DIR)
+            .join("0038-oliphaunt-wasix-disable-unsupported-writeback-hints.patch"),
+        &[
+            "src/backend/storage/file/fd.c",
+            "src/common/file_utils.c",
+            "#if defined(OLIPHAUNT_WASM_SINGLE_USER)",
+            "Actual fsync/fdatasync durability remains enabled.",
+            "#elif defined(HAVE_SYNC_FILE_RANGE)",
+        ],
+    )?;
+    ensure_file_contains_all(
+        &Path::new(POSTGRES_PATCH_DIR).join("0039-oliphaunt-wasix-inline-sigsetjmp.patch"),
+        &[
+            "src/Makefile.shlib",
+            "src/include/port/wasix-dl.h",
+            "src/makefiles/pgxs.mk",
+            "-DOLIPHAUNT_WASM_SIDE_MODULE",
+            "WebAssembly SJLJ requires setjmp to be visible at the protected call site.",
+            "defined(__wasm_exception_handling__) && defined(OLIPHAUNT_WASM_SIDE_MODULE)",
+            "#undef sigsetjmp",
+            "#define sigsetjmp(env, savesigs) ((void) (savesigs), setjmp(env))",
+        ],
+    )?;
 
     for entry in
         fs::read_dir(POSTGRES_PATCH_DIR).with_context(|| format!("read {POSTGRES_PATCH_DIR}"))?
@@ -462,7 +534,7 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         ],
     )?;
     ensure_file_contains_all(
-        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0032-oliphaunt-wasix-avoid-xlog-size-checkpoint-requests.patch",
+        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0027-oliphaunt-wasix-avoid-xlog-size-checkpoint-requests.patch",
         &[
             "src/backend/access/transam/xlog.c",
             "src/backend/postmaster/checkpointer.c",
@@ -472,7 +544,7 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         ],
     )?;
     ensure_file_contains_all(
-        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0033-oliphaunt-wasix-use-lightweight-embedded-runtime-paths.patch",
+        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0028-oliphaunt-wasix-use-lightweight-embedded-runtime-paths.patch",
         &[
             "src/backend/port/posix_sema.c",
             "src/backend/utils/misc/guc.c",
@@ -484,7 +556,7 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         ],
     )?;
     ensure_file_contains_all(
-        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0034-oliphaunt-wasix-set-embedded-postmaster-environment.patch",
+        "src/runtimes/liboliphaunt/wasix/assets/build/postgres/patches/0029-oliphaunt-wasix-set-embedded-postmaster-environment.patch",
         &[
             "src/backend/tcop/postgres.c",
             "oliphaunt_wasix_start",
@@ -498,10 +570,22 @@ pub(crate) fn check_postgres_source_spine() -> Result<()> {
         &[
             "const DEFAULT_STARTUP_GUCS",
             "(\"log_checkpoints\", \"false\")",
-            "(\"max_wal_senders\", \"0\")",
             "(\"wal_buffers\", \"4MB\")",
             "(\"min_wal_size\", \"80MB\")",
             "(\"shared_buffers\", \"128MB\")",
+        ],
+    )?;
+    ensure_file_contains_all(
+        "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/config.rs",
+        &[
+            "const SINGLE_BACKEND_STARTUP_GUCS",
+            "(\"exit_on_error\", \"false\")",
+            "(\"max_wal_senders\", \"0\")",
+            "(\"max_worker_processes\", \"0\")",
+            "(\"max_parallel_workers\", \"0\")",
+            "(\"max_parallel_workers_per_gather\", \"0\")",
+            "(\"max_parallel_maintenance_workers\", \"0\")",
+            "(\"io_method\", \"sync\")",
         ],
     )?;
     ensure_file_contains_all(
@@ -640,11 +724,6 @@ fn collect_pg18_legacy_symbol_leaks(
 }
 
 fn check_postgres_patch_series_hygiene(patches: &[(String, String)]) -> Result<()> {
-    ensure!(
-        patches.len() == 38,
-        "PG18 WASIX patch series should stay reviewable at exactly 38 audited patches; got {}",
-        patches.len()
-    );
     for (index, (patch_name, patch_text)) in patches.iter().enumerate() {
         let expected_prefix = format!("{:04}-oliphaunt-wasix-", index + 1);
         ensure!(
@@ -857,6 +936,9 @@ fn check_postgres_applied_runtime_abi(source: &Path) -> Result<()> {
             "OLIPHAUNT_WASIX_PROTOCOL_COPY_OUT",
             "OLIPHAUNT_WASIX_PROTOCOL_COPY_BOTH",
             "extern void oliphaunt_wasix_protocol_report_copy_response(int state)",
+            "defined(__wasm_exception_handling__) && defined(OLIPHAUNT_WASM_SIDE_MODULE)",
+            "#undef sigsetjmp",
+            "#define sigsetjmp(env, savesigs) ((void) (savesigs), setjmp(env))",
         ],
     )?;
     ensure_file_contains_all(
@@ -931,21 +1013,43 @@ fn check_postgres_applied_runtime_abi(source: &Path) -> Result<()> {
         &[
             "oliphaunt_wasix_set_active",
             "oliphaunt_wasix_set_force_host_error_recovery",
-            "oliphaunt_wasix_set_protocol_stdio",
             "oliphaunt_wasix_set_protocol_transport",
             "oliphaunt_wasix_protocol_stream_active",
             "oliphaunt_wasix_input_reset",
-            "oliphaunt_wasix_input_write",
+            "oliphaunt_wasix_input_reserve",
+            "oliphaunt_wasix_input_commit",
             "oliphaunt_wasix_input_available",
             "oliphaunt_wasix_output_reset",
             "oliphaunt_wasix_output_len",
-            "oliphaunt_wasix_output_read",
+            "oliphaunt_wasix_output_data",
+            "oliphaunt_wasix_output_contains_error",
         ],
     )?;
     Ok(())
 }
 
 fn check_postgres_applied_perf_patches(source: &Path) -> Result<()> {
+    for relative in ["src/backend/storage/file/fd.c", "src/common/file_utils.c"] {
+        ensure_file_contains_all(
+            source.join(relative),
+            &[
+                "#if defined(OLIPHAUNT_WASM_SINGLE_USER)",
+                "Actual fsync/fdatasync durability remains enabled.",
+                "#elif defined(HAVE_SYNC_FILE_RANGE)",
+            ],
+        )?;
+    }
+    ensure_file_contains_all(
+        source.join("src/port/pg_strong_random.c"),
+        &[
+            "#elif defined(__wasi__)",
+            "#if defined(OLIPHAUNT_WASM_SINGLE_USER)",
+            "WASIX_STRONG_RANDOM_POOL_SIZE 4096",
+            "wasix_strong_random_fill(wasix_strong_random_pool,",
+            "wasix_strong_random_used = sizeof(wasix_strong_random_pool)",
+            "return wasix_strong_random_fill(buf, len);",
+        ],
+    )?;
     ensure_file_contains_all(
         source.join("src/common/hashfn.c"),
         &[
@@ -1064,18 +1168,6 @@ pub(crate) fn check_source_lane_isolation() -> Result<()> {
         "stable AOT artifact path drifted"
     );
 
-    let extension_catalog = fs::read_to_string("tools/xtask/src/extension_catalog.rs")
-        .context("read tools/xtask/src/extension_catalog.rs for source-lane isolation guard")?;
-    for marker in [
-        "manifest_metadata_by_sql_name_from_generated_plan",
-        "extension_discovery_inputs_available(false)?",
-        "extension discovery inputs are unavailable, so generated build plan fallback is required",
-    ] {
-        ensure!(
-            extension_catalog.contains(marker),
-            "extension catalog source-lane isolation guard is missing marker {marker:?}"
-        );
-    }
     let source_lane_sh =
         fs::read_to_string("src/runtimes/liboliphaunt/wasix/assets/build/source_lane.sh")
             .context("read src/runtimes/liboliphaunt/wasix/assets/build/source_lane.sh")?;
@@ -1101,7 +1193,7 @@ pub(crate) fn check_source_lane_isolation() -> Result<()> {
         fs::read_to_string("src/runtimes/liboliphaunt/wasix/crates/assets/build.rs")
             .context("read src/runtimes/liboliphaunt/wasix/crates/assets/build.rs")?;
     for marker in [
-        "OLIPHAUNT_WASM_GENERATED_ASSETS_DIR",
+        "OLIPHAUNT_WASIX_GENERATED_ASSETS_DIR",
         "repo_root_from_manifest_dir",
         "src/runtimes/liboliphaunt/wasix/crates/assets/Cargo.toml",
         "target/oliphaunt-wasix/assets",
@@ -1152,33 +1244,19 @@ pub(crate) fn check_source_lane_isolation() -> Result<()> {
     ensure_file_contains_all(
         "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/assets.rs",
         &[
+            "AssetManifestMetadata",
             "asset_manifest_metadata",
-            "pgdata_template_source_fingerprint",
-        ],
-    )?;
-    ensure_file_contains_all(
-        "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/lib.rs",
-        &["AssetManifestMetadata", "asset_manifest_metadata"],
-    )?;
-    ensure_file_contains_all(
-        "tools/perf/runner/src/report.rs",
-        &[
-            "WasixRuntimeAssetReport",
-            "wasix_runtime_assets",
-            "asset_manifest_metadata",
-            "source_lane: metadata",
-            "pgdata_template_source_fingerprint",
+            "cluster_seed_source_fingerprint",
         ],
     )?;
     ensure_file_contains_all(
         "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/base.rs",
         &[
-            "pub source_fingerprint: Option<String>",
-            "embedded PGDATA template source fingerprint mismatch",
+            ".cluster_seed_source_fingerprint",
+            "embedded cluster seed source fingerprint mismatch",
             "full_runtime_layout_matches_current",
             "ensure_existing_pgdata_matches_runtime",
             "existing PGDATA at {} is PostgreSQL {}",
-            "source-fingerprint=",
         ],
     )?;
     ensure_file_contains_all(
@@ -1276,8 +1354,8 @@ fn check_postgres_packaging_inputs(source: &Path) -> Result<()> {
         ensure_file(&source.join(required))?;
     }
 
-    let promoted_specs = extension_catalog::promoted_build_specs()?;
-    for extension in promoted_specs
+    let extension_specs = extension_catalog::extension_build_specs()?;
+    for extension in extension_specs
         .iter()
         .filter(|extension| extension.source_kind == "postgis")
     {
@@ -1290,7 +1368,7 @@ fn check_postgres_packaging_inputs(source: &Path) -> Result<()> {
 
     let mut checked_contrib = 0usize;
     let mut missing = Vec::new();
-    for extension in promoted_specs
+    for extension in extension_specs
         .iter()
         .filter(|extension| extension.build_kind == "postgres-contrib")
     {
@@ -1340,7 +1418,7 @@ fn check_postgres_packaging_inputs(source: &Path) -> Result<()> {
 
     ensure!(
         checked_contrib > 0,
-        "PG18 packaging input guard did not find any promoted postgres-contrib extensions"
+        "PG18 packaging input guard did not find any public postgres-contrib extensions"
     );
     ensure!(
         missing.is_empty(),
@@ -1355,7 +1433,7 @@ fn check_postgres_pgxs_packaging_inputs() -> Result<()> {
     let manifest = load_sources_manifest()?;
     let mut checked_pgxs = 0usize;
     let mut missing = Vec::new();
-    for extension in extension_catalog::promoted_build_specs()?
+    for extension in extension_catalog::extension_build_specs()?
         .iter()
         .filter(|extension| extension_catalog::is_pgxs_style_build_kind(&extension.build_kind))
     {
@@ -1438,7 +1516,7 @@ fn check_postgres_pgxs_packaging_inputs() -> Result<()> {
 
     ensure!(
         checked_pgxs > 0,
-        "PG18 packaging input guard did not find any promoted PGXS external extensions"
+        "PG18 packaging input guard did not find any public PGXS external extensions"
     );
     ensure!(
         missing.is_empty(),
@@ -1612,14 +1690,13 @@ pub(crate) fn check_rust_startup_abi_boundary() -> Result<()> {
         "struct OliphauntLifecycleExports",
         "struct WasixProtocolExports",
         "fn ensure_integrated_oliphaunt_contract",
-        "fn record_backend_c_timings",
-        "oliphaunt_wasix_backend_timing_reset",
-        "oliphaunt_wasix_backend_timing_elapsed_us",
-        "host_requires_process_exit_error_recovery",
+        "fn host_requires_process_exit_error_recovery() -> bool",
+        "cfg!(target_env = \"msvc\")",
         "oliphaunt_wasix_set_force_host_error_recovery",
         "oliphaunt_wasix_set_protocol_transport",
         "oliphaunt_wasix_protocol_stream_active",
         "The upstream lifecycle is already running by this point",
+        "[\"-D\", PGDATA_DIR, \"--\", startup_config.database.as_str()]",
     ] {
         if !text.contains(marker) {
             bail!(

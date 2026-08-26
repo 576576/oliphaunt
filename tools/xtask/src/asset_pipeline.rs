@@ -290,7 +290,7 @@ impl BuildOutputs {
             });
         }
         if !skip_extensions_for_perf_probe() {
-            for extension in extension_catalog::promoted_build_specs()? {
+            for extension in extension_catalog::extension_build_specs()? {
                 for support_module in &extension.native_support_modules {
                     modules.push(BuildModuleOutput {
                         name: format!("extension:{}:{}", extension.sql_name, support_module.name),
@@ -362,7 +362,7 @@ impl BuildOutputs {
         let runtime_path = base.join("runtime/oliphaunt");
         write_bytes_file(
             &runtime_path,
-            &archive_entry_bytes(&runtime_archive, "oliphaunt/bin/oliphaunt")?,
+            &archive_entry_bytes(&runtime_archive, RUNTIME_MODULE_ARCHIVE_MEMBER)?,
         )?;
 
         let mut modules = vec![BuildModuleOutput {
@@ -590,7 +590,7 @@ impl BuildOutputs {
 
 fn extension_build_module_path(
     build_dir: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
 ) -> Result<PathBuf> {
     let module_file = extension
         .module_file
@@ -624,7 +624,7 @@ fn extension_build_module_path(
             Ok(build_dir.join(module_source_dir).join(module_file))
         }
         other => bail!(
-            "promoted extension {} has unsupported build kind {other}",
+            "supported extension {} has unsupported build kind {other}",
             extension.sql_name
         ),
     }
@@ -632,12 +632,12 @@ fn extension_build_module_path(
 
 fn pgxs_extension_build_dir(
     build_dir: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
 ) -> PathBuf {
     build_dir.join("pgxs").join(&extension.id)
 }
 
-fn extension_aot_file_stem(extension: &extension_catalog::PromotedExtensionBuildSpec) -> String {
+fn extension_aot_file_stem(extension: &extension_catalog::ExtensionBuildSpec) -> String {
     extension.sql_name.replace('/', "_")
 }
 
@@ -691,6 +691,19 @@ fn validate_module_link_metadata(module: &BuildModuleManifestOut) -> Result<()> 
 
     match module.kind.as_str() {
         "runtime" => {
+            let thread_spawn_imports = module
+                .link
+                .imports
+                .iter()
+                .filter(|import| is_thread_spawn_import(import))
+                .map(|import| format!("{}.{}", import.module, import.name))
+                .collect::<Vec<_>>();
+            ensure!(
+                thread_spawn_imports.is_empty(),
+                "{} violates the single-backend contract with thread-spawn imports: {}",
+                module.name,
+                thread_spawn_imports.join(", ")
+            );
             let missing = required_runtime_abi_exports()
                 .iter()
                 .copied()
@@ -734,6 +747,18 @@ fn validate_module_link_metadata(module: &BuildModuleManifestOut) -> Result<()> 
     Ok(())
 }
 
+fn is_thread_spawn_import(import: &WasmImportOut) -> bool {
+    matches!(
+        import.name.trim_start_matches('_'),
+        "thread-spawn"
+            | "thread_spawn"
+            | "thread_spawn_v2"
+            | "wasi_thread_spawn"
+            | "wasi_thread_spawn_v2"
+            | "pthread_create"
+    )
+}
+
 fn validate_build_output_link_closure(outputs: &BuildOutputs) -> Result<()> {
     let runtime = outputs
         .modules
@@ -741,15 +766,7 @@ fn validate_build_output_link_closure(outputs: &BuildOutputs) -> Result<()> {
         .find(|module| module.kind == "runtime")
         .ok_or_else(|| anyhow!("build outputs are missing runtime module"))?;
     let runtime_link = read_wasm_link_metadata(&runtime.path)?;
-    let runtime_exports = runtime_link
-        .exports
-        .iter()
-        .flat_map(|export| {
-            let name = export.name.trim_start_matches('_').to_owned();
-            [export.name.clone(), name]
-        })
-        .collect::<HashSet<_>>();
-
+    validate_sealed_runtime_exports(&runtime_link)?;
     let side_modules = outputs
         .modules
         .iter()
@@ -761,28 +778,27 @@ fn validate_build_output_link_closure(outputs: &BuildOutputs) -> Result<()> {
             Ok::<_, anyhow::Error>((module.name.clone(), read_wasm_link_metadata(&module.path)?))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let side_module_exports = side_module_links
-        .iter()
-        .map(|(name, link)| (name.clone(), wasm_export_name_set(link)))
-        .collect::<BTreeMap<_, _>>();
+    let side_module_basenames = side_module_basename_index(
+        side_modules
+            .iter()
+            .map(|module| (module.name.as_str(), module.path.as_path())),
+    )?;
 
     let mut failures = Vec::new();
     for module in side_modules {
         let link = side_module_links
             .get(&module.name)
             .ok_or_else(|| anyhow!("missing link metadata for {}", module.name))?;
-        let provider_exports = side_module_provider_exports(&module.name, &side_module_exports);
+        let provider_exports =
+            side_module_provider_exports(&module.name, &side_module_links, &side_module_basenames)?;
         for import in &link.imports {
             if !import_should_resolve_from_runtime(import) {
                 continue;
             }
-            if import_resolves_from_linked_module_exports(import, &provider_exports) {
+            if import_resolves_from_wasm_exports(import, &provider_exports, &module.name)? {
                 continue;
             }
-            let normalized = import.name.trim_start_matches('_');
-            if !runtime_exports.contains(import.name.as_str())
-                && !runtime_exports.contains(normalized)
-            {
+            if !import_resolves_from_wasm_exports(import, &runtime_link.exports, "runtime")? {
                 failures.push(format!(
                     "{} imports {}.{}",
                     module.name, import.module, import.name
@@ -800,23 +816,87 @@ fn validate_build_output_link_closure(outputs: &BuildOutputs) -> Result<()> {
     Ok(())
 }
 
+fn validate_sealed_runtime_exports(runtime: &WasmLinkMetadataOut) -> Result<()> {
+    let policy_path =
+        repo_relative_path("src/runtimes/liboliphaunt/wasix/assets/generated/wasix-dl.exports");
+    let policy = fs::read_to_string(&policy_path)
+        .with_context(|| format!("read {}", policy_path.display()))?;
+    let mut expected = policy
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    expected.extend(
+        WASIX_LINKER_RUNTIME_EXPORTS
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
+    let actual = runtime
+        .exports
+        .iter()
+        .map(|export| export.name.clone())
+        .collect::<BTreeSet<_>>();
+    ensure_exact_runtime_export_surface(&actual, &expected)
+}
+
+fn ensure_exact_runtime_export_surface(
+    actual: &BTreeSet<String>,
+    expected: &BTreeSet<String>,
+) -> Result<()> {
+    let missing = expected.difference(actual).cloned().collect::<Vec<_>>();
+    let unexpected = actual.difference(expected).cloned().collect::<Vec<_>>();
+    ensure!(
+        missing.is_empty() && unexpected.is_empty(),
+        "sealed WASIX runtime export surface differs: missing={missing:?} unexpected={unexpected:?}"
+    );
+    Ok(())
+}
+
 fn side_module_provider_exports(
     module_name: &str,
-    exports_by_name: &BTreeMap<String, HashSet<String>>,
-) -> HashSet<String> {
-    let mut exports = exports_by_name
-        .get(module_name)
-        .cloned()
-        .unwrap_or_default();
-    if let Some(sql_name) = extension_module_sql_name(module_name) {
-        let support_prefix = format!("extension:{sql_name}:");
-        for (name, module_exports) in exports_by_name {
-            if name.starts_with(&support_prefix) {
-                exports.extend(module_exports.iter().cloned());
+    links_by_name: &BTreeMap<String, WasmLinkMetadataOut>,
+    names_by_basename: &BTreeMap<String, String>,
+) -> Result<Vec<WasmExportOut>> {
+    let mut provider_names = BTreeSet::from([module_name.to_owned()]);
+    let mut pending = vec![module_name.to_owned()];
+    while let Some(name) = pending.pop() {
+        let link = links_by_name
+            .get(&name)
+            .ok_or_else(|| anyhow!("missing side-module link metadata for {name}"))?;
+        for needed in &link.dylink_needed {
+            let dependency = names_by_basename.get(needed).ok_or_else(|| {
+                anyhow!("{name} declares missing WASIX dynamic dependency {needed}")
+            })?;
+            if provider_names.insert(dependency.clone()) {
+                pending.push(dependency.clone());
             }
         }
     }
-    exports
+    Ok(provider_names
+        .into_iter()
+        .flat_map(|name| {
+            links_by_name
+                .get(&name)
+                .into_iter()
+                .flat_map(|link| link.exports.iter().cloned())
+        })
+        .collect())
+}
+
+fn side_module_basename_index<'a>(
+    modules: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<BTreeMap<String, String>> {
+    let mut names_by_basename = BTreeMap::new();
+    for (name, path) in modules {
+        let basename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("side-module {name} path has no UTF-8 basename"))?;
+        if let Some(previous) = names_by_basename.insert(basename.to_owned(), name.to_owned()) {
+            bail!("WASIX side modules {previous} and {name} share dynamic basename {basename}");
+        }
+    }
+    Ok(names_by_basename)
 }
 
 fn extension_module_sql_name(module_name: &str) -> Option<&str> {
@@ -901,8 +981,13 @@ pub(crate) fn check_source_controlled_wasix_export_list() -> Result<()> {
         "oliphaunt_wasix_protocol_stream_active",
         "oliphaunt_wasix_start",
         "oliphaunt_wasix_set_protocol_transport",
-        "oliphaunt_wasix_input_write",
-        "oliphaunt_wasix_output_read",
+        "oliphaunt_wasix_input_reserve",
+        "oliphaunt_wasix_input_commit",
+        "oliphaunt_wasix_output_data",
+        "oliphaunt_wasix_output_contains_error",
+        "__wasm_longjmp",
+        "__wasm_setjmp",
+        "__wasm_setjmp_test",
         "malloc",
         "free",
     ] {
@@ -985,7 +1070,15 @@ pub(crate) fn read_asset_manifest_for_source_lane(source_lane: &str) -> Result<A
 pub(crate) fn read_asset_manifest_from(asset_dir: &Path) -> Result<AssetManifestOut> {
     let path = asset_dir.join("manifest.json");
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    let manifest: AssetManifestOut =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    ensure!(
+        manifest.format_version == ASSET_MANIFEST_FORMAT_VERSION,
+        "{} must use WASIX asset manifest format {}",
+        path.display(),
+        ASSET_MANIFEST_FORMAT_VERSION,
+    );
+    Ok(manifest)
 }
 
 fn build_output_modules_from_asset_manifest(
@@ -1077,91 +1170,65 @@ fn wasix_export_list_from_modules(modules: &[BuildModuleManifestOut]) -> Result<
         validate_module_link_metadata(module)?;
     }
 
-    let runtime = modules
+    let _runtime = modules
         .iter()
         .find(|module| module.kind == "runtime")
         .ok_or_else(|| anyhow!("build outputs are missing runtime module"))?;
-    let runtime_exports = wasm_export_name_set(&runtime.link);
-    let side_module_exports = modules
+    let side_modules = modules
         .iter()
         .filter(|module| matches!(module.kind.as_str(), "runtime-support" | "extension"))
-        .map(|module| (module.name.clone(), wasm_export_name_set(&module.link)))
+        .collect::<Vec<_>>();
+    let side_module_links = side_modules
+        .iter()
+        .map(|module| (module.name.clone(), module.link.clone()))
         .collect::<BTreeMap<_, _>>();
+    let side_module_basenames = side_module_basename_index(
+        side_modules
+            .iter()
+            .map(|module| (module.name.as_str(), Path::new(&module.path))),
+    )?;
     let mut required_exports = BTreeSet::<String>::new();
-    let mut unresolved = Vec::new();
 
     for abi_export in required_runtime_abi_exports().iter().copied() {
-        let normalized = abi_export.trim_start_matches('_');
-        if runtime_exports.contains(abi_export) {
-            required_exports.insert(abi_export.to_owned());
-        } else if runtime_exports.contains(normalized) {
-            required_exports.insert(normalized.to_owned());
-        } else {
-            unresolved.push(format!("runtime ABI export {abi_export}"));
-        }
+        required_exports.insert(abi_export.to_owned());
     }
 
-    for module in modules
-        .iter()
-        .filter(|module| matches!(module.kind.as_str(), "runtime-support" | "extension"))
-    {
-        let module_exports = side_module_provider_exports(&module.name, &side_module_exports);
+    for module in side_modules {
+        let module_exports =
+            side_module_provider_exports(&module.name, &side_module_links, &side_module_basenames)?;
         for import in &module.link.imports {
             if !import_should_resolve_from_runtime(import) {
                 continue;
             }
-            if import_resolves_from_linked_module_exports(import, &module_exports) {
+            if import_resolves_from_wasm_exports(import, &module_exports, &module.name)? {
                 continue;
             }
-            let normalized = import.name.trim_start_matches('_');
-            if runtime_exports.contains(import.name.as_str()) {
-                required_exports.insert(import.name.clone());
-            } else if runtime_exports.contains(normalized) {
-                required_exports.insert(normalized.to_owned());
-            } else {
-                unresolved.push(format!(
-                    "{} imports {}.{}",
-                    module.name, import.module, import.name
-                ));
-            }
+            // The strict final link proves that the runtime defines every policy symbol. Do not
+            // consult the previously sealed runtime here: doing so would make adding a new side
+            // module import impossible without first restoring an ambient export surface.
+            required_exports.insert(runtime_export_name_for_side_import(import));
         }
-    }
-
-    if !unresolved.is_empty() {
-        bail!(
-            "cannot generate WASIX dynamic-link export list with unresolved imports: {}",
-            unresolved.join(", ")
-        );
     }
 
     Ok(required_exports.into_iter().collect::<Vec<_>>().join("\n") + "\n")
 }
 
 pub(crate) fn required_runtime_abi_exports() -> &'static [&'static str] {
-    &[
-        "_start",
-        "oliphaunt_wasix_set_active",
-        "oliphaunt_wasix_start",
-        "oliphaunt_wasix_get_proc_port",
-        "ProcessStartupPacket",
-        "oliphaunt_wasix_send_conn_data",
-        "oliphaunt_wasix_pq_flush",
-        "pq_buffer_remaining_data",
-        "PostgresMainLoopOnce",
-        "PostgresSendReadyForQueryIfNecessary",
-        "PostgresMainLongJmp",
-        "oliphaunt_wasix_set_protocol_stdio",
-        "oliphaunt_wasix_set_force_host_error_recovery",
-        "oliphaunt_wasix_protocol_stream_active",
-        "oliphaunt_wasix_input_reset",
-        "oliphaunt_wasix_input_write",
-        "oliphaunt_wasix_input_available",
-        "oliphaunt_wasix_output_reset",
-        "oliphaunt_wasix_output_len",
-        "oliphaunt_wasix_output_read",
-        "oliphaunt_wasix_set_protocol_transport",
-    ]
+    REQUIRED_RUNTIME_ABI_EXPORTS
 }
+
+const WASIX_LINKER_RUNTIME_EXPORTS: &[&str] = &[
+    "__data_end",
+    "__tls_align",
+    "__tls_base",
+    "__tls_size",
+    "__wasm_apply_data_relocs",
+    "__wasm_call_ctors",
+    "__wasm_init_tls",
+    "__wasm_sigaction",
+    "__wasm_signal",
+    "wasi_thread_start",
+];
 
 fn import_should_resolve_from_runtime(import: &WasmImportOut) -> bool {
     if import_is_wasix_linker_provided(import) {
@@ -1186,37 +1253,87 @@ fn import_is_wasix_linker_provided(import: &WasmImportOut) -> bool {
     )
 }
 
-fn import_resolves_from_linked_module_exports(
+fn import_resolves_from_wasm_exports(
     import: &WasmImportOut,
-    module_exports: &HashSet<String>,
-) -> bool {
-    module_exports.contains(import.name.as_str())
-        || module_exports.contains(import.name.trim_start_matches('_'))
+    exports: &[WasmExportOut],
+    provider: &str,
+) -> Result<bool> {
+    Ok(resolved_wasm_export_name(import, exports, provider)?.is_some())
+}
+
+fn resolved_wasm_export_name(
+    import: &WasmImportOut,
+    exports: &[WasmExportOut],
+    provider: &str,
+) -> Result<Option<String>> {
+    let mut candidates = exports
+        .iter()
+        .filter(|export| export.name == import.name)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        let normalized = import.name.trim_start_matches('_');
+        candidates = exports
+            .iter()
+            .filter(|export| export.name.trim_start_matches('_') == normalized)
+            .collect();
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let expected_kind = match import.module.as_str() {
+        "GOT.func" => "func",
+        "GOT.mem" => "global",
+        _ => import.kind.as_str(),
+    };
+    ensure!(
+        candidates.iter().any(|export| export.kind == expected_kind),
+        "{provider} provides {}.{} as {:?}, expected {expected_kind}",
+        import.module,
+        import.name,
+        candidates
+            .iter()
+            .map(|export| export.kind.as_str())
+            .collect::<BTreeSet<_>>()
+    );
+    Ok(candidates
+        .into_iter()
+        .find(|export| export.kind == expected_kind)
+        .map(|export| export.name.clone()))
+}
+
+fn runtime_export_name_for_side_import(import: &WasmImportOut) -> String {
+    import.name.clone()
 }
 
 fn extension_asset_provider_exports(
     primary_link: &WasmLinkMetadataOut,
+    primary_path: &Path,
     sql_name: &str,
+    native_modules: &[OwnedExtensionNativeModule],
     native_module_links: &BTreeMap<String, WasmLinkMetadataOut>,
-) -> HashSet<String> {
-    let mut exports = wasm_export_name_set(primary_link);
-    for (name, link) in native_module_links {
-        if name == sql_name {
+) -> Result<Vec<WasmExportOut>> {
+    let root_name = format!("extension:{sql_name}");
+    let mut links = BTreeMap::from([(root_name.clone(), primary_link.clone())]);
+    let mut paths = vec![(root_name.as_str(), primary_path)];
+    let mut dependency_names = Vec::new();
+    for module in native_modules {
+        if module.name == sql_name {
             continue;
         }
-        exports.extend(wasm_export_name_set(link));
+        let name = format!("extension:{sql_name}:{}", module.name);
+        let link = native_module_links
+            .get(&module.name)
+            .ok_or_else(|| anyhow!("missing link metadata for {name}"))?;
+        links.insert(name.clone(), link.clone());
+        dependency_names.push((name, module.path.as_path()));
     }
-    exports
-}
-
-fn wasm_export_name_set(link: &WasmLinkMetadataOut) -> HashSet<String> {
-    link.exports
-        .iter()
-        .flat_map(|export| {
-            let normalized = export.name.trim_start_matches('_').to_owned();
-            [export.name.clone(), normalized]
-        })
-        .collect()
+    paths.extend(
+        dependency_names
+            .iter()
+            .map(|(name, path)| (name.as_str(), *path)),
+    );
+    let basenames = side_module_basename_index(paths)?;
+    side_module_provider_exports(&root_name, &links, &basenames)
 }
 
 fn has_wasm_export(link: &WasmLinkMetadataOut, name: &str) -> bool {
@@ -1310,7 +1427,7 @@ fn asset_build_commands(backend_script: &str) -> Result<Vec<AssetBuildCommand>> 
             skip_for_core_probe: true,
         },
     ];
-    for extension in extension_catalog::promoted_build_specs()? {
+    for extension in extension_catalog::extension_build_specs()? {
         if !extension_catalog::is_recipe_staged_build_kind(&extension.build_kind) {
             continue;
         }
@@ -1583,7 +1700,7 @@ fn package_assets_with_options(
     copy_file(outputs.module_path("tool:initdb")?, &initdb)?;
 
     let extension_artifacts =
-        build_promoted_extension_artifacts(source, build, stage, assets_dir, &outputs)?;
+        build_extension_artifacts(source, build, stage, assets_dir, &outputs)?;
     let extension_artifact_refs = extension_artifacts
         .iter()
         .map(|extension| ExtensionArtifact {
@@ -1594,14 +1711,18 @@ fn package_assets_with_options(
             module_path: extension.module_path.as_deref(),
             native_module: extension.native_module.as_deref(),
             native_modules: &extension.native_modules,
-            stable: extension.stable,
         })
         .collect::<Vec<_>>();
 
     if include_aot {
         package_aot_artifacts(target, &outputs, manifest)?;
     }
-    generate_pgdata_template_from_runtime_stage(manifest, &outputs, &runtime_stage, assets_dir)?;
+    generate_cluster_seed_assets_from_runtime_stage(
+        manifest,
+        &outputs,
+        &runtime_stage,
+        assets_dir,
+    )?;
     write_asset_manifest(
         manifest,
         &outputs,
@@ -1635,18 +1756,18 @@ fn package_assets_with_options(
     Ok(())
 }
 
-pub(crate) fn generate_pgdata_template_asset(
+pub(crate) fn generate_cluster_seed_assets(
     manifest: &SourcesManifest,
     source_lane: &str,
 ) -> Result<()> {
     let outputs = BuildOutputs::discover_for_source_lane(source_lane)?;
-    let stage_root = outputs.package_stage.join("template-runtime");
+    let stage_root = outputs.package_stage.join("cluster-seed-runtime");
     if stage_root.exists() {
         fs::remove_dir_all(&stage_root)
             .with_context(|| format!("remove {}", stage_root.display()))?;
     }
     stage_runtime_tree(&outputs.build_dir, &outputs.source_dir, &stage_root)?;
-    generate_pgdata_template_from_runtime_stage(
+    generate_cluster_seed_assets_from_runtime_stage(
         manifest,
         &outputs,
         &stage_root,
@@ -1654,66 +1775,130 @@ pub(crate) fn generate_pgdata_template_asset(
     )
 }
 
-fn generate_pgdata_template_from_runtime_stage(
+fn generate_cluster_seed_assets_from_runtime_stage(
     manifest: &SourcesManifest,
     outputs: &BuildOutputs,
     runtime_stage: &Path,
     assets_dir: &Path,
 ) -> Result<()> {
-    let output_dir = assets_dir.join("prepopulated");
+    let output_dir = assets_dir.join("cluster-seeds");
     if output_dir.exists() {
         fs::remove_dir_all(&output_dir)
             .with_context(|| format!("remove {}", output_dir.display()))?;
     }
     fs::create_dir_all(&output_dir).with_context(|| format!("create {}", output_dir.display()))?;
 
-    let work_root = assets_dir.join("template-work");
-    if work_root.exists() {
+    let source_pins = effective_source_pins(manifest, outputs)?;
+    let source_fingerprint = outputs
+        .source_fingerprint
+        .as_deref()
+        .ok_or_else(|| anyhow!("cluster seeds require an exact PostgreSQL source fingerprint"))?;
+    let runtime_sha256 = sha256_file(outputs.module_path("runtime:oliphaunt")?)?;
+    let initdb_sha256 = sha256_file(outputs.module_path("tool:initdb")?)?;
+    let catalog_version = postgres_catalog_version(&outputs.source_dir)?;
+    let runtime_version = release_product_version("src/runtimes/liboliphaunt/wasix")?;
+    let icu_data_root = wasix_icu_data_root()?;
+    let icu_tree_sha256 = logical_tree_sha256(&icu_data_root)?;
+    let icu_source = source_pins
+        .iter()
+        .find(|source| source.name == "icu")
+        .ok_or_else(|| anyhow!("WASIX cluster-seed source pins do not contain ICU"))?;
+
+    for profile in cluster_seed_runner::CatalogProfile::ALL {
+        let work_root = assets_dir.join(format!("cluster-seed-work-{}", profile.as_str()));
+        if work_root.exists() {
+            fs::remove_dir_all(&work_root)
+                .with_context(|| format!("remove {}", work_root.display()))?;
+        }
+        fs::create_dir_all(&work_root)
+            .with_context(|| format!("create {}", work_root.display()))?;
+        cluster_seed_runner::run_wasix_initdb_cluster_seed(
+            runtime_stage,
+            &work_root,
+            profile,
+            (profile == cluster_seed_runner::CatalogProfile::Icu)
+                .then_some(icu_data_root.as_path()),
+        )?;
+
+        let pgdata = work_root.join("pgdata");
+        ensure!(
+            pgdata.join("PG_VERSION").is_file() && pgdata.join("global/pg_control").is_file(),
+            "WASIX initdb did not create a complete {} cluster seed at {}",
+            profile.as_str(),
+            pgdata.display()
+        );
+        cluster_seed_runner::clean_generated_cluster_seed(&pgdata)?;
+
+        let archive_relative = format!("cluster-seeds/{}.tar.zst", profile.as_str());
+        let archive = assets_dir.join(&archive_relative);
+        deterministic_tar_zst(&pgdata, Path::new(""), &archive)?;
+        let (expanded_bytes, regular_files, directories) = tree_stats(&pgdata)?;
+        let icu = (profile == cluster_seed_runner::CatalogProfile::Icu).then(|| {
+            serde_json::json!({
+                "artifactRole": "icu-data",
+                "upstreamVersion": "76.1",
+                "sourceCommit": icu_source.commit,
+                "dataTreeSha256": icu_tree_sha256,
+                "dataVersion": "76.1",
+                "dataForm": "files-le"
+            })
+        });
+        let seed_manifest = serde_json::json!({
+            "schema": "oliphaunt-cluster-seed-v1",
+            "artifactRole": profile.artifact_role(),
+            "catalogProfile": profile.as_str(),
+            "runtime": {
+                "product": "liboliphaunt-wasix",
+                "version": runtime_version,
+                "engineFamily": "wasix",
+                "physicalFormat": "wasix-pg18-v1",
+                "postgresMajor": 18,
+                "compatibilityKey": "wasix-pg18-datum32-v1",
+                "consumerSha256": runtime_sha256,
+                "producerSha256": runtime_sha256,
+                "initdbSha256": initdb_sha256
+            },
+            "source": {
+                "fingerprint": source_fingerprint,
+                "catalogVersion": catalog_version,
+                "lane": outputs.source_lane,
+                "producer": "wasix-initdb"
+            },
+            "initProfile": cluster_seed_runner::default_initdb_profile(),
+            "archive": {
+                "path": archive_relative,
+                "sha256": sha256_file(&archive)?,
+                "compressedBytes": fs::metadata(&archive)
+                    .with_context(|| format!("metadata {}", archive.display()))?
+                    .len(),
+                "expandedBytes": expanded_bytes,
+                "regularFiles": regular_files,
+                "directories": directories
+            },
+            "requiredRuntimeFeatures": if profile == cluster_seed_runner::CatalogProfile::Icu {
+                vec!["icu"]
+            } else {
+                Vec::<&str>::new()
+            },
+            "extensions": {
+                "selected": Vec::<String>::new(),
+                "startupConfiguration": Vec::<String>::new()
+            },
+            "icu": icu
+        });
+        let manifest_path = output_dir.join(format!("{}.json", profile.as_str()));
+        fs::write(
+            &manifest_path,
+            format!("{}\n", serde_json::to_string_pretty(&seed_manifest)?),
+        )
+        .with_context(|| format!("write {}", manifest_path.display()))?;
         fs::remove_dir_all(&work_root)
             .with_context(|| format!("remove {}", work_root.display()))?;
     }
-    fs::create_dir_all(&work_root).with_context(|| format!("create {}", work_root.display()))?;
-
-    template_runner::run_wasix_initdb_template(runtime_stage, &work_root)?;
-
-    let pgdata = work_root.join("pgdata");
-    ensure!(
-        pgdata.join("PG_VERSION").is_file() && pgdata.join("global/pg_control").is_file(),
-        "WASIX initdb did not create a complete PGDATA template at {}",
-        pgdata.display()
-    );
-    template_runner::clean_generated_pgdata_template(&pgdata)?;
-
-    let archive = output_dir.join("pgdata-template.tar.zst");
-    deterministic_tar_zst(&pgdata, Path::new(""), &archive)?;
-    let manifest_path = output_dir.join("pgdata-template.json");
-    let source_pins = effective_source_pins(manifest, outputs)?;
-    let mut manifest_json = serde_json::json!({
-        "architectureIndependent": true,
-        "archiveSha256": sha256_file(&archive)?,
-        "catalogVersion": postgres_catalog_version(&outputs.source_dir)?,
-        "generatedBy": "wasix-initdb",
-        "initProfile": template_runner::default_initdb_profile(),
-        "initdbSha256": sha256_file(outputs.module_path("tool:initdb")?)?,
-        "postgresVersion": postgres_major_version(&outputs.postgres_version),
-        "sourceLane": outputs.source_lane.as_str(),
-        "sourcePinsSha256": source_pins_sha256(&source_pins)?,
-        "wasmerVersion": manifest.toolchain.wasmer,
-        "wasmSha256": sha256_file(outputs.module_path("runtime:oliphaunt")?)?,
-    });
-    if let Some(source_fingerprint) = &outputs.source_fingerprint {
-        manifest_json["sourceFingerprint"] = serde_json::json!(source_fingerprint);
-    }
-    fs::write(
-        &manifest_path,
-        format!("{}\n", serde_json::to_string_pretty(&manifest_json)?),
-    )
-    .with_context(|| format!("write {}", manifest_path.display()))?;
-    fs::remove_dir_all(&work_root).with_context(|| format!("remove {}", work_root.display()))?;
     Ok(())
 }
 
-fn build_promoted_extension_artifacts(
+fn build_extension_artifacts(
     source: &Path,
     build: &Path,
     stage: &Path,
@@ -1725,9 +1910,9 @@ fn build_promoted_extension_artifacts(
     }
 
     let mut packages = Vec::new();
-    for extension in extension_catalog::promoted_build_specs()? {
+    for extension in extension_catalog::extension_build_specs()? {
         let extension_stage = stage.join("extensions").join(&extension.sql_name);
-        stage_promoted_extension(source, build, &extension, &extension_stage)?;
+        stage_extension(source, build, &extension, &extension_stage)?;
         let archive_path = assets_dir.join(&extension.archive);
         deterministic_tar_zst(&extension_stage, Path::new(""), &archive_path)?;
         let native_modules = extension_native_module_artifacts(&extension, outputs)?;
@@ -1747,14 +1932,13 @@ fn build_promoted_extension_artifacts(
             },
             native_module: extension.module_file.clone(),
             native_modules,
-            stable: extension.stable,
         });
     }
     Ok(packages)
 }
 
 fn extension_native_module_artifacts(
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
     outputs: &BuildOutputs,
 ) -> Result<Vec<OwnedExtensionNativeModule>> {
     let mut modules = Vec::new();
@@ -1782,10 +1966,10 @@ fn extension_native_module_artifacts(
     Ok(modules)
 }
 
-fn stage_promoted_extension(
+fn stage_extension(
     source: &Path,
     build: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
     stage: &Path,
 ) -> Result<()> {
     match extension.build_kind.as_str() {
@@ -1797,7 +1981,7 @@ fn stage_promoted_extension(
             stage_recipe_staged_extension(build, extension, stage)
         }
         other => bail!(
-            "promoted extension {} has unsupported packaging build kind {other}",
+            "supported extension {} has unsupported packaging build kind {other}",
             extension.sql_name
         ),
     }
@@ -1805,7 +1989,7 @@ fn stage_promoted_extension(
 
 fn stage_recipe_staged_extension(
     build: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
     stage: &Path,
 ) -> Result<()> {
     let staging = extension
@@ -1894,7 +2078,7 @@ fn stage_recipe_staged_extension(
 
 fn stage_pgxs_style_extension(
     build: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
     stage: &Path,
 ) -> Result<()> {
     let source = Path::new(&extension.source_dir);
@@ -2000,7 +2184,7 @@ fn copy_extension_sql_dir(source: &Path, destination: &Path) -> Result<bool> {
 fn stage_contrib_extension(
     source: &Path,
     build: &Path,
-    extension: &extension_catalog::PromotedExtensionBuildSpec,
+    extension: &extension_catalog::ExtensionBuildSpec,
     stage: &Path,
 ) -> Result<()> {
     let contrib_dir = extension
@@ -2061,7 +2245,6 @@ fn stage_runtime_tree(build: &Path, source: &Path, runtime: &Path) -> Result<()>
     fs::create_dir_all(&lib).with_context(|| format!("create {}", lib.display()))?;
     fs::create_dir_all(&share).with_context(|| format!("create {}", share.display()))?;
 
-    copy_file(&build.join("src/backend/oliphaunt"), &bin.join("oliphaunt"))?;
     copy_file(&build.join("src/backend/oliphaunt"), &bin.join("postgres"))?;
     copy_file(&build.join("src/bin/initdb/initdb"), &bin.join("initdb"))?;
     fs::write(runtime.join("password"), b"password\n")
@@ -2236,7 +2419,7 @@ fn package_aot_artifacts(
     );
 
     let manifest = AotManifest {
-        format_version: 1,
+        format_version: AOT_MANIFEST_FORMAT_VERSION,
         source_lane: Some(outputs.source_lane.clone()),
         source_fingerprint: outputs.source_fingerprint.clone(),
         postgres_version: Some(outputs.postgres_version.clone()),
@@ -2329,7 +2512,7 @@ pub(crate) fn package_extension_aot_artifacts(
     for (sql_name, mut artifacts) in grouped {
         artifacts.sort_by(|left, right| left.name.cmp(&right.name));
         let manifest = AotManifest {
-            format_version: 1,
+            format_version: AOT_MANIFEST_FORMAT_VERSION,
             source_lane: Some(outputs.source_lane.clone()),
             source_fingerprint: outputs.source_fingerprint.clone(),
             postgres_version: Some(outputs.postgres_version.clone()),
@@ -2358,6 +2541,11 @@ pub(crate) fn check_aot_package_manifest(target: &str, source_lane: &str) -> Res
         .with_context(|| format!("read {}", manifest_path.display()))?;
     let manifest: AotManifest = serde_json::from_str(&text)
         .with_context(|| format!("parse {}", manifest_path.display()))?;
+    ensure!(
+        manifest.format_version == AOT_MANIFEST_FORMAT_VERSION,
+        "AOT manifest format-version must be {AOT_MANIFEST_FORMAT_VERSION}, got {}",
+        manifest.format_version
+    );
     let actual_lane = manifest.source_lane.as_deref().unwrap_or("<missing>");
     ensure_eq(
         actual_lane,
@@ -2552,11 +2740,10 @@ fn write_asset_manifest(
     extensions: &[ExtensionArtifact<'_>],
 ) -> Result<()> {
     let runtime_link = read_wasm_link_metadata(runtime_module)?;
-    let runtime_exports = wasm_export_name_set(&runtime_link);
     let extension_metadata = extension_catalog::manifest_metadata_by_sql_name()?;
     let effective_sources = effective_source_pins(sources, outputs)?;
     let manifest = AssetManifestOut {
-        format_version: 1,
+        format_version: ASSET_MANIFEST_FORMAT_VERSION,
         source_lane: Some(outputs.source_lane.clone()),
         source_fingerprint: outputs.source_fingerprint.clone(),
         runtime: RuntimeAssetOut {
@@ -2620,14 +2807,20 @@ fn write_asset_manifest(
                 .len(),
             link: read_wasm_link_metadata(initdb)?,
         }),
-        pgdata_template: Some(pgdata_template_asset_out(
-            sources,
-            outputs,
-            runtime_module,
-            initdb,
-            &assets_dir.join("prepopulated/pgdata-template.tar.zst"),
-            &assets_dir.join("prepopulated/pgdata-template.json"),
-        )?),
+        cluster_seeds: cluster_seed_runner::CatalogProfile::ALL
+            .into_iter()
+            .map(|profile| {
+                cluster_seed_asset_out(
+                    sources,
+                    outputs,
+                    runtime_module,
+                    initdb,
+                    assets_dir,
+                    profile,
+                )
+                .map(|asset| (profile.as_str().to_owned(), asset))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?,
         extensions: extensions
             .iter()
             .map(|extension| {
@@ -2654,23 +2847,34 @@ fn write_asset_manifest(
                 let mut core_exports_required = Vec::new();
                 let mut unresolved_imports = Vec::new();
                 if let Some(link) = &link {
+                    let primary_path = extension.module_path.ok_or_else(|| {
+                        anyhow!(
+                            "extension {} has link metadata without a module",
+                            extension.sql_name
+                        )
+                    })?;
                     let module_exports = extension_asset_provider_exports(
                         link,
+                        primary_path,
                         extension.sql_name,
+                        extension.native_modules,
                         &native_module_links,
-                    );
+                    )?;
                     for import in &link.imports {
                         if !import_should_resolve_from_runtime(import) {
                             continue;
                         }
-                        if import_resolves_from_linked_module_exports(import, &module_exports) {
+                        if import_resolves_from_wasm_exports(
+                            import,
+                            &module_exports,
+                            extension.sql_name,
+                        )? {
                             continue;
                         }
-                        let normalized = import.name.trim_start_matches('_');
-                        if runtime_exports.contains(import.name.as_str()) {
-                            core_exports_required.push(import.name.clone());
-                        } else if runtime_exports.contains(normalized) {
-                            core_exports_required.push(normalized.to_owned());
+                        if let Some(name) =
+                            resolved_wasm_export_name(import, &runtime_link.exports, "runtime")?
+                        {
+                            core_exports_required.push(name);
                         } else {
                             unresolved_imports.push(import.clone());
                         }
@@ -2685,32 +2889,21 @@ fn write_asset_manifest(
                     &installed_files,
                     extension.sql_name,
                 )?;
-                let promoted = extension.stable
-                    && metadata.smoke_status.direct == "passed"
-                    && metadata.smoke_status.server == "passed"
-                    && metadata.smoke_status.restart == "passed"
-                    && metadata.smoke_status.dump_restore == "passed";
-                ensure!(
-                    !metadata.smoke_status.promoted || promoted,
-                    "extension {} catalog metadata marks the asset promoted but current package evidence is insufficient",
-                    extension.sql_name
-                );
                 let native_modules = extension
                     .native_modules
                     .iter()
                     .map(|module| {
-                        let link = native_module_links.get(&module.name).cloned().ok_or_else(
-                            || anyhow!("missing link metadata for {}", module.name),
-                        )?;
+                        let link = native_module_links
+                            .get(&module.name)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("missing link metadata for {}", module.name))?;
                         Ok::<_, anyhow::Error>(BinaryAssetOut {
                             name: module.name.clone(),
                             path: module.runtime_path.clone(),
                             sha256: sha256_file(&module.path)?,
                             module_sha256: sha256_file(&module.path)?,
                             size: fs::metadata(&module.path)
-                                .with_context(|| {
-                                    format!("metadata {}", module.path.display())
-                                })?
+                                .with_context(|| format!("metadata {}", module.path.display()))?
                                 .len(),
                             link,
                         })
@@ -2732,10 +2925,8 @@ fn write_asset_manifest(
                     size: fs::metadata(extension.path)
                         .with_context(|| format!("metadata {}", extension.path.display()))?
                         .len(),
-                    stable: extension.stable,
                     control_files,
                     dependencies: metadata.dependencies.clone(),
-                    native_dependencies: metadata.native_dependencies.clone(),
                     load_order: metadata.load_order.clone(),
                     lifecycle: ExtensionLifecycleOut {
                         create_extension: metadata.lifecycle.create_extension,
@@ -2754,13 +2945,6 @@ fn write_asset_manifest(
                     core_exports_required,
                     unresolved_imports,
                     installed_files,
-                    smoke_status: ExtensionSmokeStatusOut {
-                        promoted,
-                        direct: metadata.smoke_status.direct.clone(),
-                        server: metadata.smoke_status.server.clone(),
-                        restart: metadata.smoke_status.restart.clone(),
-                        dump_restore: metadata.smoke_status.dump_restore.clone(),
-                    },
                     link,
                 })
             })
@@ -2816,6 +3000,112 @@ fn extension_control_files_for_asset_manifest(
 mod tests {
     use super::*;
 
+    fn test_binary_asset(name: &str, path: &str, sha256: &str, size: u64) -> BinaryAssetOut {
+        BinaryAssetOut {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            sha256: sha256.to_owned(),
+            module_sha256: sha256.to_owned(),
+            size,
+            link: WasmLinkMetadataOut {
+                has_dylink0: false,
+                dylink_needed: Vec::new(),
+                dylink_runtime_paths: Vec::new(),
+                dylink_memory: None,
+                dylink_imports: Vec::new(),
+                dylink_exports: Vec::new(),
+                imports: Vec::new(),
+                exports: Vec::new(),
+                memories: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn wasix_tools_npm_descriptor_metadata_is_updated_together() {
+        let pg_dump = test_binary_asset(
+            "pg_dump",
+            "bin/pg_dump.wasix.wasm",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1_234,
+        );
+        let psql = test_binary_asset(
+            "psql",
+            "bin/psql.wasix.wasm",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            5_678,
+        );
+        let original = concat!(
+            "// Preserve the workspace descriptor around its generated rows.\n",
+            "export default Object.freeze({\n",
+            "  pgDump: Object.freeze({\n",
+            "    name: 'pg_dump',\n",
+            "    sha256: 'old-pg-dump',\n",
+            "    size: 12,\n",
+            "    source: new URL('pg_dump.wasix.wasm', import.meta.url).href,\n",
+            "  }),\n",
+            "  psql: Object.freeze({\n",
+            "    name: 'psql',\n",
+            "    sha256: 'old-psql',\n",
+            "    size: 34,\n",
+            "    source: new URL('psql.wasix.wasm', import.meta.url).href,\n",
+            "  }),\n",
+            "});\n",
+        );
+
+        let updated = update_wasix_tools_npm_descriptor_rows(original, &pg_dump, &psql)
+            .expect("update descriptor metadata");
+
+        assert!(updated.starts_with("// Preserve the workspace descriptor"));
+        assert!(updated.contains(
+            "sha256: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\n    size: 1234,\n    source: new URL('pg_dump.wasix.wasm'"
+        ));
+        assert!(updated.contains(
+            "sha256: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',\n    size: 5678,\n    source: new URL('psql.wasix.wasm'"
+        ));
+        assert_eq!(updated.matches("sha256:").count(), 2);
+        assert_eq!(updated.matches("size:").count(), 2);
+        assert!(updated.ends_with("});\n"));
+        assert_eq!(
+            update_wasix_tools_npm_descriptor_rows(&updated, &pg_dump, &psql)
+                .expect("update already-current descriptor"),
+            updated
+        );
+    }
+
+    #[test]
+    fn wasix_icu_data_uses_the_canonical_work_root() {
+        assert_eq!(
+            wasix_icu_data_path(),
+            Path::new(WASIX_GENERATED_WORK_DIR).join("icu-wasix/share/icu")
+        );
+        assert!(!wasix_icu_data_path().starts_with(WASIX_POSTGRES_GENERATED_BUILD_DIR));
+    }
+
+    #[test]
+    fn wasix_icu_identity_rejects_install_scaffolding() -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oliphaunt-wasix-icu-identity-{}-{now}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("icudt76l/coll"))?;
+        fs::write(root.join("icudt76l/root.res"), b"root")?;
+        fs::write(root.join("icudt76l/coll/en.res"), b"en")?;
+        validate_canonical_wasix_icu_data_root(&root)?;
+
+        fs::create_dir_all(root.join("76.1/config"))?;
+        fs::write(root.join("76.1/config/mh-linux"), b"build-only")?;
+        let error = validate_canonical_wasix_icu_data_root(&root)
+            .expect_err("install scaffolding must not enter the logical ICU identity");
+        assert!(error.to_string().contains("only canonical icudt"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn manifest_extension_metadata(
         create_extension: bool,
         control_files: Vec<&str>,
@@ -2824,7 +3114,6 @@ mod tests {
             source_kind: "postgres-contrib".to_owned(),
             control_files: control_files.into_iter().map(str::to_owned).collect(),
             dependencies: Vec::new(),
-            native_dependencies: Vec::new(),
             load_order: Vec::new(),
             lifecycle: extension_catalog::ManifestExtensionLifecycle {
                 create_extension,
@@ -2835,13 +3124,6 @@ mod tests {
                 preload_required: false,
                 restart_required: false,
                 shared_memory_required: false,
-            },
-            smoke_status: extension_catalog::ManifestExtensionSmokeStatus {
-                promoted: true,
-                direct: "passed".to_owned(),
-                server: "passed".to_owned(),
-                restart: "passed".to_owned(),
-                dump_restore: "not-run".to_owned(),
             },
         }
     }
@@ -2949,14 +3231,14 @@ mod tests {
         postgres_version: Option<&str>,
     ) {
         let manifest = AotManifest {
-            format_version: 1,
+            format_version: AOT_MANIFEST_FORMAT_VERSION,
             source_lane: source_lane.map(str::to_owned),
             source_fingerprint: source_fingerprint.map(str::to_owned),
             postgres_version: postgres_version.map(str::to_owned),
             target_triple: "aarch64-apple-darwin".to_owned(),
             engine: "llvm-opta".to_owned(),
-            wasmer_version: "7.2.0".to_owned(),
-            wasmer_wasix_version: "0.702.0".to_owned(),
+            wasmer_version: "7.2.1".to_owned(),
+            wasmer_wasix_version: "0.702.1".to_owned(),
             artifacts: vec![AotManifestArtifact {
                 name: "runtime:oliphaunt".to_owned(),
                 path: "oliphaunt.aot.zst".to_owned(),
@@ -3012,6 +3294,40 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_stable_aot_manifest_rejects_noncanonical_format_version() {
+        let path = temp_aot_manifest_path("wrong-format-version");
+        let fingerprint = expected_postgres_source_fingerprint().expect("PG18 fingerprint");
+        write_downloaded_aot_manifest(
+            &path,
+            Some("stable"),
+            Some(&fingerprint),
+            Some("18.4-wasix-oliphaunt"),
+        );
+        let mut manifest: AotManifest =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read AOT manifest"))
+                .expect("parse AOT manifest");
+        manifest.format_version = AOT_MANIFEST_FORMAT_VERSION + 1;
+        fs::write(
+            &path,
+            serde_json::to_string(&manifest).expect("serialize AOT manifest"),
+        )
+        .expect("write AOT manifest");
+
+        let error = ensure_aot_manifest_matches_source_lane(
+            &path,
+            "aarch64-apple-darwin",
+            DEFAULT_SOURCE_LANE,
+        )
+        .expect_err("downloaded AOT manifest with a noncanonical format version should fail");
+
+        assert!(
+            error.to_string().contains("AOT manifest format-version"),
+            "unexpected validation error: {error:#}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn downloaded_stable_aot_manifest_rejects_stale_wasmer_metadata() {
         let path = temp_aot_manifest_path("stale-wasmer");
         let fingerprint = expected_postgres_source_fingerprint().expect("PG18 fingerprint");
@@ -3024,8 +3340,8 @@ mod tests {
         let mut manifest: AotManifest =
             serde_json::from_str(&fs::read_to_string(&path).expect("read AOT manifest"))
                 .expect("parse AOT manifest");
-        manifest.wasmer_version = "7.2.0-alpha.3".to_owned();
-        manifest.wasmer_wasix_version = "0.702.0-alpha.3".to_owned();
+        manifest.wasmer_version = "7.2.1-alpha.3".to_owned();
+        manifest.wasmer_wasix_version = "0.702.1-alpha.3".to_owned();
         fs::write(
             &path,
             serde_json::to_string(&manifest).expect("serialize AOT manifest"),
@@ -3055,6 +3371,13 @@ mod tests {
         }
     }
 
+    fn wasm_export(name: &str, kind: &str) -> WasmExportOut {
+        WasmExportOut {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+        }
+    }
+
     #[test]
     fn wasix_linker_provided_imports_do_not_require_runtime_exports() {
         for import in [
@@ -3077,12 +3400,31 @@ mod tests {
     }
 
     #[test]
+    fn single_backend_runtime_rejects_thread_creation_imports() {
+        for import in [
+            wasm_import("wasi", "thread-spawn", "func"),
+            wasm_import("wasix_32v1", "thread_spawn_v2", "func"),
+            wasm_import("env", "__pthread_create", "func"),
+        ] {
+            assert!(is_thread_spawn_import(&import), "{import:?}");
+        }
+
+        for import in [
+            wasm_import("wasix_32v1", "thread_exit", "func"),
+            wasm_import("wasix_32v1", "thread_signal", "func"),
+            wasm_import("wasix_32v1", "thread_parallelism", "func"),
+        ] {
+            assert!(!is_thread_spawn_import(&import), "{import:?}");
+        }
+    }
+
+    #[test]
     fn side_module_exports_satisfy_their_own_dynamic_symbol_imports() {
-        let module_exports = HashSet::from([
-            "GEOSArea_r".to_owned(),
-            "_ZN10FlatGeobuf11PackedRTree4initEt".to_owned(),
-            "ZN10FlatGeobuf11PackedRTree4initEt".to_owned(),
-        ]);
+        let module_exports = vec![
+            wasm_export("GEOSArea_r", "func"),
+            wasm_export("_ZN10FlatGeobuf11PackedRTree4initEt", "func"),
+            wasm_export("ZN10FlatGeobuf11PackedRTree4initEt", "func"),
+        ];
 
         for import in [
             wasm_import("env", "GEOSArea_r", "func"),
@@ -3091,80 +3433,221 @@ mod tests {
         ] {
             assert!(import_should_resolve_from_runtime(&import));
             assert!(
-                import_resolves_from_linked_module_exports(&import, &module_exports),
+                import_resolves_from_wasm_exports(&import, &module_exports, "test module")
+                    .expect("valid typed provider"),
                 "{import:?} should be self-resolved by the linked side module"
             );
         }
     }
 
     #[test]
-    fn unresolved_extension_imports_still_require_runtime_exports() {
+    fn new_extension_imports_extend_the_sealed_runtime_policy() {
         let runtime_import = wasm_import("env", "SearchSysCache1", "func");
-        let module_exports = HashSet::from(["GEOSArea_r".to_owned()]);
+        let module_exports = vec![wasm_export("GEOSArea_r", "func")];
 
         assert!(import_should_resolve_from_runtime(&runtime_import));
-        assert!(!import_resolves_from_linked_module_exports(
-            &runtime_import,
-            &module_exports
-        ));
+        assert!(
+            !import_resolves_from_wasm_exports(&runtime_import, &module_exports, "test module")
+                .expect("absent export")
+        );
+        assert_eq!(
+            runtime_export_name_for_side_import(&runtime_import),
+            "SearchSysCache1"
+        );
+    }
+
+    #[test]
+    fn side_module_provider_kinds_must_match_dynamic_imports() {
+        let error = import_resolves_from_wasm_exports(
+            &wasm_import("GOT.func", "SearchSysCache1", "global"),
+            &[wasm_export("SearchSysCache1", "global")],
+            "test module",
+        )
+        .expect_err("function-address imports must resolve to functions");
+        assert!(error.to_string().contains("expected func"));
+    }
+
+    #[test]
+    fn side_module_providers_follow_declared_dynamic_dependencies() {
+        let mut root = WasmLinkMetadataOut::default();
+        root.dylink_needed = vec!["declared.so".to_owned()];
+        root.exports = vec![wasm_export("root_symbol", "func")];
+        let mut declared = WasmLinkMetadataOut::default();
+        declared.exports = vec![wasm_export("declared_symbol", "func")];
+        let mut undeclared = WasmLinkMetadataOut::default();
+        undeclared.exports = vec![wasm_export("undeclared_symbol", "func")];
+        let links = BTreeMap::from([
+            ("extension:test".to_owned(), root),
+            ("extension:test:declared".to_owned(), declared),
+            ("extension:test:undeclared".to_owned(), undeclared),
+        ]);
+        let basenames = BTreeMap::from([
+            ("root.so".to_owned(), "extension:test".to_owned()),
+            (
+                "declared.so".to_owned(),
+                "extension:test:declared".to_owned(),
+            ),
+            (
+                "undeclared.so".to_owned(),
+                "extension:test:undeclared".to_owned(),
+            ),
+        ]);
+
+        let exports = side_module_provider_exports("extension:test", &links, &basenames)
+            .expect("declared provider graph");
+        assert!(
+            import_resolves_from_wasm_exports(
+                &wasm_import("env", "declared_symbol", "func"),
+                &exports,
+                "test graph",
+            )
+            .expect("declared provider")
+        );
+        assert!(
+            !import_resolves_from_wasm_exports(
+                &wasm_import("env", "undeclared_symbol", "func"),
+                &exports,
+                "test graph",
+            )
+            .expect("undeclared provider")
+        );
+    }
+
+    #[test]
+    fn sealed_runtime_export_policy_requires_exact_surface() {
+        let expected = BTreeSet::from(["_start".to_owned(), "runtime_abi".to_owned()]);
+        ensure_exact_runtime_export_surface(&expected, &expected).expect("exact export surface");
+
+        let error = ensure_exact_runtime_export_surface(
+            &BTreeSet::from(["_start".to_owned(), "ambient".to_owned()]),
+            &expected,
+        )
+        .expect_err("ambient export must fail");
+        let message = error.to_string();
+        assert!(message.contains("runtime_abi"));
+        assert!(message.contains("ambient"));
     }
 }
 
-fn pgdata_template_asset_out(
+fn cluster_seed_asset_out(
     sources: &SourcesManifest,
     outputs: &BuildOutputs,
     runtime_module: &Path,
     initdb_module: &Path,
-    archive: &Path,
-    manifest: &Path,
-) -> Result<PgDataTemplateAssetOut> {
-    ensure_file(archive)?;
-    ensure_file(manifest)?;
+    assets_dir: &Path,
+    profile: cluster_seed_runner::CatalogProfile,
+) -> Result<ClusterSeedAssetOut> {
+    let archive_relative = format!("cluster-seeds/{}.tar.zst", profile.as_str());
+    let manifest_relative = format!("cluster-seeds/{}.json", profile.as_str());
+    let archive = assets_dir.join(&archive_relative);
+    let manifest = assets_dir.join(&manifest_relative);
+    ensure_file(&archive)?;
+    ensure_file(&manifest)?;
     let manifest_text =
-        fs::read_to_string(manifest).with_context(|| format!("read {}", manifest.display()))?;
+        fs::read_to_string(&manifest).with_context(|| format!("read {}", manifest.display()))?;
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text)
         .with_context(|| format!("parse {}", manifest.display()))?;
-    let template_source_lane = manifest_json
-        .get("sourceLane")
+    let seed_source = manifest_json
+        .get("source")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("{} is missing source identity", manifest.display()))?;
+    let seed_runtime = manifest_json
+        .get("runtime")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("{} is missing runtime identity", manifest.display()))?;
+    let seed_source_lane = seed_source
+        .get("lane")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<missing>");
     ensure_eq(
-        template_source_lane,
+        seed_source_lane,
         outputs.source_lane.as_str(),
-        "PGDATA template manifest sourceLane",
+        "cluster seed manifest source.lane",
     )?;
     if let Some(source_fingerprint) = outputs.source_fingerprint.as_deref() {
-        let template_source_fingerprint = manifest_json
-            .get("sourceFingerprint")
+        let seed_source_fingerprint = seed_source
+            .get("fingerprint")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<missing>");
         ensure_eq(
-            template_source_fingerprint,
+            seed_source_fingerprint,
             source_fingerprint,
-            "PGDATA template manifest sourceFingerprint",
+            "cluster seed manifest source.fingerprint",
         )?;
     }
+    ensure_eq(
+        manifest_json
+            .get("catalogProfile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        profile.as_str(),
+        "cluster seed manifest catalogProfile",
+    )?;
+    ensure_eq(
+        manifest_json
+            .get("artifactRole")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        profile.artifact_role(),
+        "cluster seed manifest artifactRole",
+    )?;
+    let runtime_module_sha256 = sha256_file(runtime_module)?;
+    let initdb_module_sha256 = sha256_file(initdb_module)?;
+    ensure_eq(
+        seed_runtime
+            .get("consumerSha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        &runtime_module_sha256,
+        "cluster seed manifest runtime.consumerSha256",
+    )?;
+    ensure_eq(
+        seed_runtime
+            .get("initdbSha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        &initdb_module_sha256,
+        "cluster seed manifest runtime.initdbSha256",
+    )?;
     let source_pins = effective_source_pins(sources, outputs)?;
-    Ok(PgDataTemplateAssetOut {
-        archive: "prepopulated/pgdata-template.tar.zst".to_owned(),
-        manifest: "prepopulated/pgdata-template.json".to_owned(),
-        sha256: sha256_file(archive)?,
-        size: fs::metadata(archive)
+    Ok(ClusterSeedAssetOut {
+        artifact_role: profile.artifact_role().to_owned(),
+        catalog_profile: profile.as_str().to_owned(),
+        archive: archive_relative,
+        manifest: manifest_relative,
+        sha256: sha256_file(&archive)?,
+        size: fs::metadata(&archive)
             .with_context(|| format!("metadata {}", archive.display()))?
             .len(),
-        runtime_module_sha256: sha256_file(runtime_module)?,
-        initdb_module_sha256: sha256_file(initdb_module)?,
+        runtime_module_sha256,
+        initdb_module_sha256,
         source_pins_sha256: source_pins_sha256(&source_pins)?,
         source_lane: Some(outputs.source_lane.clone()),
         source_fingerprint: outputs.source_fingerprint.clone(),
         postgres_version: postgres_major_version(&outputs.postgres_version),
-        catalog_version: manifest_json
+        catalog_version: seed_source
             .get("catalogVersion")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_owned(),
-        init_profile: template_runner::default_initdb_profile().to_owned(),
+        init_profile: cluster_seed_runner::default_initdb_profile().to_owned(),
         wasmer_version: sources.toolchain.wasmer.clone(),
+        physical_format: seed_runtime
+            .get("physicalFormat")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>")
+            .to_owned(),
+        compatibility_key: seed_runtime
+            .get("compatibilityKey")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>")
+            .to_owned(),
+        icu_data_tree_sha256: manifest_json
+            .get("icu")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|icu| icu.get("dataTreeSha256"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -3263,6 +3746,138 @@ fn source_pins_sha256(sources: &[SourcePin]) -> Result<String> {
     Ok(sha256_bytes(&pins))
 }
 
+fn release_product_version(product_path: &str) -> Result<String> {
+    let path = Path::new(".release-please-manifest.json");
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    manifest
+        .get(product_path)
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} does not identify release product {product_path}",
+                path.display()
+            )
+        })
+}
+
+fn wasix_icu_data_root() -> Result<PathBuf> {
+    let root = wasix_icu_data_path();
+    validate_canonical_wasix_icu_data_root(&root)?;
+    Ok(root)
+}
+
+fn validate_canonical_wasix_icu_data_root(root: &Path) -> Result<()> {
+    ensure!(
+        root.is_dir() && tree_contains_icu_files_data(&root)?,
+        "ICU cluster-seed generation requires the exact WASIX ICU files-data tree at {}; build the WASIX runtime first",
+        root.display()
+    );
+    for file in sorted_files(&root)? {
+        let relative = file
+            .strip_prefix(&root)
+            .with_context(|| format!("strip {} from {}", root.display(), file.display()))?;
+        let first = relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .unwrap_or_default();
+        ensure!(
+            first.starts_with("icudt"),
+            "WASIX ICU data root must contain only canonical icudt files-data payloads, found {}",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
+fn wasix_icu_data_path() -> PathBuf {
+    Path::new(WASIX_GENERATED_WORK_DIR).join("icu-wasix/share/icu")
+}
+
+fn tree_contains_icu_files_data(root: &Path) -> Result<bool> {
+    for file in sorted_files(root)? {
+        let relative = file
+            .strip_prefix(root)
+            .with_context(|| format!("strip {} from {}", root.display(), file.display()))?;
+        if relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with("icudt"))
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Digest the logical portable files tree, independent of host metadata.
+/// Each sorted row is `path NUL size NUL file-bytes LF`.
+fn logical_tree_sha256(root: &Path) -> Result<String> {
+    let mut digest = Sha256::new();
+    for file in sorted_files(root)? {
+        let relative = file
+            .strip_prefix(root)
+            .with_context(|| format!("strip {} from {}", root.display(), file.display()))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| anyhow!("ICU data path is not UTF-8: {}", file.display()))?
+            .replace('\\', "/");
+        ensure!(
+            !relative.is_empty() && !relative.contains('\0'),
+            "ICU data path is not portable: {}",
+            file.display()
+        );
+        let size = fs::metadata(&file)
+            .with_context(|| format!("metadata {}", file.display()))?
+            .len();
+        digest.update(relative.as_bytes());
+        digest.update([0]);
+        digest.update(size.to_string().as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(&file).with_context(|| format!("read {}", file.display()))?);
+        digest.update([b'\n']);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn tree_stats(root: &Path) -> Result<(u64, u64, u64)> {
+    let mut expanded_bytes = 0_u64;
+    let mut regular_files = 0_u64;
+    let mut directories = 0_u64;
+    for entry in WalkDir::new(root) {
+        let entry = entry.with_context(|| format!("walk {}", root.display()))?;
+        if entry.path() == root {
+            continue;
+        }
+        if entry.file_type().is_file() {
+            regular_files += 1;
+            expanded_bytes = expanded_bytes
+                .checked_add(entry.metadata()?.len())
+                .ok_or_else(|| {
+                    anyhow!("expanded tree size overflow at {}", entry.path().display())
+                })?;
+        } else if entry.file_type().is_dir() {
+            directories += 1;
+        } else {
+            bail!(
+                "cluster seed must contain only regular files and directories: {}",
+                entry.path().display()
+            );
+        }
+    }
+    ensure!(
+        regular_files > 0 && directories > 0,
+        "cluster seed tree {} must contain files and directories",
+        root.display()
+    );
+    Ok((expanded_bytes, regular_files, directories))
+}
+
 fn postgres_catalog_version(source_dir: &Path) -> Result<String> {
     let path = source_dir.join("src/include/catalog/catversion.h");
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -3282,26 +3897,23 @@ pub(crate) fn update_staged_root_asset_metadata(workspace: &Path) -> Result<()> 
     let asset_dir = workspace.join(GENERATED_ASSETS_DIR);
     let manifest = read_asset_manifest_from(&asset_dir)?;
     let runtime_archive = asset_dir.join(&manifest.runtime.archive);
-    let runtime_module = archive_entry_bytes(&runtime_archive, "oliphaunt/bin/oliphaunt")?;
-    update_root_asset_metadata_in(
-        workspace,
-        &asset_dir,
-        &manifest,
-        &sha256_bytes(&runtime_module),
-    )
+    let runtime_module = archive_entry_bytes(&runtime_archive, RUNTIME_MODULE_ARCHIVE_MEMBER)?;
+    update_root_asset_metadata_in(workspace, &manifest, &sha256_bytes(&runtime_module))
 }
 
 fn update_root_asset_metadata_in(
     workspace: &Path,
-    asset_dir: &Path,
     manifest: &AssetManifestOut,
     runtime_module_sha256: &str,
 ) -> Result<()> {
     let path = workspace.join("src/bindings/wasix-rust/crates/oliphaunt-wasix/Cargo.toml");
     let tools_path = workspace.join("src/runtimes/liboliphaunt/wasix/crates/tools/Cargo.toml");
+    let tools_npm_path = workspace.join(WASIX_TOOLS_NPM_DESCRIPTOR_PATH);
     let mut text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut tools_text = fs::read_to_string(&tools_path)
         .with_context(|| format!("read {}", tools_path.display()))?;
+    let tools_npm_text = fs::read_to_string(&tools_npm_path)
+        .with_context(|| format!("read {}", tools_npm_path.display()))?;
     let pg18 = load_postgres_source_manifest()?;
     text = replace_metadata_value(text, "postgres-version", &manifest.runtime.postgres_version);
     text = replace_metadata_value(text, "postgres-source-url", &pg18.postgresql.url);
@@ -3313,25 +3925,129 @@ fn update_root_asset_metadata_in(
     );
     text = replace_metadata_value(text, "runtime-archive-sha256", &manifest.runtime.sha256);
     text = replace_metadata_value(text, "oliphaunt-wasix-sha256", runtime_module_sha256);
-    let pgdata_template = asset_dir.join("prepopulated/pgdata-template.tar.zst");
-    if pgdata_template.exists() {
+    for profile in ["standard", "icu"] {
+        let seed = manifest.cluster_seeds.get(profile).with_context(|| {
+            format!("generated asset manifest is missing {profile} cluster seed")
+        })?;
         text = replace_metadata_value(
             text,
-            "pgdata-template-archive-sha256",
-            &sha256_file(&pgdata_template)?,
+            &format!("cluster-seed-{profile}-archive-sha256"),
+            &seed.sha256,
         );
     }
-    if let Some(pg_dump) = &manifest.pg_dump {
-        tools_text = replace_metadata_value(tools_text, "pg-dump-wasix-sha256", &pg_dump.sha256);
-    }
-    if let Some(psql) = &manifest.psql {
-        tools_text = replace_metadata_value(tools_text, "psql-wasix-sha256", &psql.sha256);
-    }
+    let (pg_dump, psql) = required_wasix_tool_assets(manifest)?;
+    let tools_npm_text = update_wasix_tools_npm_descriptor_rows(&tools_npm_text, pg_dump, psql)?;
+    tools_text = replace_metadata_value(tools_text, "pg-dump-wasix-sha256", &pg_dump.sha256);
+    tools_text = replace_metadata_value(tools_text, "psql-wasix-sha256", &psql.sha256);
     if let Some(initdb) = &manifest.initdb {
         text = replace_metadata_value(text, "initdb-wasix-sha256", &initdb.sha256);
     }
     fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-    fs::write(&tools_path, tools_text).with_context(|| format!("write {}", tools_path.display()))
+    fs::write(&tools_path, tools_text)
+        .with_context(|| format!("write {}", tools_path.display()))?;
+    fs::write(&tools_npm_path, tools_npm_text)
+        .with_context(|| format!("write {}", tools_npm_path.display()))
+}
+
+pub(crate) const WASIX_TOOLS_NPM_DESCRIPTOR_PATH: &str =
+    "src/runtimes/liboliphaunt/wasix/tools-npm/index.js";
+
+fn required_wasix_tool_asset<'a>(
+    asset: Option<&'a BinaryAssetOut>,
+    expected_name: &str,
+    expected_path: &str,
+) -> Result<&'a BinaryAssetOut> {
+    let asset = asset
+        .with_context(|| format!("generated asset manifest is missing the {expected_name} tool"))?;
+    ensure_eq(
+        &asset.name,
+        expected_name,
+        &format!("{expected_name} tool name"),
+    )?;
+    ensure_eq(
+        &asset.path,
+        expected_path,
+        &format!("{expected_name} tool path"),
+    )?;
+    Ok(asset)
+}
+
+pub(crate) fn update_wasix_tools_npm_descriptor(
+    text: &str,
+    manifest: &AssetManifestOut,
+) -> Result<String> {
+    let (pg_dump, psql) = required_wasix_tool_assets(manifest)?;
+    update_wasix_tools_npm_descriptor_rows(text, pg_dump, psql)
+}
+
+fn required_wasix_tool_assets(
+    manifest: &AssetManifestOut,
+) -> Result<(&BinaryAssetOut, &BinaryAssetOut)> {
+    Ok((
+        required_wasix_tool_asset(
+            manifest.pg_dump.as_ref(),
+            "pg_dump",
+            "bin/pg_dump.wasix.wasm",
+        )?,
+        required_wasix_tool_asset(manifest.psql.as_ref(), "psql", "bin/psql.wasix.wasm")?,
+    ))
+}
+
+fn update_wasix_tools_npm_descriptor_rows(
+    text: &str,
+    pg_dump: &BinaryAssetOut,
+    psql: &BinaryAssetOut,
+) -> Result<String> {
+    let mut updated = text.to_owned();
+    for asset in [pg_dump, psql] {
+        let marker = format!("    name: '{}',", asset.name);
+        let marker_count = updated.matches(&marker).count();
+        ensure!(
+            marker_count == 1,
+            "WASIX tools npm workspace descriptor must contain exactly one {marker:?} row, found {marker_count}"
+        );
+        let block_start = updated
+            .find(&marker)
+            .expect("validated descriptor marker must exist");
+        let block_end = updated[block_start..]
+            .find("  }),")
+            .map(|offset| block_start + offset)
+            .context("WASIX tools npm workspace descriptor has an unterminated tool row")?;
+        let block = &updated[block_start..block_end];
+        let block = replace_wasix_tools_npm_field(
+            block,
+            "sha256",
+            &format!("'{}'", asset.sha256),
+            &asset.name,
+        )?;
+        let block =
+            replace_wasix_tools_npm_field(&block, "size", &asset.size.to_string(), &asset.name)?;
+        updated.replace_range(block_start..block_end, &block);
+    }
+    Ok(updated)
+}
+
+fn replace_wasix_tools_npm_field(
+    block: &str,
+    field: &str,
+    value: &str,
+    tool: &str,
+) -> Result<String> {
+    let prefix = format!("    {field}: ");
+    let matches = block.match_indices(&prefix).collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "WASIX tools npm workspace descriptor {tool} row must contain exactly one {field} field, found {}",
+        matches.len()
+    );
+    let start = matches[0].0;
+    let end = block[start..]
+        .find('\n')
+        .map(|offset| start + offset)
+        .unwrap_or(block.len());
+    let mut updated = block.to_owned();
+    updated.replace_range(start..end, &format!("{prefix}{value},"));
+    Ok(updated)
 }
 
 fn replace_metadata_value(mut text: String, key: &str, value: &str) -> String {

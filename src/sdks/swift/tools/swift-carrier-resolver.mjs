@@ -23,7 +23,10 @@ const STABLE_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
 const EXTRACTED_CACHE_SCHEMA = "oliphaunt-extracted-carrier-tree-v1";
 const MAX_CARRIER_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ZIP_CARRIER_BYTES = 512 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES = 8192;
+// Match the release-side iOS carrier envelope. Current XCFrameworks contain
+// one runtime-resource tree per slice, so the consumer must accept the same
+// bounded archive shape that the producer validates.
+const MAX_ARCHIVE_ENTRIES = 32_768;
 const MAX_ARCHIVE_MEMBER_BYTES = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024;
 const ALLOWED_ZIP_EXTRA_FIELDS = new Set([0x5455, 0x5855, 0x7875]);
@@ -542,8 +545,13 @@ function validateBase(value, label, allowFileUrls) {
   const unsupported = [...new Set(rows.filter(({ role }) => !allowed.has(role)).map(({ role }) => role))].sort(compareText);
   if (unsupported.length) fail(`${label}.assets has unsupported roles: ${unsupported.join(",")}`);
   const framework = oneRole(rows, "base-xcframework", `${label}.assets`);
-  oneRole(rows, "runtime-resources", `${label}.assets`);
+  const runtime = oneRole(rows, "runtime-resources", `${label}.assets`);
   oneRole(rows, "icu-data", `${label}.assets`);
+  const expectedRuntimeName =
+    `liboliphaunt-${version}-runtime-resources-ios-datum64.tar.gz`;
+  if (runtime.name !== expectedRuntimeName) {
+    fail(`${label} runtime-resources asset must be ${expectedRuntimeName}`);
+  }
   if (!path.posix.basename(framework.member).endsWith(".xcframework")) fail(`${label} base framework member must be an XCFramework`);
   return { assets: rows, product: row.product, tag: row.tag, version };
 }
@@ -1281,7 +1289,7 @@ export async function resolveSwiftCarrierSelection({
   try { packageUrl = new URL(basePackageUrl); } catch { fail("basePackageUrl must be an HTTPS Git URL"); }
   if (packageUrl.protocol !== "https:" || !packageUrl.pathname.endsWith(".git")) fail("basePackageUrl must be an HTTPS Git URL ending in .git");
   return {
-    schema: "oliphaunt-swiftpm-extension-input-v1",
+    schema: "oliphaunt-swiftpm-extension-selection-v1",
     basePackage: { name: "Oliphaunt", url: packageUrl.href, version: basePackageVersion },
     nativeRuntime: { product: base.product, version: base.version },
     extensions: output,

@@ -70,6 +70,15 @@ $VcRuntimeClosureTool = Join-Path $RepoRoot "tools/release/windows-vc-runtime-cl
 $Stamp = Join-Path $OutDir "oliphaunt-windows.inputs.sha256"
 $ExternalCheckoutRoot = Join-Path $RepoRoot "target/oliphaunt-sources/checkouts"
 $OpenSslSourceManifest = Join-Path $RepoRoot "src/sources/third-party/shared/openssl.toml"
+$IcuDataSourceManifest = Join-Path $RepoRoot "src/sources/third-party/shared/icu-data.toml"
+$IcuWindowsSourceManifest = Join-Path $RepoRoot "src/sources/third-party/native/icu-windows.toml"
+$IcuDataArchive = Join-Path $ExternalCheckoutRoot "icu-data/icudt76l.dat"
+$IcuWindowsRoot = Join-Path $ExternalCheckoutRoot "icu-windows"
+$IcuDataRoot = Join-Path $WorkRoot "icu/share/icu"
+$IcuDataArchiveSha256 = "dbc14e1c48ef209f230adc2aa6854bd4d6bba8f5e6733e75897a4263d97920f0"
+$IcuDataTreeSha256 = "0523cc164d698d95d844e3683bbe23d415b575b84f4a04287d372e1c132cf1d1"
+$IcuRuntimeDllNames = @("icudt76.dll", "icuin76.dll", "icuuc76.dll")
+$NativeComponentTool = Join-Path $RepoRoot "src/extensions/tools/native-component-contract.mjs"
 $PgxsBuildPlan = Join-Path $RepoRoot "src/extensions/generated/pgxs-build.tsv"
 $PortableUuidDir = Join-Path $RepoRoot "src/runtimes/liboliphaunt/native/portable-uuid"
 $PortableUuidIncludeDir = Join-Path $PortableUuidDir "include"
@@ -97,10 +106,11 @@ $LiboliphauntSources = @(
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_native.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_runtime.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_protocol.c",
-    "src/runtimes/liboliphaunt/native/src/liboliphaunt_bootstrap.c",
+    "src/runtimes/liboliphaunt/native/src/liboliphaunt_config.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_process.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_trace.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_fs.c",
+    "src/runtimes/liboliphaunt/native/src/liboliphaunt_backup_state.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_archive.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_archive_tar.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_static_extensions.c",
@@ -190,6 +200,23 @@ function Invoke-Python([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) {
         Fail "python command failed: $($Arguments -join ' ')"
     }
+}
+
+function Get-NativeExtensionComponentField([string]$SqlName, [string]$Field) {
+    Require-Command bun
+    $values = @(& bun $NativeComponentTool field $SqlName native native-dynamic $TargetId $Field)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "native component $Field resolution failed for $SqlName/$TargetId"
+    }
+    return @($values | Where-Object { $_ })
+}
+
+function Get-NativeExtensionComponents([string]$SqlName) {
+    return @(Get-NativeExtensionComponentField $SqlName "components")
+}
+
+function Get-NativeExtensionComponentSources([string]$SqlName) {
+    return @(Get-NativeExtensionComponentField $SqlName "sources")
 }
 
 function Add-PythonUserScriptsToPath {
@@ -499,8 +526,11 @@ function Get-DesiredHash {
     foreach ($source in $LiboliphauntSources) {
         $parts.Add("source:$source=$(Get-FileSha256 $source)")
     }
-    foreach ($source in @(
+    $sourceInputs = @(
         $OpenSslSourceManifest,
+        $IcuDataSourceManifest,
+        $IcuWindowsSourceManifest,
+        (Join-Path $RepoRoot "src/extensions/catalog/native-components.toml"),
         $PgxsBuildPlan,
         (Join-Path $PortableUuidDir "portable_uuid.c"),
         (Join-Path $PortableUuidIncludeDir "uuid/uuid.h"),
@@ -509,15 +539,13 @@ function Get-DesiredHash {
         (Join-Path $RepoRoot "src/extensions/external/pg_textsearch/source.toml"),
         (Join-Path $RepoRoot "src/extensions/external/pg_uuidv7/source.toml"),
         (Join-Path $RepoRoot "src/extensions/external/postgis/source.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/deps.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/geos/source.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/json-c/source.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/libxml2/source.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/proj/source.toml"),
-        (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/sqlite/source.toml"),
         (Join-Path $RepoRoot "src/extensions/external/pgtap/source.toml"),
         (Join-Path $RepoRoot "src/extensions/external/vector/source.toml")
-    )) {
+    )
+    foreach ($dependency in @(Get-NativeExtensionComponentSources "postgis")) {
+        $sourceInputs += (Join-Path $RepoRoot "src/extensions/external/postgis/dependencies/$dependency/source.toml")
+    }
+    foreach ($source in $sourceInputs) {
         if (Test-Path $source) {
             $parts.Add("source-input:$source=$(Get-FileSha256 $source)")
         }
@@ -528,6 +556,78 @@ function Get-DesiredHash {
         (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "")
     } finally {
         $sha.Dispose()
+    }
+}
+
+function Assert-WindowsIcuDependency {
+    foreach ($required in @(
+        (Join-Path $IcuWindowsRoot "include/unicode/ucol.h"),
+        (Join-Path $IcuWindowsRoot "lib64/icudt.lib"),
+        (Join-Path $IcuWindowsRoot "lib64/icuin.lib"),
+        (Join-Path $IcuWindowsRoot "lib64/icuuc.lib"),
+        (Join-Path $IcuWindowsRoot "bin64/icupkg.exe")
+    )) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            Fail "missing pinned Windows ICU dependency file: $required"
+        }
+    }
+    foreach ($name in $IcuRuntimeDllNames) {
+        $dll = Join-Path $IcuWindowsRoot "bin64/$name"
+        if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+            Fail "missing pinned Windows ICU runtime DLL: $dll"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $IcuDataArchive -PathType Leaf)) {
+        Fail "missing pinned ICU data archive: $IcuDataArchive"
+    }
+    $actualDataSha256 = Get-FileSha256 $IcuDataArchive
+    if ($actualDataSha256 -ne $IcuDataArchiveSha256) {
+        Fail "ICU data archive checksum mismatch: expected $IcuDataArchiveSha256, got $actualDataSha256"
+    }
+}
+
+function Prepare-WindowsIcuData {
+    Assert-WindowsIcuDependency
+    $receipt = Join-Path $WorkRoot "icu/manifest.properties"
+    $ready = (Test-Path -LiteralPath $IcuDataRoot -PathType Container) -and
+        (Test-Path -LiteralPath $receipt -PathType Leaf) -and
+        ((Get-Content -LiteralPath $receipt -Raw).Contains("icuDataTreeSha256=$IcuDataTreeSha256`n"))
+    if ($ready) {
+        & bun tools/release/native-icu-data-contract.mjs $IcuDataRoot $receipt
+        if ($LASTEXITCODE -eq 0 -and
+            (Get-Content -LiteralPath $receipt -Raw).Contains("icuDataTreeSha256=$IcuDataTreeSha256`n")) {
+            return
+        }
+    }
+
+    $icuRoot = Split-Path -Parent (Split-Path -Parent $IcuDataRoot)
+    Remove-Item -LiteralPath $icuRoot -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path (Join-Path $IcuDataRoot "icudt76l") | Out-Null
+    $previousPath = $env:Path
+    try {
+        Prepend-ProcessPath @((Join-Path $IcuWindowsRoot "bin64"))
+        & (Join-Path $IcuWindowsRoot "bin64/icupkg.exe") -x "*" -d (Join-Path $IcuDataRoot "icudt76l") $IcuDataArchive
+        if ($LASTEXITCODE -ne 0) {
+            Fail "failed to extract pinned ICU data archive"
+        }
+    } finally {
+        Set-Item -Path Env:Path -Value $previousPath
+    }
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $IcuDataRoot "icudt76l") -Recurse -File)
+    if ($files.Count -ne 4136) {
+        Fail "pinned ICU data archive must extract exactly 4136 files; found $($files.Count)"
+    }
+    & bun tools/release/native-icu-data-contract.mjs $IcuDataRoot $receipt
+    if ($LASTEXITCODE -ne 0 -or
+        -not (Get-Content -LiteralPath $receipt -Raw).Contains("icuDataTreeSha256=$IcuDataTreeSha256`n")) {
+        Fail "pinned ICU data tree does not have the canonical identity $IcuDataTreeSha256"
+    }
+}
+
+function Stage-WindowsIcuRuntime([string]$Destination) {
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    foreach ($name in $IcuRuntimeDllNames) {
+        Copy-Item -LiteralPath (Join-Path $IcuWindowsRoot "bin64/$name") -Destination (Join-Path $Destination $name) -Force
     }
 }
 
@@ -622,7 +722,7 @@ function Assert-PatchedSource {
     Assert-FileContains (Join-Path $BuildDir "src/backend/tcop/postgres.c") "oliphaunt_embedded_main"
     Assert-FileContains (Join-Path $BuildDir "src/port/pqsignal.c") "oliphaunt_embedded_kill"
     Assert-FileContains (Join-Path $BuildDir "src/port/pqsignal.c") "oliphaunt_embedded_raise"
-    Assert-FileContains (Join-Path $BuildDir "src/bin/initdb/initdb.c") 'getenv("ICU_DATA")'
+    Assert-FileContains (Join-Path $BuildDir "src/bin/initdb/initdb.c") 'OLIPHAUNT_INTERNAL_ICU_READY'
     Assert-FileContains (Join-Path $BuildDir "meson_options.txt") "oliphaunt_embedded"
     Assert-FileContains (Join-Path $BuildDir "meson_options.txt") "oliphaunt_embedded_module_provider"
     Assert-FileContains (Join-Path $BuildDir "meson.build") "OLIPHAUNT_EMBEDDED"
@@ -925,11 +1025,16 @@ function Build-WindowsPostgisDependencies {
     if (-not (NativeExtension-Selected "postgis")) {
         return
     }
-    Build-WindowsPostgisSqliteDependency
-    Build-WindowsPostgisJsonCDependency
-    Build-WindowsPostgisGeosDependency
-    Build-WindowsPostgisLibxml2Dependency
-    Build-WindowsPostgisProjDependency
+    foreach ($component in @(Get-NativeExtensionComponents "postgis")) {
+        switch ($component) {
+            "geos" { Build-WindowsPostgisGeosDependency }
+            "sqlite" { Build-WindowsPostgisSqliteDependency }
+            "proj" { Build-WindowsPostgisProjDependency }
+            "libxml2" { Build-WindowsPostgisLibxml2Dependency }
+            "json-c" { Build-WindowsPostgisJsonCDependency }
+            default { Fail "unsupported native PostGIS component for ${TargetId}: $component" }
+        }
+    }
 }
 
 function Read-PostgisVersionConfig([string]$PostgisSourceDir) {
@@ -1940,6 +2045,10 @@ function Add-PgcryptoMesonProducer {
     if (-not (NativeExtension-Selected "pgcrypto")) {
         return
     }
+    $components = @(Get-NativeExtensionComponents "pgcrypto")
+    if (($components -join ",") -ne "openssl") {
+        Fail "pgcrypto/$TargetId native component closure must be exactly openssl"
+    }
     Build-WindowsOpenSslDependency
     $opensslInclude = Meson-Path (Join-Path $OpenSslDependencyPrefix "include")
     $libCrypto = Meson-Path (Join-Path $OpenSslDependencyPrefix "lib/libcrypto.lib")
@@ -1988,6 +2097,10 @@ function Add-PgcryptoMesonProducer {
 function Add-UuidOsspMesonProducer {
     if (-not (NativeExtension-Selected "uuid-ossp")) {
         return
+    }
+    $components = @(Get-NativeExtensionComponents "uuid-ossp")
+    if (($components -join ",") -ne "portable-uuid") {
+        Fail "uuid-ossp/$TargetId native component closure must be exactly portable-uuid"
     }
     $destination = Join-Path $OliphauntContribDir "uuid_ossp"
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
@@ -2510,7 +2623,7 @@ function Get-ExactExtensionCatalogRows([string]$Purpose) {
     if ($null -eq $script:ExactExtensionCatalogRows) {
         Push-Location $RepoRoot
         try {
-            $catalogText = cargo run -p oliphaunt --bin oliphaunt-resources --locked -- --list-extensions
+            $catalogText = cargo run -p oliphaunt-native-packaging --bin oliphaunt-resources --locked -- --list-extensions
             $exitCode = $LASTEXITCODE
         } finally {
             Pop-Location
@@ -2571,9 +2684,19 @@ function Test-SnowballRuntimeClosure {
 }
 
 function Runtime-Installed([string]$DesiredHash) {
-    return (Test-Path (Join-Path $InstallDir "bin/initdb.exe")) -and
+    $icuRuntimeReady = $true
+    foreach ($name in $IcuRuntimeDllNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallDir "bin/$name") -PathType Leaf)) {
+            $icuRuntimeReady = $false
+            break
+        }
+    }
+    return $icuRuntimeReady -and
+        (Test-Path (Join-Path $InstallDir "bin/initdb.exe")) -and
         (Test-Path (Join-Path $InstallDir "bin/postgres.exe")) -and
         (Test-Path (Join-Path $InstallDir "bin/pg_config.exe")) -and
+        (Test-Path (Join-Path $InstallDir "include/pg_config.h")) -and
+        ((Get-Content -LiteralPath (Join-Path $InstallDir "include/pg_config.h") -Raw).Contains("#define USE_ICU 1")) -and
         (Test-Path (Join-Path $InstallDir "share/postgresql/postgresql.conf.sample")) -and
         (Test-Path (Join-Path $InstallDir "share/postgresql/timezone/UTC")) -and
         (Test-SnowballRuntimeClosure) -and
@@ -2593,7 +2716,7 @@ function Build-Runtime([string]$DesiredHash) {
         "--buildtype=release",
         "-Db_pch=false",
         "-Dreadline=disabled",
-        "-Dicu=disabled",
+        "-Dicu=enabled",
         "-Dldap=disabled",
         "-Dllvm=disabled",
         "-Dzlib=disabled",
@@ -2612,6 +2735,7 @@ function Build-Runtime([string]$DesiredHash) {
     }
     Invoke-Logged "meson-runtime-compile.log" { meson compile -C $RuntimeBuildDir }
     Invoke-Logged "meson-runtime-install.log" { meson install -C $RuntimeBuildDir }
+    Stage-WindowsIcuRuntime (Join-Path $InstallDir "bin")
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Install-WindowsPgtapExtension
     Prune-BaseRuntimeOptionalExtensions
@@ -2747,7 +2871,7 @@ function Build-EmbeddedBackend {
         "-Doliphaunt_embedded_module_provider=",
         "-Db_pch=false",
         "-Dreadline=disabled",
-        "-Dicu=disabled",
+        "-Dicu=enabled",
         "-Dldap=disabled",
         "-Dllvm=disabled",
         "-Dzlib=disabled",
@@ -2866,12 +2990,10 @@ function Link-LiboliphauntDll([System.Collections.Generic.List[string]]$Objects)
     Assert-SymbolPresent $postgresLib "oliphaunt_embedded_main"
     $exports = @(
         "oliphaunt_init",
-        "oliphaunt_init_ex",
         "oliphaunt_exec_protocol",
         "oliphaunt_exec_simple_query",
         "oliphaunt_exec_protocol_stream",
         "oliphaunt_backup",
-        "oliphaunt_backup_ex",
         "oliphaunt_restore",
         "oliphaunt_cancel",
         "oliphaunt_detach",
@@ -2881,7 +3003,6 @@ function Link-LiboliphauntDll([System.Collections.Generic.List[string]]$Objects)
         "oliphaunt_register_static_extensions",
         "oliphaunt_last_error",
         "oliphaunt_version",
-        "oliphaunt_capabilities",
         "oliphaunt_free_response",
         "oliphaunt_embedded_kill",
         "oliphaunt_embedded_raise"
@@ -2907,6 +3028,9 @@ function Link-LiboliphauntDll([System.Collections.Generic.List[string]]$Objects)
         $lines += $object
     }
     $lines += @(
+        (Join-Path $IcuWindowsRoot "lib64/icuin.lib"),
+        (Join-Path $IcuWindowsRoot "lib64/icuuc.lib"),
+        (Join-Path $IcuWindowsRoot "lib64/icudt.lib"),
         "ws2_32.lib",
         "secur32.lib",
         "advapi32.lib",
@@ -3108,13 +3232,17 @@ function Artifact-Ready {
         -not (Embedded-ModulesReady)) {
         return $false
     }
+    foreach ($name in $IcuRuntimeDllNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $OutDir "bin/$name") -PathType Leaf)) {
+            return $false
+        }
+    }
     if (-not (Test-VcRuntimeClosure)) {
         return $false
     }
     $exports = dumpbin.exe /exports $DllOut 2>$null | Out-String
     foreach ($symbol in @(
         "oliphaunt_init",
-        "oliphaunt_init_ex",
         "oliphaunt_exec_protocol",
         "oliphaunt_exec_protocol_stream",
         "oliphaunt_backup",
@@ -3123,7 +3251,6 @@ function Artifact-Ready {
         "oliphaunt_close_if_generation",
         "oliphaunt_close",
         "oliphaunt_version",
-        "oliphaunt_capabilities",
         "oliphaunt_free_response"
     )) {
         if ($exports -notmatch "\b$symbol\b") {
@@ -3150,6 +3277,8 @@ Configure-MsvcToolchainPath
 $desiredHash = Get-DesiredHash
 Prepare-Source $desiredHash
 Prepare-WindowsExtensionInputs
+Prepare-WindowsIcuData
+$env:ICU_ROOT = $IcuWindowsRoot
 
 if ($CheckCurrent) {
     if ((Runtime-Installed $desiredHash) -and (Artifact-Ready) -and (Test-Path $Stamp) -and ((Get-Content $Stamp -Raw).Trim() -eq $desiredHash)) {
@@ -3164,6 +3293,7 @@ Build-Runtime $desiredHash
 Build-EmbeddedBackend
 $objects = Compile-LiboliphauntSources
 Link-LiboliphauntDll $objects
+Stage-WindowsIcuRuntime (Join-Path $OutDir "bin")
 Build-EmbeddedModules
 Stage-VcRuntimeClosure
 if (-not (Artifact-Ready)) {

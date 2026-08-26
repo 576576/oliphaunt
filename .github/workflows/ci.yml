@@ -22,7 +22,7 @@ on:
           - linux-arm64-gnu
           - windows-x64-msvc
       native_target:
-        description: Native runtime target to run for focused manual debugging
+        description: Native target, or mobile compatibility domain, for focused manual debugging
         required: true
         default: all
         type: choice
@@ -71,6 +71,9 @@ env:
   WASMER_LLVM_LINUX_X64_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz
   WASMER_LLVM_LINUX_X64_SHA256: 5fb1c687c5e895d517a23e7aabea9ec3557e3a3e33f8a8d3a8d21395157b3906
   WASMER_LLVM_LINUX_X64_BYTES: 741670068
+  WASMER_LLVM_MACOS_ARM64_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-darwin-aarch64.tar.xz
+  WASMER_LLVM_MACOS_ARM64_SHA256: f64460f6c8a28876737402542fc5b28bb1f4262cef85f799b65ce2a7ee6f8847
+  WASMER_LLVM_MACOS_ARM64_BYTES: 479103872
   HEAVY_CACHE_SAVE_IF: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.save_heavy_caches) }}
   MOON_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
   MOON_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -112,6 +115,7 @@ jobs:
       native_extension_lifecycle_matrix: ${{ steps.plan.outputs.native_extension_lifecycle_matrix }}
       native_extension_lifecycle_shard_count: ${{ steps.plan.outputs.native_extension_lifecycle_shard_count }}
       liboliphaunt_wasix_aot_runtime_matrix: ${{ steps.plan.outputs.liboliphaunt_wasix_aot_runtime_matrix }}
+      liboliphaunt_wasix_postmaster_runtime_matrix: ${{ steps.plan.outputs.liboliphaunt_wasix_postmaster_runtime_matrix }}
       liboliphaunt_native_android_runtime_matrix: ${{ steps.plan.outputs.liboliphaunt_native_android_runtime_matrix }}
       liboliphaunt_native_desktop_runtime_matrix: ${{ steps.plan.outputs.liboliphaunt_native_desktop_runtime_matrix }}
       liboliphaunt_native_ios_runtime_matrix: ${{ steps.plan.outputs.liboliphaunt_native_ios_runtime_matrix }}
@@ -497,7 +501,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: liboliphaunt-native-extension-ccache-v2-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-apple/**', '.github/scripts/setup-native-build-tools.sh', 'src/postgres/versions/18/**', 'src/sources/third-party/shared/**', 'src/sources/third-party/native/**', 'src/shared/extension-runtime-contract/**', 'src/extensions/catalog/extensions.source.json', 'src/extensions/contrib/postgres18.toml', 'src/extensions/external/*/source.toml', 'src/extensions/external/*/recipe.toml', 'src/extensions/external/*/deps.toml', 'src/extensions/external/*/dependencies/**/source.toml', 'src/extensions/external/*/dependencies/**/recipe.toml', 'src/extensions/external/*/patches/**', 'src/extensions/external/*/dependencies/**/patches/**', 'src/extensions/generated/extensions.catalog.json', 'src/extensions/generated/extensions.build-plan.json', 'src/extensions/generated/contrib-build.tsv', 'src/extensions/generated/pgxs-build.tsv', 'src/extensions/generated/mobile/static-extensions.tsv', 'src/extensions/generated/mobile/qualification-static-extensions.tsv', 'src/extensions/generated/mobile/static-registry.json', 'src/runtimes/liboliphaunt/native/bin/build-*.sh', '!src/runtimes/liboliphaunt/native/bin/*.test.sh', 'src/runtimes/liboliphaunt/native/bin/build-postgres18-windows.ps1', 'src/runtimes/liboliphaunt/native/bin/build-output.bash', 'src/runtimes/liboliphaunt/native/bin/common.sh', 'src/runtimes/liboliphaunt/native/bin/fetch-pinned-git-checkout.sh', 'src/runtimes/liboliphaunt/native/bin/icu.sh', 'src/runtimes/liboliphaunt/native/bin/mobile-*.sh', 'src/runtimes/liboliphaunt/native/bin/postgis-dependency-cache.sh', 'src/runtimes/liboliphaunt/native/bin/postgres-backend-objects.mk', 'src/runtimes/liboliphaunt/native/crates/tools/Cargo.toml', 'src/runtimes/liboliphaunt/native/crates/tools/build.rs', 'src/runtimes/liboliphaunt/native/crates/tools/src/**', 'src/runtimes/liboliphaunt/native/include/**', 'src/runtimes/liboliphaunt/native/patches/**', 'src/runtimes/liboliphaunt/native/portable-uuid/**', 'src/runtimes/liboliphaunt/native/postgres18/**', 'src/runtimes/liboliphaunt/native/src/**') }}
+          key: liboliphaunt-native-extension-ccache-v2-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-apple/**', '.github/scripts/setup-native-build-tools.sh', 'src/postgres/versions/18/**', 'src/sources/third-party/shared/**', 'src/sources/third-party/native/**', 'src/shared/extension-runtime-contract/**', 'src/extensions/catalog/extensions.source.json', 'src/extensions/catalog/native-components.toml', 'src/extensions/contrib/postgres18.toml', 'src/extensions/external/*/source.toml', 'src/extensions/external/*/recipe.toml', 'src/extensions/external/*/dependencies/**/source.toml', 'src/extensions/external/*/dependencies/**/recipe.toml', 'src/extensions/external/*/patches/**', 'src/extensions/external/*/dependencies/**/patches/**', 'src/extensions/generated/extensions.catalog.json', 'src/extensions/generated/contrib-build.tsv', 'src/extensions/generated/pgxs-build.tsv', 'src/extensions/generated/mobile/static-extensions.tsv', 'src/extensions/generated/mobile/static-registry.json', 'src/runtimes/liboliphaunt/native/bin/build-*.sh', '!src/runtimes/liboliphaunt/native/bin/*.test.sh', 'src/runtimes/liboliphaunt/native/bin/build-postgres18-windows.ps1', 'src/runtimes/liboliphaunt/native/bin/build-output.bash', 'src/runtimes/liboliphaunt/native/bin/common.sh', 'src/runtimes/liboliphaunt/native/bin/fetch-pinned-git-checkout.sh', 'src/runtimes/liboliphaunt/native/bin/icu.sh', 'src/runtimes/liboliphaunt/native/bin/mobile-*.sh', 'src/runtimes/liboliphaunt/native/bin/postgis-dependency-cache.sh', 'src/runtimes/liboliphaunt/native/bin/postgres-backend-objects.mk', 'src/runtimes/liboliphaunt/native/crates/tools/Cargo.toml', 'src/runtimes/liboliphaunt/native/crates/tools/build.rs', 'src/runtimes/liboliphaunt/native/crates/tools/src/**', 'src/runtimes/liboliphaunt/native/include/**', 'src/runtimes/liboliphaunt/native/patches/**', 'src/runtimes/liboliphaunt/native/portable-uuid/**', 'src/runtimes/liboliphaunt/native/postgres18/**', 'src/runtimes/liboliphaunt/native/src/**') }}
           restore-keys: |
             liboliphaunt-native-extension-ccache-v2-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -509,7 +513,6 @@ jobs:
         env:
           OLIPHAUNT_EXTENSION_PRODUCTS: ${{ matrix.extensions_csv }}
           OLIPHAUNT_EXTENSION_TARGET: ${{ matrix.target }}
-          OLIPHAUNT_EXPECTED_QUALIFICATION_SQL_NAMES: ${{ matrix.qualification_sql_names_csv }}
           OLIPHAUNT_BISON: /opt/homebrew/opt/bison/bin/bison
         run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-planned-moon-job.sh extension-artifacts-native
 
@@ -525,7 +528,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: liboliphaunt-native-extension-ccache-v2-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-apple/**', '.github/scripts/setup-native-build-tools.sh', 'src/postgres/versions/18/**', 'src/sources/third-party/shared/**', 'src/sources/third-party/native/**', 'src/shared/extension-runtime-contract/**', 'src/extensions/catalog/extensions.source.json', 'src/extensions/contrib/postgres18.toml', 'src/extensions/external/*/source.toml', 'src/extensions/external/*/recipe.toml', 'src/extensions/external/*/deps.toml', 'src/extensions/external/*/dependencies/**/source.toml', 'src/extensions/external/*/dependencies/**/recipe.toml', 'src/extensions/external/*/patches/**', 'src/extensions/external/*/dependencies/**/patches/**', 'src/extensions/generated/extensions.catalog.json', 'src/extensions/generated/extensions.build-plan.json', 'src/extensions/generated/contrib-build.tsv', 'src/extensions/generated/pgxs-build.tsv', 'src/extensions/generated/mobile/static-extensions.tsv', 'src/extensions/generated/mobile/qualification-static-extensions.tsv', 'src/extensions/generated/mobile/static-registry.json', 'src/runtimes/liboliphaunt/native/bin/build-*.sh', '!src/runtimes/liboliphaunt/native/bin/*.test.sh', 'src/runtimes/liboliphaunt/native/bin/build-postgres18-windows.ps1', 'src/runtimes/liboliphaunt/native/bin/build-output.bash', 'src/runtimes/liboliphaunt/native/bin/common.sh', 'src/runtimes/liboliphaunt/native/bin/fetch-pinned-git-checkout.sh', 'src/runtimes/liboliphaunt/native/bin/icu.sh', 'src/runtimes/liboliphaunt/native/bin/mobile-*.sh', 'src/runtimes/liboliphaunt/native/bin/postgis-dependency-cache.sh', 'src/runtimes/liboliphaunt/native/bin/postgres-backend-objects.mk', 'src/runtimes/liboliphaunt/native/crates/tools/Cargo.toml', 'src/runtimes/liboliphaunt/native/crates/tools/build.rs', 'src/runtimes/liboliphaunt/native/crates/tools/src/**', 'src/runtimes/liboliphaunt/native/include/**', 'src/runtimes/liboliphaunt/native/patches/**', 'src/runtimes/liboliphaunt/native/portable-uuid/**', 'src/runtimes/liboliphaunt/native/postgres18/**', 'src/runtimes/liboliphaunt/native/src/**') }}
+          key: liboliphaunt-native-extension-ccache-v2-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-apple/**', '.github/scripts/setup-native-build-tools.sh', 'src/postgres/versions/18/**', 'src/sources/third-party/shared/**', 'src/sources/third-party/native/**', 'src/shared/extension-runtime-contract/**', 'src/extensions/catalog/extensions.source.json', 'src/extensions/catalog/native-components.toml', 'src/extensions/contrib/postgres18.toml', 'src/extensions/external/*/source.toml', 'src/extensions/external/*/recipe.toml', 'src/extensions/external/*/dependencies/**/source.toml', 'src/extensions/external/*/dependencies/**/recipe.toml', 'src/extensions/external/*/patches/**', 'src/extensions/external/*/dependencies/**/patches/**', 'src/extensions/generated/extensions.catalog.json', 'src/extensions/generated/contrib-build.tsv', 'src/extensions/generated/pgxs-build.tsv', 'src/extensions/generated/mobile/static-extensions.tsv', 'src/extensions/generated/mobile/static-registry.json', 'src/runtimes/liboliphaunt/native/bin/build-*.sh', '!src/runtimes/liboliphaunt/native/bin/*.test.sh', 'src/runtimes/liboliphaunt/native/bin/build-postgres18-windows.ps1', 'src/runtimes/liboliphaunt/native/bin/build-output.bash', 'src/runtimes/liboliphaunt/native/bin/common.sh', 'src/runtimes/liboliphaunt/native/bin/fetch-pinned-git-checkout.sh', 'src/runtimes/liboliphaunt/native/bin/icu.sh', 'src/runtimes/liboliphaunt/native/bin/mobile-*.sh', 'src/runtimes/liboliphaunt/native/bin/postgis-dependency-cache.sh', 'src/runtimes/liboliphaunt/native/bin/postgres-backend-objects.mk', 'src/runtimes/liboliphaunt/native/crates/tools/Cargo.toml', 'src/runtimes/liboliphaunt/native/crates/tools/build.rs', 'src/runtimes/liboliphaunt/native/crates/tools/src/**', 'src/runtimes/liboliphaunt/native/include/**', 'src/runtimes/liboliphaunt/native/patches/**', 'src/runtimes/liboliphaunt/native/portable-uuid/**', 'src/runtimes/liboliphaunt/native/postgres18/**', 'src/runtimes/liboliphaunt/native/src/**') }}
 
       - name: Show native compiler cache stats
         if: ${{ always() && runner.os != 'Windows' }}
@@ -553,13 +556,10 @@ jobs:
           path: |
             target/liboliphaunt-mobile-extension-ci/**/*.log
             target/liboliphaunt-mobile-extension-release/**/*.log
-            target/liboliphaunt-mobile-extension-qualification/**/*.log
             target/liboliphaunt-mobile-extension-release/ios-xcframework/ios-simulator/*.log
             target/liboliphaunt-mobile-extension-release/ios-xcframework/ios-device/*.log
             target/liboliphaunt-pg18-extension-release/**/*.log
             target/liboliphaunt-pg18-*-extension-release/**/*.log
-            target/liboliphaunt-pg18-extension-qualification*/**/*.log
-            target/liboliphaunt-pg18-*-extension-qualification/**/*.log
             /tmp/liboliphaunt-ci-*-extensions.log
             /tmp/liboliphaunt-release-*-extensions.log
             /tmp/liboliphaunt-ci-extension-assets-fetch.log
@@ -596,15 +596,6 @@ jobs:
         with:
           name: liboliphaunt-wasix-runtime-portable
           path: .
-
-      - name: Verify publication-deferred WASIX candidate build outputs
-        env:
-          OLIPHAUNT_EXTENSION_TARGET: ${{ matrix.target }}
-        run: >-
-          tools/dev/bun.sh tools/release/verify-extension-qualification-build.mjs
-          --family wasix
-          --target "$OLIPHAUNT_EXTENSION_TARGET"
-          --asset-root target/oliphaunt-wasix/assets
 
       - name: Build WASIX exact-extension artifacts
         env:
@@ -1026,13 +1017,115 @@ jobs:
             target/liboliphaunt/**/*.log
           if-no-files-found: ignore
 
+  liboliphaunt-native-android-abi:
+    name: Builds / native-runtime-android-abi-compatible
+    needs:
+      - affected
+      - liboliphaunt-native-android
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.liboliphaunt-native-android.result == 'success' && (contains(fromJson(needs.affected.outputs.jobs), 'mobile-build-android') || contains(fromJson(needs.affected.outputs.jobs), 'liboliphaunt-native-release-assets')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Download Android arm64 ABI receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-target-android-arm64-v8a
+          path: target/liboliphaunt/native-mobile-abi-inputs/android-arm64-v8a
+
+      - name: Download Android x86_64 ABI receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-target-android-x86_64
+          path: target/liboliphaunt/native-mobile-abi-inputs/android-x86_64
+
+      - name: Download Android runtime-resource assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-release-assets-android-x86_64
+          path: target/liboliphaunt/abi-compatible-release-assets/android-datum64
+
+      - name: Prove Android Datum64 ABI-compatible runtime-resource closure
+        run: |
+          tools/dev/bun.sh tools/release/finalize-native-mobile-abi-proofs.mjs \
+            --domain android-datum64 \
+            --asset-dir target/liboliphaunt/abi-compatible-release-assets/android-datum64 \
+            --receipt-root target/liboliphaunt/native-mobile-abi-inputs
+
+      - name: Upload ABI-compatible Android runtime-resource assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: liboliphaunt-native-abi-compatible-release-assets-android-datum64
+          path: target/liboliphaunt/abi-compatible-release-assets/android-datum64
+          if-no-files-found: error
+
+  liboliphaunt-native-ios-abi:
+    name: Builds / native-runtime-ios-abi-compatible
+    needs:
+      - affected
+      - liboliphaunt-native-ios
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.liboliphaunt-native-ios.result == 'success' && (contains(fromJson(needs.affected.outputs.jobs), 'mobile-build-ios') || contains(fromJson(needs.affected.outputs.jobs), 'swift-sdk-package') || contains(fromJson(needs.affected.outputs.jobs), 'react-native-sdk-package') || contains(fromJson(needs.affected.outputs.jobs), 'liboliphaunt-native-release-assets')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Download iOS ABI receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-target-ios-xcframework
+          path: target/liboliphaunt/native-mobile-abi-inputs/ios-xcframework
+
+      - name: Download iOS runtime-resource assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-release-assets-ios-xcframework
+          path: target/liboliphaunt/abi-compatible-release-assets/ios-datum64
+
+      - name: Prove iOS Datum64 ABI-compatible runtime-resource closure
+        run: |
+          tools/dev/bun.sh tools/release/finalize-native-mobile-abi-proofs.mjs \
+            --domain ios-datum64 \
+            --asset-dir target/liboliphaunt/abi-compatible-release-assets/ios-datum64 \
+            --receipt-root target/liboliphaunt/native-mobile-abi-inputs
+
+      - name: Upload ABI-compatible iOS runtime-resource assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: liboliphaunt-native-abi-compatible-release-assets-ios-datum64
+          path: target/liboliphaunt/abi-compatible-release-assets/ios-datum64
+          if-no-files-found: error
+
   liboliphaunt-native-release-assets:
     name: Builds / native-runtime-release-assets
     needs:
       - affected
       - liboliphaunt-native-android
+      - liboliphaunt-native-android-abi
       - liboliphaunt-native-desktop
       - liboliphaunt-native-ios
+      - liboliphaunt-native-ios-abi
     if: ${{ contains(fromJson(needs.affected.outputs.jobs), 'liboliphaunt-native-release-assets') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1056,6 +1149,33 @@ jobs:
           pattern: liboliphaunt-native-release-assets-*
           path: target/liboliphaunt/release-assets
           merge-multiple: true
+
+      - name: Remove raw mobile runtime-resource closures
+        run: |
+          set --
+          while IFS= read -r archive; do
+            [ -n "$archive" ] && set -- "$@" "$archive"
+          done < <(find target/liboliphaunt/release-assets -maxdepth 1 -type f \
+            \( -name 'liboliphaunt-*-runtime-resources-android-datum64.tar.gz' \
+              -o -name 'liboliphaunt-*-runtime-resources-ios-datum64.tar.gz' \) \
+            | LC_ALL=C sort)
+          if [ "$#" -ne 2 ]; then
+            echo "Expected exactly two raw mobile runtime-resource closures; found $#" >&2
+            exit 1
+          fi
+          rm -- "$@"
+
+      - name: Download ABI-compatible Android runtime-resource assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-abi-compatible-release-assets-android-datum64
+          path: target/liboliphaunt/release-assets
+
+      - name: Download ABI-compatible iOS runtime-resource assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-abi-compatible-release-assets-ios-datum64
+          path: target/liboliphaunt/release-assets
 
       - name: Package aggregate liboliphaunt release assets
         run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-moon-targets.sh --upstream none liboliphaunt-native:release-assets
@@ -1273,7 +1393,7 @@ jobs:
     name: Builds / swift-sdk
     needs:
       - affected
-      - liboliphaunt-native-ios
+      - liboliphaunt-native-ios-abi
     if: ${{ contains(fromJson(needs.affected.outputs.jobs), 'swift-sdk-package') }}
     runs-on: macos-26
     timeout-minutes: 90
@@ -1302,7 +1422,7 @@ jobs:
       - name: Download Apple liboliphaunt release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: liboliphaunt-native-release-assets-ios-xcframework
+          name: liboliphaunt-native-abi-compatible-release-assets-ios-datum64
           path: target/liboliphaunt/release-assets
 
       - name: Build Swift SDK package artifacts
@@ -1386,7 +1506,7 @@ jobs:
     name: Builds / react-native-sdk
     needs:
       - affected
-      - liboliphaunt-native-ios
+      - liboliphaunt-native-ios-abi
     if: ${{ contains(fromJson(needs.affected.outputs.jobs), 'react-native-sdk-package') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -1409,7 +1529,7 @@ jobs:
       - name: Download Apple liboliphaunt release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: liboliphaunt-native-release-assets-ios-xcframework
+          name: liboliphaunt-native-abi-compatible-release-assets-ios-datum64
           path: target/liboliphaunt/release-assets
 
       - name: Build React Native SDK package artifacts
@@ -1467,6 +1587,62 @@ jobs:
           path: target/sdk-artifacts/oliphaunt-js
           if-no-files-found: error
 
+  wasix-ts-sdk-package:
+    name: Builds / wasix-typescript-sdk
+    needs:
+      - affected
+      - liboliphaunt-wasix-runtime
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.liboliphaunt-wasix-runtime.result == 'success' && contains(fromJson(needs.affected.outputs.jobs), 'wasix-ts-sdk-package') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Moon
+        uses: ./.github/actions/setup-moon
+        with:
+          install-workspace: "true"
+
+      - name: Set up Rust and wasm-pack
+        uses: ./.github/actions/setup-rust
+        with:
+          tools: wasm-pack@0.15.0
+
+      - name: Set up Deno
+        uses: ./.github/actions/setup-deno
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Download same-run portable WASIX outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-wasix-runtime-portable
+          path: .
+
+      - name: Build and smoke WASIX TypeScript SDK package
+        run: |
+          pnpm --dir src/bindings/wasix-ts package:build:closure
+          node src/bindings/wasix-ts/tools/smoke-node.mjs --runtime node
+          node src/bindings/wasix-ts/tools/smoke-node.mjs --runtime bun
+          node src/bindings/wasix-ts/tools/smoke-node.mjs --runtime deno
+          node src/bindings/wasix-ts/tools/smoke-browser.mjs --postgis-worker
+          node src/bindings/wasix-ts/tools-package/tools/smoke-host.mjs --runtime node
+          tools/dev/bun.sh src/bindings/wasix-ts/tools-package/tools/smoke-host.mjs --runtime bun
+          tools/dev/deno.sh run --allow-all src/bindings/wasix-ts/tools-package/tools/smoke-host.mjs --runtime deno
+          OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' OLIPHAUNT_MOON_UPSTREAM=none MOON_CACHE=off .github/scripts/run-planned-moon-job.sh wasix-ts-sdk-package
+
+      - name: Upload WASIX TypeScript SDK package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: oliphaunt-wasix-ts-sdk-package-artifacts
+          path: target/sdk-artifacts/oliphaunt-wasix-ts
+          if-no-files-found: error
+
   wasix-rust-package:
     name: Builds / wasix-rust-binding
     needs:
@@ -1507,10 +1683,10 @@ jobs:
             libxdo-dev \
             pkg-config
 
-      - name: Build WASIX Rust binding package artifacts
+      - name: Build Rust WASIX binding package artifacts
         run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-planned-moon-job.sh wasix-rust-package
 
-      - name: Upload WASIX Rust binding package artifacts
+      - name: Upload Rust WASIX binding package artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: oliphaunt-wasix-rust-package-artifacts
@@ -1600,7 +1776,7 @@ jobs:
           load: true
           cache-from: type=gha,scope=wasix-builder
 
-      - name: Install Wasmer LLVM 22.1 for WASIX template generation
+      - name: Install Wasmer LLVM 22.1 for WASIX cluster-seed generation
         uses: ./.github/actions/setup-wasmer-llvm
         with:
           url: ${{ env.WASMER_LLVM_LINUX_X64_URL }}
@@ -1801,6 +1977,161 @@ jobs:
           path: target/oliphaunt-wasix/release-assets
           if-no-files-found: error
 
+  wasix-postmaster-portable:
+    name: Builds / wasix-postmaster (portable)
+    needs:
+      - affected
+    if: ${{ contains(fromJson(needs.affected.outputs.jobs), 'wasix-postmaster') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Moon
+        uses: ./.github/actions/setup-moon
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Wasmer LLVM 22.1
+        uses: ./.github/actions/setup-wasmer-llvm
+        with:
+          url: ${{ env.WASMER_LLVM_LINUX_X64_URL }}
+          sha256: ${{ env.WASMER_LLVM_LINUX_X64_SHA256 }}
+          bytes: ${{ env.WASMER_LLVM_LINUX_X64_BYTES }}
+          version: ${{ env.WASMER_LLVM_VERSION }}
+          cache-save-if: ${{ env.HEAVY_CACHE_SAVE_IF }}
+
+      - name: Build and qualify portable WASIX postmaster inputs
+        run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-moon-targets.sh --upstream deep liboliphaunt-wasix-postmaster:portable-inputs
+
+      - name: Upload portable WASIX postmaster build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: liboliphaunt-wasix-postmaster-portable-build-inputs
+          path: target/oliphaunt-wasix-postmaster/portable-inputs/wasix-postmaster-portable-build-inputs.tar.gz
+          if-no-files-found: error
+
+  wasix-postmaster-target:
+    name: Builds / wasix-postmaster (${{ matrix.target_id }})
+    needs:
+      - affected
+      - wasix-postmaster-portable
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.wasix-postmaster-portable.result == 'success' && contains(fromJson(needs.affected.outputs.jobs), 'wasix-postmaster') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.affected.outputs.liboliphaunt_wasix_postmaster_runtime_matrix || '{"include":[]}') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Moon
+        uses: ./.github/actions/setup-moon
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install portable shell utilities
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          brew install bash coreutils findutils util-linux
+          {
+            echo "$(brew --prefix bash)/bin"
+            echo "$(brew --prefix coreutils)/libexec/gnubin"
+            echo "$(brew --prefix findutils)/libexec/gnubin"
+            echo "$(brew --prefix util-linux)/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Install Wasmer LLVM 22.1
+        uses: ./.github/actions/setup-wasmer-llvm
+        with:
+          url: ${{ matrix.llvm_url }}
+          sha256: ${{ matrix.llvm_sha256 }}
+          bytes: ${{ matrix.llvm_bytes }}
+          version: ${{ env.WASMER_LLVM_VERSION }}
+
+      - name: Download portable WASIX postmaster build inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-wasix-postmaster-portable-build-inputs
+          path: target/oliphaunt-wasix-postmaster/portable-input-download
+
+      - name: Restore portable WASIX postmaster build inputs
+        run: |
+          archive=target/oliphaunt-wasix-postmaster/portable-input-download/wasix-postmaster-portable-build-inputs.tar.gz
+          test -f "$archive"
+          tar -xzf "$archive" --strip-components=1 \
+            -C target/oliphaunt-wasix-postmaster
+
+      - name: Build, verify, qualify, and package WASIX postmaster
+        env:
+          OLIPHAUNT_WASIX_POSTMASTER_PORTABLE_INPUTS: "1"
+        run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-moon-targets.sh --upstream deep liboliphaunt-wasix-postmaster:release-assets
+
+      - name: Upload target WASIX postmaster release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: liboliphaunt-wasix-postmaster-release-assets-${{ matrix.target_id }}
+          path: ${{ matrix.release_asset_path }}
+          if-no-files-found: error
+
+  wasix-postmaster:
+    name: Builds / wasix-postmaster
+    needs:
+      - affected
+      - wasix-postmaster-target
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.wasix-postmaster-target.result == 'success' && contains(fromJson(needs.affected.outputs.jobs), 'wasix-postmaster') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Moon
+        uses: ./.github/actions/setup-moon
+
+      - name: Download target WASIX postmaster release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: liboliphaunt-wasix-postmaster-release-assets-*
+          path: target/oliphaunt-wasix-postmaster/release-assets
+          merge-multiple: true
+
+      - name: Merge target WASIX postmaster release assets
+        run: OLIPHAUNT_CI_JOB_TARGETS_JSON='${{ needs.affected.outputs.job_targets }}' MOON_CACHE=off .github/scripts/run-moon-targets.sh --upstream none liboliphaunt-wasix-postmaster:aggregate-release-assets
+
+      - name: Upload complete WASIX postmaster release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: liboliphaunt-wasix-postmaster-release-assets
+          path: target/oliphaunt-wasix-postmaster/release-assets
+          if-no-files-found: error
+
   native-extension-lifecycle:
     name: E2E / native extension lifecycle (shard ${{ matrix.shard }})
     needs:
@@ -1827,6 +2158,12 @@ jobs:
         uses: ./.github/actions/setup-moon
         with:
           install-workspace: "false"
+
+      - name: Set up Deno for packed native tools smoke
+        if: ${{ matrix.shard == 0 }}
+        uses: ./.github/actions/setup-deno
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
 
       - name: Download same-run Linux native runtime
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -2088,9 +2425,10 @@ jobs:
       - affected
       - mobile-extension-packages
       - liboliphaunt-native-android
+      - liboliphaunt-native-android-abi
       - kotlin-sdk-package
       - react-native-sdk-package
-    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.mobile-extension-packages.result == 'success' && needs.liboliphaunt-native-android.result == 'success' && needs.kotlin-sdk-package.result == 'success' && needs.react-native-sdk-package.result == 'success' && contains(fromJson(needs.affected.outputs.jobs), 'mobile-build-android') }}
+    if: ${{ always() && !cancelled() && needs.affected.result == 'success' && needs.mobile-extension-packages.result == 'success' && needs.liboliphaunt-native-android.result == 'success' && needs.liboliphaunt-native-android-abi.result == 'success' && needs.kotlin-sdk-package.result == 'success' && needs.react-native-sdk-package.result == 'success' && contains(fromJson(needs.affected.outputs.jobs), 'mobile-build-android') }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.affected.outputs.react_native_android_mobile_app_matrix) }}
@@ -2125,6 +2463,45 @@ jobs:
         with:
           name: liboliphaunt-native-target-${{ matrix.target }}
           path: .
+
+      - name: Download ABI-compatible Android runtime-resource closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-abi-compatible-release-assets-android-datum64
+          path: target/liboliphaunt/android-runtime-assets
+
+      - name: Extract ABI-compatible Android runtime-resource closure
+        run: |
+          set --
+          while IFS= read -r archive; do
+            [ -n "$archive" ] && set -- "$@" "$archive"
+          done < <(find target/liboliphaunt/android-runtime-assets -type f \
+            -name 'liboliphaunt-*-runtime-resources-android-datum64.tar.gz' | LC_ALL=C sort)
+          if [ "$#" -ne 1 ]; then
+            echo "Expected exactly one Android datum64 runtime-resource closure; found $#" >&2
+            exit 1
+          fi
+          destination=target/liboliphaunt/runtime-closure/android
+          mkdir -p "$destination"
+          tar -xzf "$1" -C "$destination"
+          set --
+          while IFS= read -r receipt; do
+            [ -n "$receipt" ] && set -- "$@" "$receipt"
+          done < <(find "$destination" -type f -path '*/oliphaunt/manifest.properties' | LC_ALL=C sort)
+          if [ "$#" -ne 1 ]; then
+            echo "Expected exactly one extracted Android runtime-carrier receipt; found $#" >&2
+            exit 1
+          fi
+          closure="$(dirname "$1")"
+          # JavaScript template interpolation belongs inside the single-quoted Bun program.
+          # shellcheck disable=SC2016
+          tools/dev/bun.sh -e '
+            import { validateNativeRuntimeCarrier } from "./tools/release/native-runtime-carrier-contract.mjs";
+            const [root, icuData] = process.argv.slice(1);
+            const { target } = validateNativeRuntimeCarrier(root, { icuData });
+            if (target !== "android-datum64") throw new Error(`expected android-datum64, got ${target}`);
+          ' "$closure" target/liboliphaunt-pg18-linux-x64-gnu/icu/share/icu
+          echo "OLIPHAUNT_EXPO_ANDROID_SEED_CLOSURE_DIR=$GITHUB_WORKSPACE/$closure" >> "$GITHUB_ENV"
 
       - name: Download Kotlin SDK package artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -2188,6 +2565,7 @@ jobs:
       - affected
       - mobile-extension-packages
       - liboliphaunt-native-ios
+      - liboliphaunt-native-ios-abi
       - react-native-sdk-package
       - swift-sdk-package
     if: ${{ contains(fromJson(needs.affected.outputs.jobs), 'mobile-build-ios') }}
@@ -2218,10 +2596,10 @@ jobs:
           name: liboliphaunt-native-target-ios-xcframework
           path: .
 
-      - name: Download iOS liboliphaunt release assets
+      - name: Download ABI-compatible iOS liboliphaunt release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: liboliphaunt-native-release-assets-ios-xcframework
+          name: liboliphaunt-native-abi-compatible-release-assets-ios-datum64
           path: target/liboliphaunt/release-assets
 
       - name: Qualify standalone ICU CocoaPods carrier
@@ -2236,6 +2614,43 @@ jobs:
             exit 1
           fi
           tools/release/check-icu-npm-cocoapods-consumer.sh "$1"
+          icu_root=target/liboliphaunt/icu-data/ios
+          mkdir -p "$icu_root"
+          tar -xzf "$1" -C "$icu_root" share/icu
+          echo "OLIPHAUNT_IOS_ICU_DATA_DIR=$GITHUB_WORKSPACE/$icu_root/share/icu" >> "$GITHUB_ENV"
+
+      - name: Extract ABI-compatible iOS runtime-resource closure
+        run: |
+          set --
+          while IFS= read -r archive; do
+            [ -n "$archive" ] && set -- "$@" "$archive"
+          done < <(find target/liboliphaunt/release-assets -type f \
+            -name 'liboliphaunt-*-runtime-resources-ios-datum64.tar.gz' | LC_ALL=C sort)
+          if [ "$#" -ne 1 ]; then
+            echo "Expected exactly one iOS datum64 runtime-resource closure; found $#" >&2
+            exit 1
+          fi
+          destination=target/liboliphaunt/runtime-closure/ios
+          mkdir -p "$destination"
+          tar -xzf "$1" -C "$destination"
+          set --
+          while IFS= read -r receipt; do
+            [ -n "$receipt" ] && set -- "$@" "$receipt"
+          done < <(find "$destination" -type f -path '*/oliphaunt/manifest.properties' | LC_ALL=C sort)
+          if [ "$#" -ne 1 ]; then
+            echo "Expected exactly one extracted iOS runtime-carrier receipt; found $#" >&2
+            exit 1
+          fi
+          closure="$(dirname "$1")"
+          # JavaScript template interpolation belongs inside the single-quoted Bun program.
+          # shellcheck disable=SC2016
+          tools/dev/bun.sh -e '
+            import { validateNativeRuntimeCarrier } from "./tools/release/native-runtime-carrier-contract.mjs";
+            const [root, icuData] = process.argv.slice(1);
+            const { target } = validateNativeRuntimeCarrier(root, { icuData });
+            if (target !== "ios-datum64") throw new Error(`expected ios-datum64, got ${target}`);
+          ' "$closure" "$OLIPHAUNT_IOS_ICU_DATA_DIR"
+          echo "OLIPHAUNT_EXPO_IOS_SEED_CLOSURE_DIR=$GITHUB_WORKSPACE/$closure" >> "$GITHUB_ENV"
 
       - name: Download Swift SDK package artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -2446,15 +2861,17 @@ jobs:
       - kotlin-maven-staging
       - react-native-sdk-package
       - js-sdk-package
+      - wasix-ts-sdk-package
       - wasix-rust-package
       - liboliphaunt-wasix-runtime
       - liboliphaunt-wasix-aot
       - liboliphaunt-wasix-release-assets
+      - wasix-postmaster
       - wasix-release-regression
       - mobile-build-android
       - mobile-build-ios
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -2467,6 +2884,27 @@ jobs:
         uses: ./.github/actions/setup-bun
         with:
           bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Download native ICU release asset for cross-family validation
+        if: ${{ contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-native-release-assets') && contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-wasix-release-assets') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-native-icu-data
+          path: target/cross-family-icu/native
+
+      - name: Download WASIX release assets for cross-family ICU validation
+        if: ${{ contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-native-release-assets') && contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-wasix-release-assets') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: liboliphaunt-wasix-release-assets
+          path: target/cross-family-icu/wasix
+
+      - name: Prove native and WASIX ICU data identity
+        if: ${{ contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-native-release-assets') && contains(fromJson(needs.affected.outputs.builder_jobs), 'liboliphaunt-wasix-release-assets') }}
+        run: |
+          tools/dev/bun.sh tools/release/check-cross-family-icu-data.mjs \
+            target/cross-family-icu/native \
+            target/cross-family-icu/wasix
 
       - name: Check selected build jobs
         id: selected_builds_gate
@@ -2646,12 +3084,12 @@ jobs:
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
-      - name: Check E2E jobs
+      - name: Check final release execution qualification
         id: selected_e2e_gate
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           SELECTED_JOBS_JSON: ${{ needs.affected.outputs.e2e_jobs }}
-          GATE_LABEL: E2E jobs
+          GATE_LABEL: final release execution qualification
         run: bun .github/scripts/check-ci-gate.mjs selected
 
   required:

@@ -12,7 +12,7 @@ oliphaunt_dev_mobile_registry_json() {
 }
 
 oliphaunt_dev_sdk_extension_json() {
-  printf '%s\n' "$root/src/extensions/generated/sdk/react-native.json"
+  printf '%s\n' "$root/src/extensions/generated/sdk/extensions.json"
 }
 
 oliphaunt_dev_csv_contains() {
@@ -35,17 +35,15 @@ oliphaunt_dev_join_csv() {
 oliphaunt_dev_normalize_mobile_extensions() {
   local raw="$1"
   local platform="$2"
-  local platform_key
   case "$platform" in
-    Android*) platform_key="android" ;;
-    iOS*) platform_key="ios" ;;
+    Android*|iOS*) ;;
     *) fail "unsupported mobile extension platform: $platform" ;;
   esac
 
   [ -n "$(printf '%s' "$raw" | tr -d '[:space:],')" ] || return 0
-  node - "$(oliphaunt_dev_sdk_extension_json)" "$raw" "$platform" "$platform_key" <<'NODE'
+  node - "$(oliphaunt_dev_sdk_extension_json)" "$raw" "$platform" <<'NODE'
 const fs = require('node:fs');
-const [metadataPath, requestedRaw, platformLabel, platformKey] = process.argv.slice(2);
+const [metadataPath, requestedRaw, platformLabel] = process.argv.slice(2);
 const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
 const bySqlName = new Map();
 for (const row of metadata.extensions ?? []) {
@@ -54,13 +52,7 @@ for (const row of metadata.extensions ?? []) {
   }
 }
 
-function supportsPlatform(row) {
-  const explicitSupport = row?.support?.mobile?.[platformKey];
-  return row?.['mobile-release-ready'] === true
-    && (explicitSupport === undefined || explicitSupport === 'supported');
-}
 const supported = [...bySqlName.values()]
-  .filter(supportsPlatform)
   .map((row) => row['sql-name'])
   .sort();
 const ordered = [];
@@ -70,7 +62,7 @@ function visit(sqlName) {
     return;
   }
   const row = bySqlName.get(sqlName);
-  if (!supportsPlatform(row)) {
+  if (!row) {
     throw new Error(
       `unsupported mobile extension for ${platformLabel} Expo smoke: ${sqlName} `
       + `(supported: ${supported.join(',')})`,
@@ -307,8 +299,8 @@ oliphaunt_dev_prepare_prebuilt_mobile_runtime_resource_package() {
   local module_stems
   module_stems="$(oliphaunt_dev_mobile_module_stems_for_selection "$selected_extensions")"
   local -a package_args=(
-    run -p oliphaunt --bin oliphaunt-resources --locked --
-    --mode server
+    run -p oliphaunt-native-packaging --bin oliphaunt-resources --locked --
+    --mode native-direct
     --output "$package_root"
     --extension-target "$extension_target"
     --liboliphaunt-native-version "$native_runtime_version"
@@ -348,6 +340,8 @@ oliphaunt_dev_prepare_prebuilt_mobile_runtime_resource_package() {
     fi
     return 1
   fi
+  grep -Fxq 'mode=native-direct' "$package_root/oliphaunt/runtime/manifest.properties" ||
+    fail "prebuilt $platform runtime resource package did not produce a native-direct manifest"
   touch "$package_root/.prepared"
   printf '%s\n' "$package_root"
 }

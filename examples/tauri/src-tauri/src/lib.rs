@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use oliphaunt::{BackupRequest, Extension, Oliphaunt, QueryResult};
+use oliphaunt::{Extension, Oliphaunt, QueryResult};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -122,28 +122,15 @@ impl From<oliphaunt::Error> for CommandError {
     }
 }
 
-async fn open_database(root: PathBuf) -> anyhow::Result<Oliphaunt> {
+async fn open_database(directory: PathBuf) -> anyhow::Result<Oliphaunt> {
     oliphaunt::register_build_resources!()?;
     let db = Oliphaunt::builder()
-        .path(root)
-        .native_server()
-        .max_client_sessions(4)
+        .directory(directory)
         .extensions([Extension::Hstore, Extension::PgTrgm, Extension::Unaccent])
         .open()
         .await?;
     db.execute(SCHEMA).await?;
-    validate_sql_dump(&db).await?;
     Ok(db)
-}
-
-async fn validate_sql_dump(db: &Oliphaunt) -> anyhow::Result<()> {
-    let backup = db.backup(BackupRequest::sql()).await?;
-    let sql = std::str::from_utf8(&backup.bytes)?;
-    anyhow::ensure!(
-        sql.contains("PostgreSQL database dump"),
-        "pg_dump SQL backup smoke did not look like a PostgreSQL dump"
-    );
-    Ok(())
 }
 
 #[tauri::command]
@@ -153,7 +140,7 @@ async fn list_todos(
     status: String,
 ) -> Result<Vec<Todo>, CommandError> {
     let db = state.db.lock().await;
-    let result = db.query_params(SELECT_TODOS, [search, status]).await?;
+    let result = db.query_with_params(SELECT_TODOS, [search, status]).await?;
     todos_from_result(&result).map_err(CommandError::from)
 }
 
@@ -170,7 +157,7 @@ async fn create_todo(
          {RETURNING_TODO}"
     );
     let result = db
-        .query_params(
+        .query_with_params(
             &sql,
             [
                 input.title,
@@ -193,14 +180,14 @@ async fn toggle_todo(state: tauri::State<'_, TodoStore>, id: i64) -> Result<Todo
          WHERE id = $1
          {RETURNING_TODO}"
     );
-    let result = db.query_params(&sql, [id]).await?;
+    let result = db.query_with_params(&sql, [id]).await?;
     one_todo(&result).map_err(CommandError::from)
 }
 
 #[tauri::command]
 async fn delete_todo(state: tauri::State<'_, TodoStore>, id: i64) -> Result<(), CommandError> {
     let db = state.db.lock().await;
-    db.query_params(
+    db.query_with_params(
         "DELETE FROM todos WHERE id = $1 RETURNING id::text AS id",
         [id],
     )
@@ -209,7 +196,7 @@ async fn delete_todo(state: tauri::State<'_, TodoStore>, id: i64) -> Result<(), 
 }
 
 fn todos_from_result(result: &QueryResult) -> anyhow::Result<Vec<Todo>> {
-    (0..result.row_count())
+    (0..result.rows().len())
         .map(|row| todo_from_result(result, row))
         .collect()
 }
@@ -242,8 +229,8 @@ fn required<'a>(result: &'a QueryResult, row: usize, column: &str) -> anyhow::Re
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let root = app.path().app_data_dir()?.join("oliphaunt-native-todos");
-            let db = tauri::async_runtime::block_on(open_database(root))?;
+            let directory = app.path().app_data_dir()?.join("oliphaunt-native-todos");
+            let db = tauri::async_runtime::block_on(open_database(directory))?;
             app.manage(TodoStore { db: Mutex::new(db) });
             Ok(())
         })
@@ -262,14 +249,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_smoke_runs_sql_dump() {
-        let root = std::env::temp_dir().join(format!(
+    fn startup_smoke_opens_schema() {
+        let directory = std::env::temp_dir().join(format!(
             "oliphaunt-example-tauri-smoke-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
-        let db = tauri::async_runtime::block_on(open_database(root.clone())).unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        let db = tauri::async_runtime::block_on(open_database(directory.clone())).unwrap();
         tauri::async_runtime::block_on(db.close()).unwrap();
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

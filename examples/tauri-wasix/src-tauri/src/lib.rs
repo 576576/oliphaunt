@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use oliphaunt_wasix::{extensions, OliphauntServer, PgDumpOptions, PsqlOptions};
+use oliphaunt_wasix::{extensions, OliphauntServer};
+#[cfg(test)]
+use oliphaunt_wasix::{tools, Oliphaunt};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -133,19 +135,19 @@ impl From<sqlx::Error> for CommandError {
     }
 }
 
-fn open_database(root: PathBuf) -> Result<TodoDatabase> {
+fn open_database(directory: PathBuf) -> Result<TodoDatabase> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build WASIX example Tokio runtime")?;
     let _runtime_context = runtime.enter();
-    let server = start_database_server(root)?;
+    let server = start_database_server(directory)?;
     runtime.block_on(connect_database(server))
 }
 
-fn start_database_server(root: PathBuf) -> Result<OliphauntServer> {
+fn start_database_server(directory: PathBuf) -> Result<OliphauntServer> {
     let server = OliphauntServer::builder()
-        .path(root)
+        .storage(oliphaunt_wasix::DatabaseStorage::Directory(directory))
         .extensions([
             extensions::HSTORE,
             extensions::PG_TRGM,
@@ -153,7 +155,6 @@ fn start_database_server(root: PathBuf) -> Result<OliphauntServer> {
         ])
         .start()
         .context("start oliphaunt-wasix server")?;
-    validate_wasix_tools(&server)?;
     Ok(server)
 }
 
@@ -161,7 +162,7 @@ async fn connect_database(server: OliphauntServer) -> Result<TodoDatabase> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(30))
-        .connect(&server.connection_uri())
+        .connect(&server.connection_string())
         .await
         .context("connect SQLx pool to oliphaunt-wasix server")?;
     init_schema(&pool).await?;
@@ -180,20 +181,26 @@ async fn init_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-fn validate_wasix_tools(server: &OliphauntServer) -> Result<()> {
-    server
-        .preflight_tools()
-        .context("preflight split WASIX pg_dump and psql tools")?;
-    let dump = server.dump_sql(PgDumpOptions::new().arg("--schema-only"))?;
+#[cfg(test)]
+fn validate_wasix_tools() -> Result<()> {
+    let mut database = Oliphaunt::open()?;
+    let dump = tools::pg_dump(
+        &mut database,
+        tools::PgDumpOptions::new().arg("--schema-only"),
+    )?;
     anyhow::ensure!(
         dump.contains("PostgreSQL database dump"),
         "pg_dump SQL backup smoke did not look like a PostgreSQL dump"
     );
-    let psql = server.psql(PsqlOptions::new().arg("-tA").command("SELECT 1"))?;
+    let psql = tools::psql(
+        &mut database,
+        tools::PsqlOptions::new().arg("-tA").command("SELECT 1"),
+    )?;
     anyhow::ensure!(
         psql.lines().any(|line| line.trim() == "1"),
         "psql smoke did not return SELECT 1 output"
     );
+    database.close()?;
     Ok(())
 }
 
@@ -274,8 +281,8 @@ fn todo_from_row(row: &sqlx::postgres::PgRow) -> Result<Todo> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let root = app.path().app_data_dir()?.join("oliphaunt-wasix-todos");
-            let db = open_database(root)?;
+            let directory = app.path().app_data_dir()?.join("oliphaunt-wasix-todos");
+            let db = open_database(directory)?;
             app.manage(TodoStore {
                 inner: Mutex::new(db),
             });
@@ -297,14 +304,15 @@ mod tests {
 
     #[test]
     fn startup_smoke_runs_split_wasix_tools() {
-        let root = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "oliphaunt-example-tauri-wasix-smoke-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&root);
-        let db = open_database(root.clone())
-            .expect("start oliphaunt-wasix example database and run pg_dump smoke");
+        let _ = std::fs::remove_dir_all(&directory);
+        validate_wasix_tools().expect("run explicit split WASIX tools smoke");
+        let db = open_database(directory.clone())
+            .expect("start oliphaunt-wasix example database after tools smoke");
         drop(db);
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

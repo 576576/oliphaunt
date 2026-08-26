@@ -4,12 +4,17 @@ packages:
   - "src/runtimes/liboliphaunt/native/icu-npm"
   - "src/runtimes/liboliphaunt/native/packages/*"
   - "src/runtimes/liboliphaunt/native/tools-packages/*"
+  - "src/runtimes/liboliphaunt/native/tools-npm"
   - "src/runtimes/broker/packages/*"
   - "src/runtimes/node-direct"
   - "src/runtimes/node-direct/packages/*"
   - "src/sdks/react-native"
-  - "src/sdks/react-native/examples/expo"
-  - "src/bindings/wasix-rust/examples/tauri-sqlx-vanilla"
+  - "examples/browser-wasix"
+  - "examples/react-native-expo"
+  - "src/bindings/wasix-ts"
+  - "src/bindings/wasix-ts/tools-package"
+  - "src/runtimes/liboliphaunt/wasix/tools-npm"
+  - "tools/perf/wasix-node"
 
 catalog:
   "@vitest/coverage-v8": ^4.1.8

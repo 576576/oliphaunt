@@ -14,11 +14,9 @@ import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.gradle.api.tasks.bundling.AbstractArchiveTask
 import org.jetbrains.dokka.gradle.engine.parameters.VisibilityModifier
-import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import java.util.Properties
 
 abstract class CheckMavenPublicationContractTask : DefaultTask() {
@@ -56,7 +54,7 @@ abstract class CheckMavenPublicationContractTask : DefaultTask() {
             "Android AAR publication artifact must be ${expectedArtifactId.get()}; got ${actualArtifactId.get()}"
         }
         require(executableUnsupportedTasks.get().isEmpty()) {
-            "unsupported Kotlin/JVM/host-native publication tasks are enabled: ${executableUnsupportedTasks.get()}"
+            "unsupported non-Android publication tasks are enabled: ${executableUnsupportedTasks.get()}"
         }
     }
 }
@@ -96,14 +94,9 @@ kover {
         filters {
             includes {
                 classes(
-                    "dev.oliphaunt.AndroidContextRequiredEngine",
-                    "dev.oliphaunt.Backup*",
-                    "dev.oliphaunt.Engine*",
                     "dev.oliphaunt.GeneratedExtensionsKt",
                     "dev.oliphaunt.Oliphaunt*",
-                    "dev.oliphaunt.Protocol*",
                     "dev.oliphaunt.Query*",
-                    "dev.oliphaunt.Restore*",
                 )
             }
             excludes {
@@ -112,9 +105,7 @@ kover {
                     "dev.oliphaunt.AndroidNativeDirectEngine",
                     "dev.oliphaunt.AndroidNativeDirectEngineKt",
                     "dev.oliphaunt.AndroidNativeDirectSession",
-                    "dev.oliphaunt.OliphauntAndroid",
                     "dev.oliphaunt.OliphauntAndroidNativeBridge",
-                    "dev.oliphaunt.OliphauntAndroidProtocolStreamSink",
                 )
             }
         }
@@ -170,7 +161,7 @@ mavenPublishing {
     }
     pom {
         name.set("Oliphaunt Kotlin SDK")
-        description.set("Kotlin and Android SDK for native embedded PostgreSQL through liboliphaunt.")
+        description.set("Android SDK for native embedded PostgreSQL through liboliphaunt.")
         inceptionYear.set("2026")
         url.set("https://github.com/f0rr0/oliphaunt")
         licenses {
@@ -195,10 +186,6 @@ mavenPublishing {
     }
 }
 
-val bridgeSource = layout.projectDirectory.file("src/nativeInterop/cinterop/oliphaunt_kotlin_bridge.c")
-val bridgeHeader = layout.projectDirectory.file("src/nativeInterop/cinterop/oliphaunt_kotlin_bridge.h")
-val bridgeOutputDir = layout.buildDirectory.dir("nativeBridge")
-val bridgeArchive = bridgeOutputDir.map { it.file("liboliphaunt_kotlin_bridge.a") }
 val generatedAndroidAssetsDir = layout.buildDirectory.dir("generated/oliphaunt-android-assets")
 val generatedAndroidJniLibsDir = layout.buildDirectory.dir("generated/oliphaunt-android-jniLibs")
 val configuredCxxBuildRoot =
@@ -238,16 +225,6 @@ val packagedAndroidLinkEvidenceFile =
             ?: System.getenv("OLIPHAUNT_KOTLIN_ANDROID_LINK_EVIDENCE_FILE")
             ?: System.getenv("OLIPHAUNT_ANDROID_LINK_EVIDENCE_FILE")
     )?.toString()
-val explicitPackagedRuntimeDir =
-    (
-        oliphauntProperty("oliphauntRuntimeDir")
-            ?: System.getenv("OLIPHAUNT_KOTLIN_ANDROID_RUNTIME_DIR")
-    )?.toString()
-val explicitPackagedTemplatePgdataDir =
-    (
-        oliphauntProperty("oliphauntTemplatePgdataDir")
-            ?: System.getenv("OLIPHAUNT_KOTLIN_ANDROID_TEMPLATE_PGDATA_DIR")
-    )?.toString()
 val explicitPackagedExtensionsRaw =
     (
         oliphauntProperty("oliphauntExtensions")
@@ -278,13 +255,6 @@ fun runtimeResourcesRoot(): File? {
     }
 }
 
-fun runtimeResourceFiles(resourceName: String): String? =
-    runtimeResourcesRoot()
-        ?.resolve(resourceName)
-        ?.resolve("files")
-        ?.takeIf(File::isDirectory)
-        ?.absolutePath
-
 fun runtimeResourceManifestValue(
     resourceName: String,
     key: String,
@@ -300,9 +270,6 @@ fun runtimeResourceManifestValue(
     return properties.getProperty(key)
 }
 
-val packagedRuntimeDir = runtimeResourceFiles("runtime") ?: explicitPackagedRuntimeDir
-val packagedTemplatePgdataDir =
-    runtimeResourceFiles("template-pgdata") ?: explicitPackagedTemplatePgdataDir
 val packagedExtensionsRaw =
     explicitPackagedExtensionsRaw
         ?: runtimeResourceManifestValue("runtime", "selectedExtensions")
@@ -328,12 +295,6 @@ val effectiveAndroidExtensionArchivesDir =
 abstract class PrepareOliphauntAndroidAssetsTask : DefaultTask() {
     @get:Input
     abstract val runtimeResourcesDirPath: Property<String>
-
-    @get:Input
-    abstract val runtimeDirPath: Property<String>
-
-    @get:Input
-    abstract val templatePgdataDirPath: Property<String>
 
     @get:Input
     abstract val selectedExtensions: ListProperty<String>
@@ -380,47 +341,27 @@ abstract class PrepareOliphauntAndroidAssetsTask : DefaultTask() {
         deleteTree(output.toPath())
         output.mkdirs()
 
-        val runtimeResourcesPath = runtimeResourcesDirPath.get().takeIf(String::isNotBlank)
-        if (runtimeResourcesPath != null) {
-            val sourceRuntimeResourcesRoot = runtimeResourcesRoot(File(runtimeResourcesPath))
-            require(sourceRuntimeResourcesRoot.isDirectory) {
-                "Oliphaunt Kotlin Android runtime resources are not a Oliphaunt resource root: $runtimeResourcesPath"
-            }
-            validateRuntimeResourcesSchema(sourceRuntimeResourcesRoot)
-            copyTree(
-                sourceRuntimeResourcesRoot.toPath(),
-                output.resolve("oliphaunt").toPath(),
-                excludedPrefixes = setOf("static-registry/archives"),
-            )
-            validateSelectedExtensionFiles(
-                sourceRuntimeResourcesRoot,
-                output.resolve("oliphaunt/runtime/files"),
-                selectedExtensions.get(),
-                mobileStaticModuleStems.get(),
-            )
-            return
+        val runtimeResourcesPath = runtimeResourcesDirPath.get().takeIf(String::isNotBlank) ?: return
+        val sourceRuntimeResourcesRoot = runtimeResourcesRoot(File(runtimeResourcesPath))
+        require(sourceRuntimeResourcesRoot.isDirectory) {
+            "Oliphaunt Kotlin Android runtime resources are not a Oliphaunt resource root: $runtimeResourcesPath"
         }
-
-        writeAndroidAssetPackage(
-            name = "runtime",
-            layout = "postgres-runtime-files-v1",
-            sourcePath = runtimeDirPath.get().takeIf(String::isNotBlank),
-            requestedExtensions = selectedExtensions.get(),
-            mobileStaticModuleStems = mobileStaticModuleStems.get(),
-            output = output,
+        validateRuntimeResourcesSchema(sourceRuntimeResourcesRoot)
+        copyTree(
+            sourceRuntimeResourcesRoot.toPath(),
+            output.resolve("oliphaunt").toPath(),
+            excludedPrefixes = setOf("static-registry/archives"),
         )
-        writeAndroidAssetPackage(
-            name = "template-pgdata",
-            layout = "postgres-template-pgdata-v1",
-            sourcePath = templatePgdataDirPath.get().takeIf(String::isNotBlank),
-            requestedExtensions = emptyList(),
-            mobileStaticModuleStems = emptyList(),
-            output = output,
+        validateSelectedExtensionFiles(
+            sourceRuntimeResourcesRoot,
+            output.resolve("oliphaunt/runtime/files"),
+            selectedExtensions.get(),
+            mobileStaticModuleStems.get(),
         )
     }
 
     private fun validateRuntimeResourcesSchema(root: File) {
-        for (name in listOf("runtime", "template-pgdata")) {
+        for (name in listOf("runtime", "cluster-seed")) {
             val manifest = root.resolve("$name/manifest.properties")
             require(manifest.isFile) {
                 "Oliphaunt Kotlin Android runtime resources are missing $name/manifest.properties under ${root.absolutePath}"
@@ -445,80 +386,8 @@ abstract class PrepareOliphauntAndroidAssetsTask : DefaultTask() {
         }
     }
 
-    private fun writeAndroidAssetPackage(
-        name: String,
-        layout: String,
-        sourcePath: String?,
-        requestedExtensions: List<String>,
-        mobileStaticModuleStems: List<String>,
-        output: File,
-    ) {
-        if (sourcePath.isNullOrBlank()) {
-            require(requestedExtensions.isEmpty()) {
-                "Oliphaunt Kotlin Android extensions require -PoliphauntRuntimeDir=<postgres-install-root>"
-            }
-            return
-        }
-        val source = File(sourcePath)
-        require(source.isDirectory) {
-            "Oliphaunt Kotlin Android $name assets source is not a directory: $source"
-        }
-        require(mobileStaticModuleStems.isEmpty()) {
-            "Oliphaunt Kotlin Android split runtime packaging cannot declare mobile static module stems. " +
-                "Use -PoliphauntRuntimeResourcesDir=<runtime-resource output> from " +
-                "`oliphaunt-resources --mobile-static-module ...` so the runtime resources include the generated static-registry source."
-        }
-        val packageDir = output.resolve("oliphaunt/$name")
-        val filesDir = packageDir.resolve("files")
-        copyTree(source.toPath(), filesDir.toPath())
-        val extensions = resolveExtensionSelection(requestedExtensions)
-        validateSelectedExtensionFiles(null, filesDir, extensions, mobileStaticModuleStems)
-        val createableExtensions =
-            extensions.filter { extension ->
-                generatedExtensionMetadataRow(extension)["creates-extension"] as? Boolean
-                    ?: throw GradleException(
-                        "Oliphaunt Kotlin Android extension '$extension' must declare canonical creates-extension metadata",
-                    )
-            }
-        val nativeModuleStems = nativeModuleStems(extensions)
-        val registeredModuleStems = mobileStaticModuleStems.toSortedSet()
-        val unknownRegisteredStems = registeredModuleStems - nativeModuleStems.toSet()
-        require(unknownRegisteredStems.isEmpty()) {
-            "Oliphaunt Kotlin Android mobile static module stem(s) were not selected by these runtime resources: " +
-                unknownRegisteredStems.joinToString(",")
-        }
-        val registeredMobileExtensions = mobileStaticRegistryRegisteredExtensions(extensions, registeredModuleStems)
-        val pendingMobileExtensions = mobileStaticRegistryPendingExtensions(extensions, registeredModuleStems)
-        val mobileStaticRegistryState =
-            when {
-                nativeModuleStems.isEmpty() -> "not-required"
-                pendingMobileExtensions.isEmpty() -> "complete"
-                else -> "pending"
-            }
-        val manifest = packageDir.resolve("manifest.properties")
-        manifest.parentFile.mkdirs()
-        manifest.writeText(
-            listOf(
-                "schema=oliphaunt-runtime-resources-v1",
-                "cacheKey=${sha256Directory(source)}",
-                "layout=$layout",
-                "source=${source.name}",
-                "selectedExtensions=${extensions.joinToString(",")}",
-                "extensions=${createableExtensions.joinToString(",")}",
-                "runtimeFeatures=",
-                "sharedPreloadLibraries=${sharedPreloadLibraries(extensions).joinToString(",")}",
-                "mobileStaticRegistryState=$mobileStaticRegistryState",
-                "mobileStaticRegistryRegistered=${registeredMobileExtensions.joinToString(",")}",
-                "mobileStaticRegistryPending=${pendingMobileExtensions.joinToString(",")}",
-                "nativeModuleStems=${nativeModuleStems.joinToString(",")}",
-                "mobileStaticRegistrySource=",
-                "",
-            ).joinToString("\n"),
-        )
-    }
-
     private fun validateSelectedExtensionFiles(
-        runtimeResourcesRoot: File?,
+        runtimeResourcesRoot: File,
         filesDir: File,
         extensions: List<String>,
         effectiveMobileStaticModuleStems: List<String>,
@@ -572,14 +441,11 @@ abstract class PrepareOliphauntAndroidAssetsTask : DefaultTask() {
     }
 
     private fun incompleteMobileStaticRegistration(
-        runtimeResourcesRoot: File?,
+        runtimeResourcesRoot: File,
         extension: String,
         moduleStem: String,
         effectiveMobileStaticModuleStems: List<String>,
     ): String? {
-        if (runtimeResourcesRoot == null) {
-            return "split runtime inputs do not provide a static-registry contract"
-        }
         if (moduleStem !in effectiveMobileStaticModuleStems) {
             return "effective mobile static module stems do not include '$moduleStem'"
         }
@@ -673,101 +539,15 @@ abstract class PrepareOliphauntAndroidAssetsTask : DefaultTask() {
             .filter(String::isNotEmpty)
             .toSortedSet()
 
-    private fun resolveExtensionSelection(requestedExtensions: List<String>): List<String> {
-        val extensions = linkedSetOf<String>()
-        for (extension in requestedExtensions) {
-            extensions.addAll(extensionDependencies(extension))
-            extensions.add(extension)
-        }
-        return extensions.toSortedSet().onEach(::requireMobileReleaseReady).toList()
-    }
-
-    private fun extensionDependencies(extension: String): List<String> =
-        generatedExtensionStringList(extension, "selected-extension-dependencies")
-
-    private fun sharedPreloadLibraries(extensions: List<String>): List<String> =
-        extensions
-            .flatMap { extension -> generatedExtensionStringList(extension, "shared-preload-libraries") }
-            .toSortedSet()
-            .toList()
-
-    private fun mobileStaticRegistryRegisteredExtensions(
-        extensions: List<String>,
-        registeredModuleStems: Set<String>,
-    ): List<String> =
-        extensions
-            .filter { extension ->
-                val stem = nativeModuleStem(extension)
-                stem != null && stem in registeredModuleStems
-            }.toSortedSet()
-            .toList()
-
-    private fun mobileStaticRegistryPendingExtensions(
-        extensions: List<String>,
-        registeredModuleStems: Set<String>,
-    ): List<String> =
-        extensions
-            .filter { extension ->
-                val stem = nativeModuleStem(extension)
-                stem != null && stem !in registeredModuleStems
-            }.toSortedSet()
-            .toList()
-
-    private fun nativeModuleStems(extensions: List<String>): List<String> =
-        extensions
-            .mapNotNull(::nativeModuleStem)
-            .toSortedSet()
-            .toList()
-
-    private fun nativeModuleStem(extension: String): String? = generatedNativeModuleStem(extension)
-
-    private fun generatedExtensionStringList(
-        extension: String,
-        field: String,
-    ): List<String> =
-        (generatedExtensionMetadataRow(extension)[field] as? List<*>)
-            ?.map { value -> value.toString() }
-            ?: emptyList()
-
     private fun generatedExtensionMetadataRow(extension: String): Map<String, Any?> =
         generatedExtensionMetadataBySqlName[extension]
             ?: throw GradleException(
-                "Oliphaunt Kotlin Android split runtime packaging cannot select unknown extension '$extension'. " +
-                    "Use a generated built-in extension name, or pass " +
-                    "-PoliphauntRuntimeResourcesDir=<runtime-resource output> for custom prebuilt extension artifacts.",
+                "Oliphaunt Kotlin Android runtime resources cannot validate unknown extension '$extension'",
             )
 
     private fun generatedNativeModuleStem(extension: String): String? {
         val row = generatedExtensionMetadataRow(extension)
         return row["native-module-stem"] as? String
-    }
-
-    private fun requireMobileReleaseReady(extension: String) {
-        val row = generatedExtensionMetadataRow(extension)
-        require(row["mobile-release-ready"] == true) {
-            "Oliphaunt Kotlin Android split runtime packaging cannot select extension '$extension' because " +
-                "it does not have release-ready Android/iOS artifacts in the generated exact-extension catalog."
-        }
-    }
-
-    private fun sha256Directory(source: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val rootPath = source.toPath()
-        Files.walk(rootPath).use { stream ->
-            stream.sorted().forEach { path ->
-                require(!Files.isSymbolicLink(path)) {
-                    "Oliphaunt Android assets do not support symlinks: $path"
-                }
-                if (Files.isRegularFile(path)) {
-                    val relative = rootPath.relativize(path).toString().replace(File.separatorChar, '/')
-                    digest.update(relative.toByteArray(Charsets.UTF_8))
-                    digest.update(0.toByte())
-                    digest.update(Files.readAllBytes(path))
-                    digest.update(0.toByte())
-                }
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun copyTree(
@@ -941,14 +721,12 @@ fun parseAndroidAbiFilters(raw: String?): List<String> {
 
 val prepareOliphauntAndroidAssets by tasks.registering(PrepareOliphauntAndroidAssetsTask::class) {
     runtimeResourcesDirPath.set(packagedRuntimeResourcesDir ?: "")
-    runtimeDirPath.set(packagedRuntimeDir ?: "")
-    templatePgdataDirPath.set(packagedTemplatePgdataDir ?: "")
     selectedExtensions.set(packagedExtensions)
     mobileStaticModuleStems.set(packagedMobileStaticModules)
-    generatedExtensionMetadata.from(layout.projectDirectory.file("src/generated/extensions.json"))
-    listOfNotNull(packagedRuntimeResourcesDir, packagedRuntimeDir, packagedTemplatePgdataDir)
-        .filter(String::isNotBlank)
-        .forEach { sourceDirectories.from(file(it)) }
+    generatedExtensionMetadata.from(
+        layout.projectDirectory.file("../../../extensions/generated/sdk/extensions.json"),
+    )
+    packagedRuntimeResourcesDir?.takeIf(String::isNotBlank)?.let { sourceDirectories.from(file(it)) }
     outputDir.set(generatedAndroidAssetsDir)
 }
 
@@ -956,31 +734,6 @@ val prepareOliphauntAndroidJniLibs by tasks.registering(PrepareOliphauntAndroidJ
     jniLibsDirPath.set(packagedAndroidJniLibsDir ?: "")
     packagedAndroidJniLibsDir?.takeIf(String::isNotBlank)?.let { sourceDirectories.from(file(it)) }
     outputDir.set(generatedAndroidJniLibsDir)
-}
-
-val buildNativeBridge by tasks.registering(Exec::class) {
-    inputs.files(
-        bridgeSource,
-        bridgeHeader,
-        layout.projectDirectory.file("../../../runtimes/liboliphaunt/native/include/oliphaunt.h"),
-    )
-    outputs.file(bridgeArchive)
-    commandLine(
-        "sh",
-        "-c",
-        """
-        set -eu
-        mkdir -p "${bridgeOutputDir.get().asFile.absolutePath}"
-        cc -std=c11 -fPIC -I"${project.layout.projectDirectory.dir(
-            "src/nativeInterop/cinterop",
-        ).asFile.absolutePath}" -I"${project.layout.projectDirectory.dir(
-            "../../../runtimes/liboliphaunt/native/include",
-        ).asFile.absolutePath}" -c "${bridgeSource.asFile.absolutePath}" -o "${bridgeOutputDir.get().file(
-            "oliphaunt_kotlin_bridge.o",
-        ).asFile.absolutePath}"
-        ar rcs "${bridgeArchive.get().asFile.absolutePath}" "${bridgeOutputDir.get().file("oliphaunt_kotlin_bridge.o").asFile.absolutePath}"
-        """.trimIndent(),
-    )
 }
 
 val oliphauntJvmToolchainVersion =
@@ -993,44 +746,12 @@ kotlin {
     jvmToolchain(oliphauntJvmToolchainVersion.get())
 
     androidTarget {
-        // The JVM and host-native targets below exist to exercise the shared API
-        // during development. Android is the only supported Maven consumer
-        // surface, so only its release variant may become a publication.
+        // Android is the only supported consumer surface.
         publishLibraryVariants("release")
     }
     jvm()
-    when {
-        System.getProperty("os.name").startsWith("Mac") -> macosArm64()
-        System.getProperty("os.arch") == "aarch64" -> linuxArm64()
-        else -> linuxX64()
-    }
-
-    targets.withType<KotlinNativeTarget>().configureEach {
-        compilations["main"].cinterops.create("oliphaunt") {
-            definitionFile.set(project.file("src/nativeInterop/cinterop/oliphaunt.def"))
-            includeDirs(project.layout.projectDirectory.dir("../../../runtimes/liboliphaunt/native/include"))
-            includeDirs(project.layout.projectDirectory.dir("src/nativeInterop/cinterop"))
-            extraOpts(
-                "-libraryPath",
-                bridgeOutputDir.get().asFile.absolutePath,
-                "-staticLibrary",
-                bridgeArchive.get().asFile.name,
-            )
-        }
-    }
 
     sourceSets {
-        val nativeMain by creating {
-            dependsOn(commonMain.get())
-        }
-        val nativeTest by creating {
-            dependsOn(commonTest.get())
-        }
-        targets.withType<KotlinNativeTarget>().configureEach {
-            compilations["main"].defaultSourceSet.dependsOn(nativeMain)
-            compilations["test"].defaultSourceSet.dependsOn(nativeTest)
-        }
-
         commonMain.dependencies {
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
         }
@@ -1038,6 +759,10 @@ kotlin {
             implementation(kotlin("test"))
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
             implementation(libs.kotlinx.serialization.json)
+        }
+        androidUnitTest.dependencies {
+            // Android's SDK jar contains only throwing org.json stubs on the host JVM.
+            implementation("org.json:json:20240303")
         }
     }
 }
@@ -1084,7 +809,14 @@ fun publicationTokenForTask(taskName: String): String? = publicationTaskName.mat
 // task non-executable, including when an aggregate Maven Central task is used.
 tasks.configureEach {
     val publicationToken = publicationTokenForTask(name)
-    if (publicationToken != null && publicationToken != supportedMavenPublicationTaskToken) {
+    if (
+        publicationToken == supportedMavenPublicationTaskToken &&
+        name.startsWith("generateMetadataFileFor")
+    ) {
+        // This is an Android-only AAR. KMP module metadata redirects consumers
+        // to the intentionally unpublished root multiplatform component.
+        enabled = false
+    } else if (publicationToken != null && publicationToken != supportedMavenPublicationTaskToken) {
         enabled = false
     }
 }
@@ -1148,21 +880,41 @@ gradle.projectsEvaluated {
     }
 }
 
+val sharedFixturesDirectory =
+    listOf(
+        rootProject.layout.projectDirectory
+            .dir("../../shared/fixtures")
+            .asFile,
+        project.layout.projectDirectory
+            .dir("../../../shared/fixtures")
+            .asFile,
+    ).firstOrNull { it.isDirectory }
+        ?: rootProject.layout.projectDirectory
+            .dir("../../shared/fixtures")
+            .asFile
+val sharedClusterSeedFixturesDirectory =
+    listOf(
+        rootProject.layout.projectDirectory
+            .dir("../../shared/cluster-seed-contract/fixtures")
+            .asFile,
+        project.layout.projectDirectory
+            .dir("../../../shared/cluster-seed-contract/fixtures")
+            .asFile,
+    ).firstOrNull { it.isDirectory }
+        ?: rootProject.layout.projectDirectory
+            .dir("../../shared/cluster-seed-contract/fixtures")
+            .asFile
+
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     systemProperty(
         "oliphaunt.sharedFixturesDir",
-        rootProject.layout.projectDirectory
-            .dir("../../shared/fixtures")
-            .asFile.absolutePath,
+        sharedFixturesDirectory.absolutePath,
+    )
+    systemProperty(
+        "oliphaunt.clusterSeedFixturesDir",
+        sharedClusterSeedFixturesDirectory.absolutePath,
     )
 }
-
-tasks
-    .matching {
-        it.name.startsWith("cinteropOliphaunt") || it.name.startsWith("cinteropLiboliphaunt")
-    }.configureEach {
-        dependsOn(buildNativeBridge)
-    }
 
 android {
     namespace = "dev.oliphaunt"

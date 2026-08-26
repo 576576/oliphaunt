@@ -3,7 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <chrono>
 #include <mutex>
+#include <thread>
 
 struct OliphauntHandle {
   bool logical_active = false;
@@ -14,8 +17,11 @@ struct OliphauntHandle {
 namespace {
 
 std::mutex g_mutex;
+std::condition_variable g_query_condition;
 OliphauntHandle g_handle;
 char g_last_error[256] = "";
+bool g_failed_detach_once = false;
+bool g_query_cancelled = false;
 
 void SetError(const char *message) {
   std::snprintf(g_last_error, sizeof(g_last_error), "%s", message);
@@ -74,6 +80,11 @@ int32_t UnsupportedResponse(OliphauntResponse *out) {
   return -1;
 }
 
+bool BlockArchiveOperation() {
+  const char *block = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_ARCHIVE");
+  return block != nullptr && std::strcmp(block, "1") == 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -84,18 +95,24 @@ OLIPHAUNT_API int32_t oliphaunt_init(
   return OpenFake(out);
 }
 
-OLIPHAUNT_API int32_t oliphaunt_init_ex(
-    const OliphauntConfig *,
-    const OliphauntInitOptions *,
-    OliphauntHandle **out) {
-  return OpenFake(out);
-}
-
 OLIPHAUNT_API int32_t oliphaunt_exec_protocol(
     OliphauntHandle *,
     const uint8_t *,
     size_t,
     OliphauntResponse *out) {
+  const char *block_query = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_QUERY");
+  if (block_query != nullptr && std::strcmp(block_query, "1") == 0) {
+    if (out != nullptr) {
+      out->data = nullptr;
+      out->len = 0;
+    }
+    std::unique_lock<std::mutex> guard(g_mutex);
+    RecordEvent("query-started");
+    g_query_condition.wait(guard, [] { return g_query_cancelled; });
+    RecordEvent("query-cancelled");
+    SetError("fake query was cancelled");
+    return -1;
+  }
   return UnsupportedResponse(out);
 }
 
@@ -119,23 +136,46 @@ OLIPHAUNT_API int32_t oliphaunt_exec_protocol_stream(
 
 OLIPHAUNT_API int32_t oliphaunt_backup(
     OliphauntHandle *,
-    uint32_t,
     OliphauntResponse *out) {
-  return UnsupportedResponse(out);
-}
-
-OLIPHAUNT_API int32_t oliphaunt_backup_ex(
-    OliphauntHandle *,
-    const OliphauntBackupOptions *,
-    OliphauntResponse *out) {
+  if (BlockArchiveOperation()) {
+    RecordEvent("backup-started");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (out == nullptr) {
+      SetError("fake backup received a null response");
+      return -1;
+    }
+    out->data = static_cast<uint8_t *>(std::malloc(3));
+    if (out->data == nullptr) {
+      SetError("fake backup allocation failed");
+      return -1;
+    }
+    out->data[0] = 1;
+    out->data[1] = 2;
+    out->data[2] = 3;
+    out->len = 3;
+    RecordEvent("backup-finished");
+    return 0;
+  }
   return UnsupportedResponse(out);
 }
 
 OLIPHAUNT_API int32_t oliphaunt_restore(const OliphauntRestoreOptions *) {
+  if (BlockArchiveOperation()) {
+    RecordEvent("restore-started");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    RecordEvent("restore-finished");
+  }
   return 0;
 }
 
 OLIPHAUNT_API int32_t oliphaunt_cancel(OliphauntHandle *) {
+  const char *block_query = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_QUERY");
+  if (block_query != nullptr && std::strcmp(block_query, "1") == 0) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    RecordEvent("cancel");
+    g_query_cancelled = true;
+    g_query_condition.notify_all();
+  }
   return 0;
 }
 
@@ -149,6 +189,13 @@ OLIPHAUNT_API int32_t oliphaunt_detach(OliphauntHandle *handle) {
   if (g_handle.terminally_closed) {
     RecordEvent("detach-after-close");
     SetError("fake detach ran after terminal close");
+    return -1;
+  }
+  const char *fail_once = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_FAIL_DETACH_ONCE");
+  if (!g_failed_detach_once && fail_once != nullptr && std::strcmp(fail_once, "1") == 0) {
+    g_failed_detach_once = true;
+    RecordEvent("detach-failed");
+    SetError("injected fake detach failure");
     return -1;
   }
   RecordEvent("detach");
@@ -223,10 +270,6 @@ OLIPHAUNT_API const char *oliphaunt_last_error(OliphauntHandle *) {
 
 OLIPHAUNT_API const char *oliphaunt_version(void) {
   return "cleanup-fixture";
-}
-
-OLIPHAUNT_API uint64_t oliphaunt_capabilities(void) {
-  return OLIPHAUNT_CAP_LOGICAL_REOPEN;
 }
 
 OLIPHAUNT_API void oliphaunt_free_response(OliphauntResponse *response) {

@@ -20,12 +20,14 @@ import {
   liboliphauntNativeIosRuntimeMatrix,
   liboliphauntNativeRuntimeTargetsForSurface,
   liboliphauntWasixAotRuntimeMatrix,
+  liboliphauntWasixPostmasterRuntimeMatrix,
   nodeDirectRuntimeMatrix,
   reactNativeAndroidMobileAppMatrix,
 } from "../release/artifact_target_matrix.mjs";
 import {
   compareText,
   exactExtensionProducts,
+  extensionPublicDependencySqlNames,
   extensionSqlNames,
 } from "../release/release-artifact-targets.mjs";
 
@@ -51,6 +53,7 @@ export const BUILDER_JOBS = new Set([
   "liboliphaunt-wasix-aot",
   "liboliphaunt-wasix-release-assets",
   "liboliphaunt-wasix-runtime",
+  "wasix-postmaster",
   "mobile-build-android",
   "mobile-build-ios",
   "mobile-extension-packages",
@@ -60,6 +63,7 @@ export const BUILDER_JOBS = new Set([
   "rust-sdk-package",
   "swift-sdk-package",
   "wasix-rust-package",
+  "wasix-ts-sdk-package",
 ]);
 const NATIVE_RUNTIME_JOBS = new Set([
   "liboliphaunt-native-android",
@@ -87,6 +91,7 @@ const MOBILE_E2E_JOBS = {
   "mobile-build-android": "mobile-e2e-android",
   "mobile-build-ios": "mobile-e2e-ios",
 };
+const REACT_NATIVE_ANDROID_REPRESENTATIVE_TARGETS = new Set(["android-x86_64"]);
 export const NATIVE_EXTENSION_LIFECYCLE_JOB = "native-extension-lifecycle";
 export const NATIVE_EXTENSION_LIFECYCLE_AGGREGATE_JOB =
   "native-extension-lifecycle-aggregate";
@@ -351,6 +356,7 @@ export function addImpliedJobs(jobs, tasks) {
     jobs.add("extension-artifacts-wasix");
     jobs.add("liboliphaunt-wasix-runtime");
     jobs.add("liboliphaunt-wasix-aot");
+    jobs.add("liboliphaunt-wasix-release-assets");
   }
 
   if (jobs.has(NATIVE_EXTENSION_LIFECYCLE_JOB)) {
@@ -375,6 +381,12 @@ export function planJobsForAffected(directProjects, tasks) {
   const jobs = new Set(ALWAYS_JOBS);
   for (const job of jobsForTargets(tasks, { allowedJobs: ALL_BUILDER_JOBS })) {
     jobs.add(job);
+  }
+  // The WASIX TypeScript package runs packed Node, Bun, and Deno consumers
+  // against the same-run portable runtime rather than silently falling back
+  // to workspace or registry assets.
+  if (jobs.has("wasix-ts-sdk-package")) {
+    jobs.add("liboliphaunt-wasix-runtime");
   }
   if (intersects(directProjects, new Set(exactExtensionProducts()))) {
     jobs.add("extension-artifacts-native");
@@ -508,18 +520,20 @@ export function liboliphauntNativeDesktopRuntimeMatrixForPlan(
 
 function focusedMobileNativeTargets(mobileTarget, nativeTarget, focusedMobileJobs) {
   const targets = mobileNativeTargetsForJobs(focusedMobileJobs);
-  if (nativeTarget === "all") {
-    return targets;
+  if (nativeTarget !== "all") {
+    if (mobileTarget === "both") {
+      throw new Error("focused mobile_target=both requires native_target=all");
+    }
+    if (!targets.has(nativeTarget)) {
+      throw new Error(
+        `native_target=${nativeTarget} is not valid for mobile_target=${mobileTarget}; expected one of: all, ${sorted(targets).join(", ")}`,
+      );
+    }
   }
-  if (mobileTarget === "both") {
-    throw new Error("focused mobile_target=both requires native_target=all");
-  }
-  if (!targets.has(nativeTarget)) {
-    throw new Error(
-      `native_target=${nativeTarget} is not valid for mobile_target=${mobileTarget}; expected one of: all, ${sorted(targets).join(", ")}`,
-    );
-  }
-  return new Set([nativeTarget]);
+  // Mobile qualification admits one physical compatibility domain. A focused
+  // target may select that domain, but must not silently omit one of its ABI
+  // receipts or the representative emulator app that consumes the closure.
+  return targets;
 }
 
 export function planForPullRequest() {
@@ -600,12 +614,6 @@ export function extensionProductDependencyClosure(products) {
   const productBySqlName = new Map(
     [...exactProducts].flatMap((product) => extensionSqlNames(product, PREFIX).map((sqlName) => [sqlName, product])),
   );
-  const metadata = JSON.parse(
-    readFileSync(path.join(ROOT, "src/extensions/generated/sdk/rust.json"), "utf8"),
-  );
-  const metadataBySqlName = new Map(
-    (metadata.extensions ?? []).map((row) => [row["sql-name"], row]),
-  );
   const closure = new Set();
   const pending = [...products];
   while (pending.length > 0) {
@@ -614,9 +622,7 @@ export function extensionProductDependencyClosure(products) {
     if (closure.has(product)) continue;
     closure.add(product);
     for (const sqlName of extensionSqlNames(product, PREFIX)) {
-      const row = metadataBySqlName.get(sqlName);
-      if (!row) throw new Error(`generated Rust metadata is missing exact extension ${sqlName}`);
-      for (const dependencySqlName of row["selected-extension-dependencies"] ?? []) {
+      for (const dependencySqlName of extensionPublicDependencySqlNames(sqlName, PREFIX)) {
         const dependencyProduct = productBySqlName.get(dependencySqlName);
         if (!dependencyProduct) {
           throw new Error(`${sqlName} has unknown public extension dependency ${dependencySqlName}`);
@@ -764,12 +770,12 @@ export function renderPlanForFullRun({
 } = {}) {
   return renderPlan(
     planForFullRun({ wasmTarget, nativeTarget, mobileTarget }),
-    { nativeTarget, wasmTarget },
+    { nativeTarget: mobileTarget === "all" ? nativeTarget : "all", wasmTarget },
   );
 }
 
 export function extensionArtifactsWasixMatrixForPlan(jobs, selectedExtensionProducts) {
-  // Release regression exercises every promoted extension. Its portable
+  // Release regression exercises every public extension. Its portable
   // carrier producer must therefore be complete even when the release/package
   // selection is intentionally narrowed to one independently versioned
   // extension. Non-regression callers retain that focused selection.
@@ -899,6 +905,9 @@ export function renderPlanWithSelection({
     liboliphaunt_wasix_aot_runtime_matrix: jobs.has("liboliphaunt-wasix-aot")
       ? liboliphauntWasixAotRuntimeMatrix(wasmTarget)
       : emptyMatrix(),
+    liboliphaunt_wasix_postmaster_runtime_matrix: jobs.has("wasix-postmaster")
+      ? liboliphauntWasixPostmasterRuntimeMatrix()
+      : emptyMatrix(),
     extension_package_products: extensionProducts,
     extension_package_products_csv: extensionProducts.join(","),
     extension_package_sql_names: extensionSqlNames,
@@ -910,7 +919,7 @@ export function renderPlanWithSelection({
     mobile_extension_package_native_targets: mobileExtensionPackageNativeTargets(jobs, selectedTargets),
     mobile_extension_package_native_targets_csv: mobileExtensionPackageNativeTargets(jobs, selectedTargets).join(","),
     react_native_android_mobile_app_matrix: jobs.has("mobile-build-android")
-      ? reactNativeAndroidMobileAppMatrix(nativeTarget, selectedTargets ?? undefined)
+      ? reactNativeAndroidMobileAppMatrix("all", REACT_NATIVE_ANDROID_REPRESENTATIVE_TARGETS)
       : emptyMatrix(),
     broker_runtime_matrix: jobs.has("broker-runtime")
       ? brokerRuntimeMatrix(

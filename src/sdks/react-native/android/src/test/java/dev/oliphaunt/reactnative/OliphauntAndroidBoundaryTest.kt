@@ -1,6 +1,6 @@
 package dev.oliphaunt.reactnative
 
-import dev.oliphaunt.OliphauntAndroid
+import dev.oliphaunt.Oliphaunt
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,8 +9,91 @@ import org.junit.Test
 
 class OliphauntAndroidBoundaryTest {
   @Test
+  fun turboModuleHandlesRequireFinitePositiveSafeIntegers() {
+    assertEquals(1L, requireReactNativeHandle(1.0))
+    assertEquals(
+      REACT_NATIVE_MAX_SAFE_INTEGER_HANDLE,
+      requireReactNativeHandle(REACT_NATIVE_MAX_SAFE_INTEGER_HANDLE.toDouble()),
+    )
+
+    listOf(
+      Double.NaN,
+      Double.POSITIVE_INFINITY,
+      Double.NEGATIVE_INFINITY,
+      -1.0,
+      0.0,
+      1.5,
+      REACT_NATIVE_MAX_SAFE_INTEGER_HANDLE.toDouble() + 1.0,
+    ).forEach(::assertInvalidReactNativeHandle)
+    listOf(
+      Long.MIN_VALUE,
+      -1L,
+      0L,
+      REACT_NATIVE_MAX_SAFE_INTEGER_HANDLE + 1L,
+      Long.MAX_VALUE,
+    ).forEach(::assertInvalidReactNativeHandle)
+  }
+
+  @Test
+  fun iosTurboModuleValidatesHandlesBeforeEveryLookupAndRemoval() {
+    val iosSource = File(System.getProperty("user.dir"), "../ios/Oliphaunt.mm").readText()
+
+    assertTrue(
+      "React Native iOS must reject non-finite, fractional, and unsafe numeric handles",
+      iosSource.contains("std::isfinite(handle)") &&
+        iosSource.contains("std::trunc(handle) == handle") &&
+        iosSource.contains("handle <= kOliphauntMaxSafeIntegerHandle"),
+    )
+    assertTrue(
+      "React Native iOS must canonicalize validated handles through one checked helper",
+      iosSource.contains("static NSNumber *_Nullable OliphauntHandleKey(double handle)") &&
+        iosSource.contains("NSNumber *key = OliphauntHandleKey(handle);"),
+    )
+    assertFalse(
+      "React Native iOS must not cast unchecked TurboModule doubles into dictionary keys",
+      iosSource.contains("@(static_cast<uint64_t>(handle))") &&
+        !iosSource.substringAfter("static NSNumber *_Nullable OliphauntHandleKey(double handle)")
+          .substringBefore("#ifdef RCT_NEW_ARCH_ENABLED")
+          .contains("OliphauntIsValidHandle(handle)"),
+    )
+  }
+
+  @Test
+  fun iosRetainsNativeDirectOwnershipAcrossModuleInvalidation() {
+    val iosSource = File(System.getProperty("user.dir"), "../ios/Oliphaunt.mm").readText()
+
+    assertTrue(iosSource.contains("static void OliphauntAcquireNativeDirect"))
+    assertTrue(iosSource.contains("OliphauntRetainedNativeDirectDatabase = database"))
+    assertTrue(iosSource.contains("static void OliphauntFinishNativeDirectCleanup"))
+    assertTrue(iosSource.contains("BOOL retainOnFailure"))
+    assertTrue(iosSource.contains("OliphauntNativeDirectCleanupAlreadyInFlight"))
+    assertFalse(
+      "iOS invalidation must not abandon an in-flight owner after an arbitrary timeout",
+      iosSource.contains("dispatch_group_wait"),
+    )
+  }
+
+  @Test
+  fun iosProtocolStreamAcknowledgesEachCallback() {
+    val iosSource = File(System.getProperty("user.dir"), "../ios/Oliphaunt.mm").readText()
+    val adapterSource = File(
+      System.getProperty("user.dir"),
+      "../ios/OliphauntAdapter.swift",
+    ).readText()
+
+    assertTrue(
+      "React Native iOS JSI must use the bounded callback contract",
+      iosSource.contains("class OliphauntChunkAcknowledgement") &&
+        iosSource.contains("acknowledgement->wait()") &&
+        iosSource.contains("OliphauntProtocolStreamCallbackError") &&
+        adapterSource.contains("if let error = chunkBox.value") &&
+        adapterSource.contains("throw error"),
+    )
+  }
+
+  @Test
   fun reactNativeAndroidDelegatesRuntimeToKotlinSdk() {
-    assertEquals("dev.oliphaunt.OliphauntAndroid", OliphauntAndroid::class.java.name)
+    assertEquals("dev.oliphaunt.Oliphaunt", Oliphaunt::class.java.name)
 
     val nativeSourceDir = File(System.getProperty("user.dir"), "src/main/cpp")
     val nativeSources = nativeSourceDir
@@ -33,9 +116,9 @@ class OliphauntAndroidBoundaryTest {
       System.getProperty("user.dir"),
       "src/main/java/dev/oliphaunt/reactnative/OliphauntModule.kt",
     ).readText()
-    assertTrue(
-      "React Native Android must delegate package-size evidence to OliphauntAndroid",
-      moduleSource.contains("OliphauntAndroid.packageSizeReport"),
+    assertFalse(
+      "React Native Android must not expose repository qualification APIs",
+      moduleSource.contains("packageSizeReport") || moduleSource.contains("processMemory"),
     )
     assertTrue(
       "React Native Android must reject non-string extension entries before Kotlin SDK open",
@@ -55,26 +138,25 @@ class OliphauntAndroidBoundaryTest {
       moduleSource.contains("getType(name) == ReadableType.String") &&
         moduleSource.contains("\$name must be a string"),
     )
-    assertTrue(
-      "React Native Android must reject blank native override paths before Kotlin SDK open",
-      moduleSource.contains("pathOverride") &&
-        moduleSource.contains("libraryPath must not be empty"),
+    assertFalse(
+      "React Native Android app configuration must not expose native path overrides",
+      moduleSource.contains("config.pathOverride"),
     )
     assertTrue(
-      "React Native Android must reject NUL-containing roots before Kotlin SDK open/restore",
-      moduleSource.contains("validateRootPath") &&
+      "React Native Android must reject NUL-containing storage and restore paths before crossing the Kotlin SDK boundary",
+      moduleSource.contains("validatePath") &&
         moduleSource.contains("must not contain NUL bytes"),
     )
     assertTrue(
       "React Native Android must expose a byte-array JSI hook that delegates to the Kotlin SDK session",
       moduleSource.contains("fun execProtocolRawBytes") &&
-        moduleSource.contains("session.execProtocolRaw(ProtocolRequest(request)).bytes"),
+        moduleSource.contains("session.execProtocolRaw(request)"),
     )
     assertTrue(
-      "React Native Android must expose a true chunked JSI stream hook that delegates to the Kotlin SDK session",
+      "React Native Android must stream through the Kotlin SDK and propagate acknowledged callback failures",
       moduleSource.contains("fun execProtocolStreamBytes") &&
-        moduleSource.contains("session.execProtocolStream(ProtocolRequest(request))") &&
-        moduleSource.contains("callback.emitChunk(chunk.bytes)"),
+        moduleSource.contains("session.execProtocolStream(request)") &&
+        moduleSource.contains("callback.emitChunk(chunk)"),
     )
     assertTrue(
       "React Native Android must expose byte-array JSI backup/restore hooks instead of base64 TurboModule binary APIs",
@@ -106,10 +188,37 @@ class OliphauntAndroidBoundaryTest {
         jsiSource.contains("typed-array byteLength"),
     )
     assertTrue(
-      "React Native Android JSI must install a real chunked stream transport before protocolStream can be advertised",
-      jsiSource.contains("\"execProtocolStream\"") &&
-        jsiSource.contains("OliphauntJsiStreamCallback") &&
-        jsiSource.contains("nativeEmitChunk"),
+      "React Native Android JSI must acknowledge each stream callback before accepting another chunk",
+      jsiSource.contains("class ChunkAcknowledgement") &&
+        jsiSource.contains("acknowledgement->wait()") &&
+        jsiSource.contains("protocol stream callback failed"),
     )
+    val callbackSource = File(
+      System.getProperty("user.dir"),
+      "src/main/java/dev/oliphaunt/reactnative/OliphauntJsiStreamCallback.kt",
+    ).readText()
+    assertTrue(
+      "React Native Android must surface a failed JSI acknowledgement to the Kotlin producer",
+      callbackSource.contains("nativeEmitChunk(token, chunk)?.let") &&
+        callbackSource.contains("throw IllegalStateException(error)"),
+    )
+  }
+
+  private fun assertInvalidReactNativeHandle(handle: Double) {
+    try {
+      requireReactNativeHandle(handle)
+      throw AssertionError("expected invalid React Native handle: $handle")
+    } catch (error: IllegalArgumentException) {
+      assertTrue(error.message.orEmpty().contains("positive safe integer"))
+    }
+  }
+
+  private fun assertInvalidReactNativeHandle(handle: Long) {
+    try {
+      requireReactNativeHandle(handle)
+      throw AssertionError("expected invalid React Native handle: $handle")
+    } catch (error: IllegalArgumentException) {
+      assertTrue(error.message.orEmpty().contains("positive safe integer"))
+    }
   }
 }

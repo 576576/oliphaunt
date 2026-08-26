@@ -17,7 +17,7 @@ cd "$root"
 . "$root/src/sdks/react-native/tools/expo-runner-ios-device.sh"
 . "$root/src/sdks/react-native/tools/expo-runner-ios-installed-app.sh"
 
-source_example_dir="$root/src/sdks/react-native/examples/expo"
+source_example_dir="$root/examples/react-native-expo"
 rn_dir="$root/src/sdks/react-native"
 mobile_platform="ios"
 scratch_workspace_name="oliphaunt-react-native-expo-ios-workspace"
@@ -40,9 +40,9 @@ elif [ "$runner" = "crash" ]; then
   failure_tag="OLIPHAUNT_EXPO_CRASH_RECOVERY_FAIL"
 fi
 scratch_root="${OLIPHAUNT_EXPO_IOS_SCRATCH:-$root/target/oliphaunt-expo-ios-$runner}"
-example_dir="${OLIPHAUNT_EXPO_IOS_EXAMPLE_DIR:-$scratch_root/src/sdks/react-native/examples/expo}"
-crash_root_suffix="$(printf '%s' "$(basename "$scratch_root")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
-[ -n "$crash_root_suffix" ] || crash_root_suffix="run"
+example_dir="${OLIPHAUNT_EXPO_IOS_EXAMPLE_DIR:-$scratch_root/examples/react-native-expo}"
+crash_storage_suffix="$(printf '%s' "$(basename "$scratch_root")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
+[ -n "$crash_storage_suffix" ] || crash_storage_suffix="run"
 package_work="$scratch_root/src/sdks/react-native"
 pack_dir="${OLIPHAUNT_EXPO_IOS_PACK_DIR:-$root/target/oliphaunt-rn-expo-pack/ios}"
 tarball="$pack_dir/$(react_native_package_tarball_name "$rn_dir")"
@@ -107,18 +107,18 @@ elif [ "${OLIPHAUNT_EXPO_MOBILE_EXTENSIONS+x}" = "x" ]; then
 else
   mobile_extensions_raw="vector"
 fi
-runtime_footprint="${OLIPHAUNT_EXPO_IOS_RUNTIME_FOOTPRINT:-${OLIPHAUNT_EXPO_MOBILE_RUNTIME_FOOTPRINT:-balancedMobile}}"
-default_durability_profile=balanced
-[ "$runner" = "crash" ] && default_durability_profile=safe
-durability_profile="${OLIPHAUNT_EXPO_IOS_DURABILITY:-${OLIPHAUNT_EXPO_MOBILE_DURABILITY:-$default_durability_profile}}"
 startup_gucs="${OLIPHAUNT_EXPO_IOS_STARTUP_GUCS:-${OLIPHAUNT_EXPO_MOBILE_STARTUP_GUCS:-}}"
-wal_segsize_mb="${OLIPHAUNT_EXPO_IOS_WAL_SEGSIZE_MB:-${OLIPHAUNT_EXPO_MOBILE_WAL_SEGSIZE_MB:-16}}"
 benchmark_preset="${OLIPHAUNT_EXPO_IOS_BENCHMARK_PRESET:-${OLIPHAUNT_EXPO_MOBILE_BENCHMARK_PRESET:-full}}"
-crash_root_override="${OLIPHAUNT_EXPO_IOS_CRASH_ROOT:-}"
-mobile_template_initdb="${OLIPHAUNT_EXPO_IOS_INITDB:-}"
+crash_storage_override="${OLIPHAUNT_EXPO_IOS_CRASH_STORAGE:-}"
+mobile_packaging_initdb="${OLIPHAUNT_EXPO_IOS_INITDB:-}"
+if is_truthy "${OLIPHAUNT_EXPO_IOS_ICU:-0}"; then
+  configure_mobile_catalog_profile_probe icu
+else
+  configure_mobile_catalog_profile_probe standard
+fi
 metro_pid=""
 metro_bundle_runner=""
-metro_bundle_root=""
+metro_bundle_storage=""
 ios_simulator_log_pid=""
 ios_simulator_log_file=""
 
@@ -198,15 +198,14 @@ prepare_runtime_resources() {
   [ -f "$runtime_source/share/postgresql/postgres.bki" ] ||
     fail "runtime assets are missing postgres.bki: $runtime_source"
   ensure_mobile_runtime_tool_permissions "$runtime_source"
-  ensure_mobile_tool_executable "$mobile_template_initdb"
+  ensure_mobile_tool_executable "$mobile_packaging_initdb"
 
-  local template_source
-  template_source="$(
-    find_latest_mobile_pgdata \
+  local seed_closure
+  seed_closure="$(
+    require_mobile_runtime_seed_closure \
       iOS \
-      "${OLIPHAUNT_EXPO_IOS_TEMPLATE_PGDATA_DIR:-}" \
-      OLIPHAUNT_EXPO_IOS_TEMPLATE_PGDATA_DIR \
-      OLIPHAUNT_EXPO_IOS_INITDB
+      "${OLIPHAUNT_EXPO_IOS_SEED_CLOSURE_DIR:-}" \
+      OLIPHAUNT_EXPO_IOS_SEED_CLOSURE_DIR
   )"
   local selected_extensions
   selected_extensions="$(normalize_mobile_extensions)"
@@ -214,15 +213,17 @@ prepare_runtime_resources() {
   if oliphaunt_dev_prepare_prebuilt_mobile_runtime_resource_package \
     iOS \
     "$runtime_source" \
-    "$mobile_template_initdb" \
+    "$mobile_packaging_initdb" \
     "$selected_extensions" \
     "$package_root"; then
+    install_mobile_runtime_seed_closure "$package_root" "$seed_closure"
+    bind_mobile_runtime_manifest_to_seed_closure "$package_root" "$seed_closure"
     return 0
   fi
   prepare_mobile_runtime_resource_package \
     iOS \
     "$runtime_source" \
-    "$template_source" \
+    "$seed_closure" \
     "$static_registry_source" \
     "$selected_extensions" \
     "${OLIPHAUNT_EXPO_IOS_REPACKAGE_ASSETS:-0}" \
@@ -394,20 +395,13 @@ pack_react_native_sdk() {
     return
   fi
 
-  local package_stamp="$pack_dir/.ios-package.stamp"
+  local package_stamp="$pack_dir/.ios-package-inputs.sha256"
+  local package_fingerprint
+  package_fingerprint="$(react_native_source_package_fingerprint)"
   if [ "${OLIPHAUNT_EXPO_IOS_REPACK_RN:-0}" != "1" ] &&
     [ -f "$tarball" ] &&
     [ -f "$package_stamp" ] &&
-    [ -z "$(
-      find "$rn_dir" \
-        -path "$rn_dir/node_modules" -prune -o \
-        -path "$rn_dir/lib" -prune -o \
-        -path "$rn_dir/.build" -prune -o \
-        -path "$rn_dir/android/.gradle" -prune -o \
-        -path "$rn_dir/android/.cxx" -prune -o \
-        -path "$rn_dir/android/build" -prune -o \
-        -type f -newer "$package_stamp" -print -quit
-    )" ]; then
+    [ "$(tr -d '\r\n' <"$package_stamp")" = "$package_fingerprint" ]; then
     echo "Reusing React Native SDK package: $tarball" >&2
     if [ ! -f "$example_dir/node_modules/@oliphaunt/react-native/package.json" ]; then
       install_react_native_sdk_tarball
@@ -428,7 +422,7 @@ pack_react_native_sdk() {
   install_react_native_sdk_tarball
   local installed_package="$example_dir/node_modules/@oliphaunt/react-native"
   verify_installed_ios_package "$installed_package"
-  touch "$package_stamp"
+  printf '%s\n' "$package_fingerprint" >"$package_stamp"
 }
 
 prepare_swift_sdk_artifact_git_repo_if_required() {
@@ -819,7 +813,7 @@ build_ios_app() {
     fail "iOS app is missing OliphauntReactNativeResources.bundle/oliphaunt resource root"
   echo "bundled: $resource_root ($(directory_files "$resource_root") files, $(directory_bytes "$resource_root") bytes)" >&2
   for required in \
-    "$resource_root/template-pgdata/files/PG_VERSION" \
+    "$resource_root/cluster-seed/files/PG_VERSION" \
     "$resource_root/runtime/files/share/postgresql/postgres.bki"; do
     [ -e "$required" ] || fail "iOS app is missing packaged Oliphaunt resource: $required"
     echo "bundled: $required" >&2
@@ -851,11 +845,11 @@ build_ios_app() {
 
 start_metro_if_needed() {
   local bundle_runner="${1:-$runner}"
-  local bundle_root="${2:-}"
+  local bundle_storage="${2:-}"
   mkdir -p "$scratch_root"
   mkdir -p "$(dirname "$metro_dev_log")"
   if [ -n "${metro_pid:-}" ] && kill -0 "$metro_pid" >/dev/null 2>&1; then
-    if [ "$metro_bundle_runner" = "$bundle_runner" ] && [ "$metro_bundle_root" = "$bundle_root" ]; then
+    if [ "$metro_bundle_runner" = "$bundle_runner" ] && [ "$metro_bundle_storage" = "$bundle_storage" ]; then
       return 0
     fi
     stop_owned_metro
@@ -874,18 +868,15 @@ start_metro_if_needed() {
       CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_MCP_SERVER=1 \
       EXPO_PUBLIC_OLIPHAUNT_RUNNER="$bundle_runner" \
       EXPO_PUBLIC_OLIPHAUNT_LIFECYCLE_SMOKE="$lifecycle_smoke" \
-      EXPO_PUBLIC_OLIPHAUNT_DURABILITY="$durability_profile" \
-      EXPO_PUBLIC_OLIPHAUNT_RUNTIME_FOOTPRINT="$runtime_footprint" \
       EXPO_PUBLIC_OLIPHAUNT_BENCHMARK_PRESET="$benchmark_preset" \
       EXPO_PUBLIC_OLIPHAUNT_STARTUP_GUCS="$startup_gucs" \
-      EXPO_PUBLIC_OLIPHAUNT_WAL_SEGSIZE_MB="$wal_segsize_mb" \
-      EXPO_PUBLIC_OLIPHAUNT_ROOT="$bundle_root" \
+      EXPO_PUBLIC_OLIPHAUNT_STORAGE_DIRECTORY="$bundle_storage" \
       pnpm exec expo start --dev-client --port "$metro_port" --host lan --clear \
         >"$scratch_root/metro.log" 2>&1
     ) &
     metro_pid="$!"
     metro_bundle_runner="$bundle_runner"
-    metro_bundle_root="$bundle_root"
+    metro_bundle_storage="$bundle_storage"
 
     for _ in $(seq 1 60); do
       if port_is_listening; then
@@ -982,15 +973,15 @@ main() {
   prepare_expo_example_workspace
   preflight_physical_ios_device
   if is_reuse_installed_physical_ios_app; then
-    local device_id crash_root scratch_metro_offset dev_metro_offset
+    local device_id crash_storage scratch_metro_offset dev_metro_offset
     device_id="$(select_ios_physical_device_id)" ||
       fail "failed to resolve a paired physical iOS device; set OLIPHAUNT_EXPO_IOS_DEVICE_ID"
     echo "Reusing installed iOS app $app_id on physical device: $device_id" >&2
     install_react_native_sdk_from_source_for_reuse
     if [ "$runner" = "crash" ]; then
-      crash_root="$crash_root_override"
-      [ -n "$crash_root" ] || crash_root="app-support://oliphaunt-crash-recovery-root-$crash_root_suffix"
-      exercise_ios_device_crash_recovery "$device_id" "$crash_root"
+      crash_storage="$crash_storage_override"
+      [ -n "$crash_storage" ] || crash_storage="app-data:oliphaunt-crash-recovery-$crash_storage_suffix"
+      exercise_ios_device_crash_recovery "$device_id" "$crash_storage"
       return
     fi
     if uses_ios_metro; then

@@ -31,7 +31,7 @@ Tool versions for Moon, Node, pnpm, Bun, and Deno are pinned in `.prototools`.
 Bun is required for the TypeScript SDK checks because `@oliphaunt/ts` supports
 Bun through the npm artifact; local checks use `tools/dev/bun.sh` when the shell
 does not already provide the pinned Bun. Deno is optional for normal local checks
-and uses `tools/dev/deno.sh` on demand for JSR package validation.
+and uses `tools/dev/deno.sh` on demand for Deno npm-package validation.
 
 Windows native builds obtain WinFlexBison from the exact upstream archive pinned
 in `src/sources/toolchains/winflexbison.toml`. The shared native setup verifies
@@ -80,6 +80,12 @@ The validation entrypoint is split by maintainer workflow:
   behavior tests for helpers invoked by Actions;
 - `moon run liboliphaunt-wasix:smoke`: hard-requires portable assets plus host AOT,
   installs them into ignored paths, and runs the real runtime tests;
+- `moon run oliphaunt-wasix-ts:smoke`: local-only browser proof. It builds the
+  canonical portable runtime and PGDATA, rebuilds the source-pinned browser
+  host, serves COOP/COEP headers, and requires Chrome/Chromium to exercise
+  `pgtap`, recover two PostgreSQL error paths, return `42`, and exit cleanly;
+  `moon run oliphaunt-wasix-ts:smoke-pg-uuidv7` adds the private native-module
+  canary. Neither is a CI or release task yet;
 - `moon run integration-examples:check`: Tauri/Rust/frontend example checks;
 - `moon run liboliphaunt-native:smoke`: native-only C ABI smoke and
   Rust native SDK tests. This delegates to the same fast product-track harness
@@ -113,6 +119,14 @@ The validation entrypoint is split by maintainer workflow:
   proving the native perf script plans direct/broker/server/native-PostgreSQL
   work with explicit `--perf-runner` support, without invoking the separate
   WASIX comparison lane;
+- `pnpm --dir tools/perf/wasix-node bench:streaming`: quick local WASIX
+  TypeScript transport benchmark. It reuses staged packages and portable assets,
+  compares direct and worker round-trip latency, exercises bounded COPY,
+  backpressure, event-loop delay, process RSS, the local server, `pg_dump`, and
+  `psql`, and prints a readable report (`-- --json` prints the complete JSON).
+  Process RSS deltas are descriptive because the quick run reuses one process.
+  If inputs are absent, first run
+  `moon run oliphaunt-wasix-ts:tools-package liboliphaunt-wasix:runtime-portable`;
 - `moon run oliphaunt-rust:check`: static Cargo checks for `oliphaunt` and
   `oliphaunt-build`, plus the artifact-relay build-script test. Unit, package,
   and native runtime evidence remain separate `test`, `package`, and `smoke`
@@ -148,9 +162,9 @@ The validation entrypoint is split by maintainer workflow:
   `liboliphaunt.xcframework`;
 - `moon run oliphaunt-kotlin:smoke`: builds and freshness-checks the selected
   Android ABI's `liboliphaunt.so` artifact, then runs the Android SDK smoke;
-- `moon run oliphaunt-kotlin:check`: Kotlin Multiplatform formatting, lint,
-  compilation, and Android-only Maven publication-shape checks. Unit and
-  host-native tests remain in `oliphaunt-kotlin:test`;
+- `moon run oliphaunt-kotlin:check`: Kotlin formatting, lint, common/JVM and
+  Android compilation, and Android-only Maven publication-shape checks. Unit
+  tests remain in `oliphaunt-kotlin:test`;
 - `moon run oliphaunt-react-native:smoke-android`: Android React Native
   installed-app harness over the Expo development-client sample;
 - `moon run oliphaunt-react-native:smoke-ios`: iOS React Native
@@ -161,17 +175,17 @@ The validation entrypoint is split by maintainer workflow:
 - `moon run oliphaunt-react-native:smoke-mobile`: aggregate local Expo
   development-client installed-app lane. It runs both platform-specific smokes
   against the packed SDK and real native artifacts;
-- `pnpm --dir src/sdks/react-native/examples/expo run smoke:android`: real Android Expo
+- `pnpm --dir examples/react-native-expo run smoke:android`: real Android Expo
   development-client smoke for the installed React Native package. It reuses
   current native artifacts, generates the ignored Expo `android/` project only
-  when missing, packages `liboliphaunt.so` plus runtime/template resources, starts
+  when missing, packages `liboliphaunt.so` plus runtime/cluster-seed resources, starts
   Metro when needed, installs the app, and waits for
   `OLIPHAUNT_EXPO_SMOKE_PASS`;
-- `pnpm --dir src/sdks/react-native/examples/expo run smoke:ios`: real iOS Expo
+- `pnpm --dir examples/react-native-expo run smoke:ios`: real iOS Expo
   development-client build/smoke harness for the installed React Native package.
   For simulator builds it produces or reuses the current iOS simulator
   `liboliphaunt.dylib` automatically when no explicit artifact override is set,
-  packages the same runtime/template resources, patches only the ignored
+  packages the same runtime/cluster-seed resources, patches only the ignored
   generated `ios/` Podfile for local Swift pods, rejects macOS dylibs, and can
   run in `OLIPHAUNT_EXPO_IOS_BUILD_ONLY=1` mode when CoreSimulator is
   unavailable;
@@ -247,19 +261,21 @@ tools/dev/bootstrap-tools.sh
 tools/dev/bun.sh tools/dev/install-hooks.mjs
 ```
 
-`src/bindings/wasix-rust/crates/oliphaunt-wasix/tests/runtime_smoke.rs` starts the real WASM backend and
+`src/bindings/wasix-rust/crates/oliphaunt-wasix/tests/runtime_smoke.rs` starts the real WASIX backend and
 is intentionally slower than the protocol unit tests.
 
 ## Maintenance Utilities
 
 The repository includes maintenance commands:
 
-- `oliphaunt-wasix-dump` is the logical dump CLI entry point.
+- `oliphaunt-wasix-dump` is the logical dump CLI entry point. Its typed
+  `--database`, `--username`, and repeatable `--extension` options configure
+  the embedded server; arguments after `--` shape `pg_dump` output.
 - `oliphaunt-wasix-proxy` exposes a local PostgreSQL socket backed by the embedded
   runtime.
-- `xtask assets template` generates the architecture-independent PGDATA
-  template from the split WASIX `initdb` module. Portable WASIX, PGDATA
-  templates, and native AOT payloads remain generated-only.
+- `xtask assets cluster-seeds` generates the architecture-independent PGDATA
+  seeds from the split WASIX `initdb` module. Portable WASIX, cluster seeds,
+  and native AOT payloads remain generated-only.
 
 Asset and source checks:
 
@@ -268,7 +284,7 @@ cargo run -p xtask -- assets verify-committed
 cargo run -p xtask -- assets fetch
 cargo run -p xtask -- assets check --strict-local
 cargo run -p xtask -- assets check --strict-generated
-cargo run -p xtask --features template-runner -- assets template
+cargo run -p xtask --features cluster-seed-runner -- assets cluster-seeds
 cargo run -p xtask -- assets source-spine --check-patch-applies
 cargo run -p xtask -- assets audit-upstream --strict
 cargo run -p xtask -- package-size --enforce
@@ -384,13 +400,13 @@ tools/dev/bun.sh tools/release/release-check.mjs
 ```
 
 Developers should not be expected to build every target locally. Local runtime
-work validates the host target; the `CI` workflow's WASM runtime/AOT lane is
+work validates the host target; the `CI` workflow's WASIX runtime/AOT lane is
 the authority for the full macOS, Linux, and Windows AOT matrix.
 
 Contributors do not need upstream source checkouts for normal Rust, docs,
 examples, or package validation. Maintainers fetch sources only when rebuilding
-the portable WASIX runtime, extensions, `initdb`, `pg_dump`, or the generated
-PGDATA template. Portable WASIX artifacts, generated PGDATA templates, and
+the portable WASIX runtime, extensions, `initdb`, `pg_dump`, `psql`, or the generated
+cluster seed. Portable WASIX artifacts, generated cluster seeds, and
 native AOT artifacts are generated under `target/oliphaunt-wasix/**` locally or by
 CI; they are not committed to git.
 

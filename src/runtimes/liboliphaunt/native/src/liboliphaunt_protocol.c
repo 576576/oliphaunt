@@ -14,7 +14,7 @@
 #include <string.h>
 #include <time.h>
 
-#define DEFAULT_WAIT_TIMEOUT_MS 60000
+#define DEFAULT_STARTUP_TIMEOUT_MS 60000
 #define DEFAULT_STREAM_QUEUE_MAX_BYTES (4 * 1024 * 1024)
 
 static int validate_frontend_protocol_frames(OliphauntHandle *handle, const uint8_t *request, size_t request_len) {
@@ -306,13 +306,10 @@ static bool scan_ready_for_query_locked(OliphauntHandle *handle) {
 int oliphaunt_startup_timeout_ms(void) {
     const char *value = getenv("OLIPHAUNT_STARTUP_TIMEOUT_MS");
     if (value == NULL || value[0] == '\0') {
-        value = getenv("OLIPHAUNT_TIMEOUT_MS");
-    }
-    if (value == NULL || value[0] == '\0') {
-        return DEFAULT_WAIT_TIMEOUT_MS;
+        return DEFAULT_STARTUP_TIMEOUT_MS;
     }
     int parsed = atoi(value);
-    return parsed > 0 ? parsed : DEFAULT_WAIT_TIMEOUT_MS;
+    return parsed > 0 ? parsed : DEFAULT_STARTUP_TIMEOUT_MS;
 }
 
 static void add_ms_to_timespec(struct timespec *ts, int ms) {
@@ -564,6 +561,11 @@ int32_t oliphaunt_exec_protocol(
         pthread_mutex_unlock(&handle->mutex);
         return -1;
     }
+    if (handle->backup_mode_exit_unconfirmed) {
+        set_error(handle, "native liboliphaunt backup-mode exit is unconfirmed; close the database and restart the process before reopening it");
+        pthread_mutex_unlock(&handle->mutex);
+        return -1;
+    }
     if (handle->backend_exited) {
         set_error(handle, "native backend is not running");
         pthread_mutex_unlock(&handle->mutex);
@@ -621,6 +623,11 @@ int32_t oliphaunt_exec_simple_query(
         pthread_mutex_unlock(&handle->mutex);
         return -1;
     }
+    if (handle->backup_mode_exit_unconfirmed) {
+        set_error(handle, "native liboliphaunt backup-mode exit is unconfirmed; close the database and restart the process before reopening it");
+        pthread_mutex_unlock(&handle->mutex);
+        return -1;
+    }
     if (handle->backend_exited) {
         set_error(handle, "native backend is not running");
         pthread_mutex_unlock(&handle->mutex);
@@ -661,6 +668,11 @@ int32_t oliphaunt_exec_protocol_stream(
     pthread_mutex_lock(&handle->mutex);
     if (!handle->logical_active) {
         set_error(handle, "native liboliphaunt logical handle is closed");
+        pthread_mutex_unlock(&handle->mutex);
+        return -1;
+    }
+    if (handle->backup_mode_exit_unconfirmed) {
+        set_error(handle, "native liboliphaunt backup-mode exit is unconfirmed; close the database and restart the process before reopening it");
         pthread_mutex_unlock(&handle->mutex);
         return -1;
     }

@@ -12,7 +12,8 @@ headers_dir="$work_root/include"
 xcframework_out="$out_dir/liboliphaunt.xcframework"
 stamp="$work_root/.liboliphaunt-ios-xcframework.sha256"
 script_mode="${1:-build}"
-runtime_resources_root="${OLIPHAUNT_IOS_RUNTIME_RESOURCES_ROOT:-}"
+macos_runtime_resources_root="${OLIPHAUNT_MACOS_RUNTIME_RESOURCES_ROOT:-}"
+ios_runtime_resources_root="${OLIPHAUNT_IOS_RUNTIME_RESOURCES_ROOT:-}"
 runtime_version_file="$repo_root/src/runtimes/liboliphaunt/native/VERSION"
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -61,7 +62,8 @@ MSG
 desired_hash() {
   {
     printf 'mobile_static_extensions=%s\n' "${OLIPHAUNT_MOBILE_STATIC_EXTENSIONS:-}"
-    printf 'runtime_resources_root=%s\n' "$runtime_resources_root"
+    printf 'macos_runtime_resources_root=%s\n' "$macos_runtime_resources_root"
+    printf 'ios_runtime_resources_root=%s\n' "$ios_runtime_resources_root"
     printf 'script_sha256=%s\n' "$(shasum -a 256 "$script_path" | awk '{print $1}')"
     shasum -a 256 \
       "$macos_script" \
@@ -69,9 +71,11 @@ desired_hash() {
       "$device_script" \
       "$public_header" \
       "$runtime_version_file"
-  if [ -d "$runtime_resources_root" ]; then
-    find "$runtime_resources_root" -type f -print0 | sort -z | xargs -0 shasum -a 256
-  fi
+  for resource_root in "$macos_runtime_resources_root" "$ios_runtime_resources_root"; do
+    if [ -d "$resource_root" ]; then
+      find "$resource_root" -type f -print0 | sort -z | xargs -0 shasum -a 256
+    fi
+  done
   if [ -f "$default_simulator_library" ]; then
     shasum -a 256 "$default_simulator_library"
   fi
@@ -120,11 +124,9 @@ assert_library_slice() {
   local symbol
   for symbol in \
     _oliphaunt_init \
-    _oliphaunt_init_ex \
     _oliphaunt_exec_protocol \
     _oliphaunt_exec_protocol_stream \
     _oliphaunt_backup \
-    _oliphaunt_backup_ex \
     _oliphaunt_restore \
     _oliphaunt_cancel \
     _oliphaunt_detach \
@@ -134,7 +136,6 @@ assert_library_slice() {
     _oliphaunt_register_static_extensions \
     _oliphaunt_last_error \
     _oliphaunt_version \
-    _oliphaunt_capabilities \
     _oliphaunt_free_response
   do
     case "$symbols" in
@@ -169,6 +170,9 @@ xcframework_ready() {
   assert_library_slice "$macos_library" MACOS || return 1
   assert_library_slice "$ios_library" IOS || return 1
   assert_library_slice "$simulator_library" IOSSIMULATOR || return 1
+  assert_framework_info_platform "$(dirname "$macos_library")/Info.plist" macosx || return 1
+  assert_framework_info_platform "$(dirname "$ios_library")/Info.plist" iphoneos || return 1
+  assert_framework_info_platform "$(dirname "$simulator_library")/Info.plist" iphonesimulator || return 1
 }
 
 assert_framework_info_version() {
@@ -181,10 +185,32 @@ assert_framework_info_version() {
   }
 }
 
+assert_framework_info_platform() {
+  local plist="$1"
+  local expected="$2"
+  local observed
+  observed="$(plutil -extract DTPlatformName raw "$plist")"
+  [ "$observed" = "$expected" ] || {
+    echo "framework platform $observed does not match $expected: $plist" >&2
+    return 1
+  }
+}
+
+framework_info_platform() {
+  case "$1" in
+    MacOSX) printf 'macosx\n' ;;
+    iPhoneOS) printf 'iphoneos\n' ;;
+    iPhoneSimulator) printf 'iphonesimulator\n' ;;
+    *) echo "unsupported framework platform $1" >&2; return 1 ;;
+  esac
+}
+
 write_framework_info_plist() {
   local plist="$1"
   local platform="$2"
   local platform_family="$3"
+  local info_platform
+  info_platform="$(framework_info_platform "$platform")"
   if [ "$platform" = "MacOSX" ]; then
     cat >"$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -211,12 +237,15 @@ write_framework_info_plist() {
   </array>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>DTPlatformName</key>
+  <string>${info_platform}</string>
   <key>MinimumOSVersion</key>
   <string>14.0</string>
 </dict>
 </plist>
 PLIST
     assert_framework_info_version "$plist"
+    assert_framework_info_platform "$plist" "$info_platform"
     return
   fi
   cat >"$plist" <<PLIST
@@ -244,6 +273,8 @@ PLIST
   </array>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>DTPlatformName</key>
+  <string>${info_platform}</string>
   <key>MinimumOSVersion</key>
   <string>17.0</string>
   <key>UIDeviceFamily</key>
@@ -254,6 +285,7 @@ PLIST
 </plist>
 PLIST
   assert_framework_info_version "$plist"
+  assert_framework_info_platform "$plist" "$info_platform"
 }
 
 expected_library_platform_for_framework_platform() {
@@ -270,6 +302,7 @@ prepare_framework_slice() {
   local framework="$2"
   local platform="$3"
   local platform_family="$4"
+  local runtime_resources_root="$5"
   rm -rf "$framework"
   mkdir -p "$framework/Headers" "$framework/Modules"
   cp "$library" "$framework/liboliphaunt"
@@ -277,7 +310,7 @@ prepare_framework_slice() {
   rsync -a --delete "$headers_dir/" "$framework/Headers/"
   if [ -n "$runtime_resources_root" ]; then
     [ -d "$runtime_resources_root" ] || {
-      echo "OLIPHAUNT_IOS_RUNTIME_RESOURCES_ROOT does not exist: $runtime_resources_root" >&2
+      echo "runtime resource root does not exist: $runtime_resources_root" >&2
       exit 1
     }
     mkdir -p "$framework/Resources/oliphaunt"
@@ -328,9 +361,9 @@ build_xcframework() {
   assert_library_slice "$macos_library" MACOS
   assert_library_slice "$simulator_library" IOSSIMULATOR
   assert_library_slice "$device_library" IOS
-  prepare_framework_slice "$macos_library" "$macos_framework" "MacOSX" "0"
-  prepare_framework_slice "$device_library" "$device_framework" "iPhoneOS" "1"
-  prepare_framework_slice "$simulator_library" "$simulator_framework" "iPhoneSimulator" "1"
+  prepare_framework_slice "$macos_library" "$macos_framework" "MacOSX" "0" "$macos_runtime_resources_root"
+  prepare_framework_slice "$device_library" "$device_framework" "iPhoneOS" "1" "$ios_runtime_resources_root"
+  prepare_framework_slice "$simulator_library" "$simulator_framework" "iPhoneSimulator" "1" "$ios_runtime_resources_root"
 
   rm -rf "$xcframework_out"
   xcodebuild -create-xcframework \

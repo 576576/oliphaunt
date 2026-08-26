@@ -267,7 +267,7 @@ pub(crate) fn verify_asset_manifest_hashes() -> Result<()> {
         &manifest.runtime.sha256,
         "runtime archive",
     )?;
-    let runtime_module = archive_entry_bytes(&runtime_archive, "oliphaunt/bin/oliphaunt")?;
+    let runtime_module = archive_entry_bytes(&runtime_archive, RUNTIME_MODULE_ARCHIVE_MEMBER)?;
     ensure_eq(
         &sha256_bytes(&runtime_module),
         &manifest.runtime.module_sha256,
@@ -337,62 +337,79 @@ pub(crate) fn verify_asset_manifest_hashes() -> Result<()> {
         }
     }
 
-    let pgdata_archive = base.join("prepopulated/pgdata-template.tar.zst");
-    verify_pgdata_template_hash(&pgdata_archive)?;
-    if let Some(template) = &manifest.pgdata_template {
-        verify_file_sha256(
-            &base.join(&template.archive),
-            &template.sha256,
-            "PGDATA template",
+    for (profile, seed) in &manifest.cluster_seeds {
+        verify_cluster_seed_hash(
+            profile,
+            &base.join(&seed.archive),
+            &base.join(&seed.manifest),
         )?;
-        ensure_file(&base.join(&template.manifest))?;
+        verify_file_sha256(
+            &base.join(&seed.archive),
+            &seed.sha256,
+            &format!("{profile} cluster seed"),
+        )?;
+        ensure_file(&base.join(&seed.manifest))?;
         ensure_eq(
-            &template.runtime_module_sha256,
+            &seed.runtime_module_sha256,
             &manifest.runtime.module_sha256,
-            "PGDATA template runtime module sha256",
+            &format!("{profile} cluster seed runtime module sha256"),
         )?;
         if let Some(initdb) = &manifest.initdb {
             ensure_eq(
-                &template.initdb_module_sha256,
+                &seed.initdb_module_sha256,
                 &initdb.module_sha256,
-                "PGDATA template initdb module sha256",
+                &format!("{profile} cluster seed initdb module sha256"),
             )?;
         }
     }
+    ensure!(
+        manifest
+            .cluster_seeds
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            == ["icu", "standard"],
+        "generated asset manifest must contain exactly the icu and standard cluster seeds"
+    );
 
     if is_release_staged_workspace() {
         verify_root_asset_metadata(&manifest, &manifest.runtime.module_sha256)?;
-        verify_file_sha256(
-            &pgdata_archive,
-            &cargo_metadata_value(
-                "src/bindings/wasix-rust/crates/oliphaunt-wasix/Cargo.toml",
-                "pgdata-template-archive-sha256",
-            )?,
-            "PGDATA template archive metadata",
-        )?;
     }
 
     println!("generated asset hashes match manifests");
     Ok(())
 }
 
-fn verify_pgdata_template_hash(pgdata_archive: &Path) -> Result<()> {
-    let manifest_path = Path::new(GENERATED_ASSETS_DIR).join("prepopulated/pgdata-template.json");
+fn verify_cluster_seed_hash(profile: &str, archive: &Path, manifest_path: &Path) -> Result<()> {
     ensure!(
-        manifest_path.exists() && pgdata_archive.exists(),
-        "generated assets must include the bundled PGDATA template required by the default runtime; expected both {} and {}",
+        manifest_path.exists() && archive.exists(),
+        "generated assets must include the {profile} cluster seed archive and manifest; expected both {} and {}",
         manifest_path.display(),
-        pgdata_archive.display()
+        archive.display()
     );
     let text = fs::read_to_string(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
     let manifest: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse {}", manifest_path.display()))?;
     let expected = manifest
-        .get("archiveSha256")
+        .get("archive")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|archive| archive.get("sha256"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("{} is missing archiveSha256", manifest_path.display()))?;
-    verify_file_sha256(pgdata_archive, expected, "PGDATA template archive")?;
+        .ok_or_else(|| anyhow!("{} is missing archive.sha256", manifest_path.display()))?;
+    ensure_eq(
+        manifest
+            .get("catalogProfile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        profile,
+        "cluster seed catalogProfile",
+    )?;
+    verify_file_sha256(
+        archive,
+        expected,
+        &format!("{profile} cluster seed archive"),
+    )?;
     Ok(())
 }
 
@@ -431,6 +448,16 @@ fn verify_root_asset_metadata(
         &pg18.patches.series.len().to_string(),
         "PostgreSQL patch count metadata",
     )?;
+    for profile in ["standard", "icu"] {
+        let seed = manifest.cluster_seeds.get(profile).with_context(|| {
+            format!("generated asset manifest is missing {profile} cluster seed")
+        })?;
+        verify_root_metadata_value(
+            &format!("cluster-seed-{profile}-archive-sha256"),
+            &seed.sha256,
+            &format!("{profile} cluster seed archive metadata"),
+        )?;
+    }
     if let Some(pg_dump) = &manifest.pg_dump {
         verify_tools_metadata_value("pg-dump-wasix-sha256", &pg_dump.sha256, "pg_dump metadata")?;
     }
@@ -440,7 +467,19 @@ fn verify_root_asset_metadata(
     if let Some(initdb) = &manifest.initdb {
         verify_root_metadata_value("initdb-wasix-sha256", &initdb.sha256, "initdb metadata")?;
     }
+    verify_wasix_tools_npm_descriptor(manifest)?;
     Ok(())
+}
+
+fn verify_wasix_tools_npm_descriptor(manifest: &AssetManifestOut) -> Result<()> {
+    let actual = fs::read_to_string(WASIX_TOOLS_NPM_DESCRIPTOR_PATH)
+        .with_context(|| format!("read {WASIX_TOOLS_NPM_DESCRIPTOR_PATH}"))?;
+    let expected = update_wasix_tools_npm_descriptor(&actual, manifest)?;
+    ensure_eq(
+        &actual,
+        &expected,
+        "WASIX tools npm workspace descriptor metadata",
+    )
 }
 
 fn verify_root_metadata_value(key: &str, expected: &str, field: &str) -> Result<()> {
@@ -761,8 +800,7 @@ pub(crate) fn verify_generated_extension_surface() -> Result<()> {
         "read src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/generated_extensions.rs",
     )?;
 
-    let mut packaged_constants = BTreeMap::new();
-    let mut promoted_constants = BTreeMap::new();
+    let mut supported_constants = BTreeMap::new();
     for entry in catalog
         .get("extensions")
         .and_then(|value| value.as_array())
@@ -776,116 +814,51 @@ pub(crate) fn verify_generated_extension_surface() -> Result<()> {
             .get("rust-constant")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow!("extension {sql_name} is missing rust-constant"))?;
-        let requested = entry
-            .pointer("/promotion/requested")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let packaged = entry
-            .pointer("/promotion/packaged")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let has_archive = entry
-            .pointer("/promotion/archive")
-            .and_then(|value| value.as_str())
-            .is_some();
-        if requested && packaged && has_archive {
-            packaged_constants.insert(sql_name.to_owned(), rust_constant.to_owned());
-        }
-        let promoted = entry
-            .pointer("/promotion/promoted")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if promoted {
-            promoted_constants.insert(sql_name.to_owned(), rust_constant.to_owned());
-        }
+        supported_constants.insert(sql_name.to_owned(), rust_constant.to_owned());
     }
 
-    let manifest_packaged_sql_names = manifest
+    let manifest_sql_names = manifest
         .extensions
         .iter()
         .map(|extension| extension.sql_name.clone())
         .collect::<BTreeSet<_>>();
-    let catalog_packaged_sql_names = packaged_constants.keys().cloned().collect::<BTreeSet<_>>();
-    if manifest_packaged_sql_names != catalog_packaged_sql_names {
+    let catalog_sql_names = supported_constants.keys().cloned().collect::<BTreeSet<_>>();
+    if manifest_sql_names != catalog_sql_names {
         bail!(
-            "packaged extension catalog and asset manifest disagree: manifest-only={:?} catalog-only={:?}",
-            manifest_packaged_sql_names
-                .difference(&catalog_packaged_sql_names)
-                .collect::<Vec<_>>(),
-            catalog_packaged_sql_names
-                .difference(&manifest_packaged_sql_names)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    let manifest_promoted_sql_names = manifest
-        .extensions
-        .iter()
-        .filter(|extension| extension.smoke_status.promoted)
-        .map(|extension| extension.sql_name.clone())
-        .collect::<BTreeSet<_>>();
-    let catalog_sql_names = promoted_constants.keys().cloned().collect::<BTreeSet<_>>();
-    if manifest_promoted_sql_names != catalog_sql_names {
-        bail!(
-            "promoted extension catalog and asset manifest disagree: manifest-only={:?} catalog-only={:?}",
-            manifest_promoted_sql_names
+            "supported extension catalog and asset manifest disagree: manifest-only={:?} catalog-only={:?}",
+            manifest_sql_names
                 .difference(&catalog_sql_names)
                 .collect::<Vec<_>>(),
             catalog_sql_names
-                .difference(&manifest_promoted_sql_names)
+                .difference(&manifest_sql_names)
                 .collect::<Vec<_>>()
         );
     }
 
     for extension in &manifest.extensions {
-        let rust_constant = packaged_constants.get(&extension.sql_name).ok_or_else(|| {
-            anyhow!(
-                "extension {} missing from packaged catalog",
-                extension.sql_name
-            )
-        })?;
-        let candidate_const = format!("CANDIDATE_{rust_constant}");
+        let rust_constant = supported_constants
+            .get(&extension.sql_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "extension {} missing from supported catalog",
+                    extension.sql_name
+                )
+            })?;
+        let definition_const = format!("DEFINITION_{rust_constant}");
         for (needle, description) in [
             (
-                format!("pub(crate) const {candidate_const}: Extension ="),
-                "packaged candidate extension constant",
+                format!("const {definition_const}: Extension ="),
+                "extension definition constant",
             ),
             (
-                format!("    {candidate_const},"),
-                "extensions::CANDIDATES entry",
+                format!("pub const {rust_constant}: Extension = {definition_const};"),
+                "public extension constant",
             ),
+            (format!("    {rust_constant},"), "extensions::ALL entry"),
             (format!("{:?}", extension.sql_name), "extension SQL name"),
-            (format!("{:?}", extension.archive), "extension archive path"),
         ] {
             if !generated.contains(&needle) {
                 bail!("generated extension API is stale: missing {description} {needle}");
-            }
-        }
-        if extension.smoke_status.promoted {
-            for (needle, description) in [
-                (
-                    format!("pub const {rust_constant}: Extension = {candidate_const};"),
-                    "public extension constant",
-                ),
-                (format!("    {rust_constant},"), "extensions::ALL entry"),
-            ] {
-                if !generated.contains(&needle) {
-                    bail!("generated extension API is stale: missing {description} {needle}");
-                }
-            }
-        }
-        if extension.smoke_status.promoted {
-            for status in [
-                &extension.smoke_status.direct,
-                &extension.smoke_status.server,
-                &extension.smoke_status.restart,
-                &extension.smoke_status.dump_restore,
-            ] {
-                ensure_eq(
-                    status,
-                    "passed",
-                    &format!("extension {} smoke status", extension.sql_name),
-                )?;
             }
         }
     }
@@ -987,6 +960,7 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         "src/runtimes/liboliphaunt/wasix/assets/build/build_wasix_proj.sh",
         "src/runtimes/liboliphaunt/wasix/assets/build/build_wasix_libiconv.sh",
         "src/runtimes/liboliphaunt/wasix/assets/build/build_wasix_icu.sh",
+        "src/runtimes/liboliphaunt/native/bin/icu.sh",
         "src/extensions/external/postgis/tools/build_wasix.sh",
         "src/runtimes/liboliphaunt/wasix/assets/build/docker_pgxs_extensions.sh",
         "src/runtimes/liboliphaunt/wasix/assets/build/docker_contrib_extensions.sh",
@@ -1052,6 +1026,9 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "WASIX_HOME:=/opt/wasixcc-home/.wasixcc",
             "ln -s \"$WASIX_HOME\" \"$HOME/.wasixcc\"",
             "export PATH=\"$WASIX_HOME/bin:$PATH\"",
+            "oliphaunt_wasix_verify_side_module_sjlj",
+            "WASIX side module imports out-of-line sigsetjmp",
+            "/\"sigsetjmp\"/",
         ],
     )?;
     for path in wasix_build_scripts_requiring_docker_env()? {
@@ -1062,7 +1039,7 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         "src/runtimes/liboliphaunt/wasix/assets/build/profile_flags.sh",
         &[
             "release)",
-            "-O2 -g0",
+            "-O2 -g0 -flto=thin",
             "release-o3)",
             "-O3 -g0 -flto=thin",
             "-flto=thin",
@@ -1074,7 +1051,6 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "WASIXCC_RUN_WASM_OPT",
             "WASIXCC_WASM_OPT_FLAGS",
             "OLIPHAUNT_WASM_ALLOW_ASYNCIFY_EXPERIMENT",
-            "OLIPHAUNT_WASM_WASIX_BACKEND_TIMING",
             "production WASIX artifacts require WebAssembly exceptions",
             "build_wasix_icu_sha256",
         ],
@@ -1086,6 +1062,7 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "--with-icu",
             "ICU_CFLAGS",
             "ICU_LIBS",
+            "OLIPHAUNT_WASM_SHIM_OBJECT",
             "oliphaunt_wasix_icu_cflags",
             "oliphaunt_wasix_icu_libs",
         ],
@@ -1117,7 +1094,12 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "icu_stub_data_archive_ready",
             "icu_files_data_ready",
             "icu_install_stub_data_archive",
-            "members=\"$(ar -t \"$archive\")\"",
+            ". \"$NATIVE_ICU_HELPER\"",
+            "native_icu_helper_sha256",
+            "icu_canonical_data_sha256",
+            "icu_require_canonical_data",
+            "icu_build_native_tools",
+            "icu_install_canonical_files_data",
             "icu_wasix_config_ready",
             "icu_cv_host_frag=mh-linux",
             "wasix-platform-fragment=mh-linux",
@@ -1126,12 +1108,10 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "wasix-timezone-cache=no-tzname",
             "icu_pkgdata_opts=\"-O $ICU_BUILD_DIR/data/icupkg.inc -w\"",
             "wasix-data-packaging=files-without-assembly",
-            "stubdata\\.ao",
             "packagedata",
             "--disable-tools",
             "--disable-icuio",
             "--disable-layoutex",
-            "makeconv",
             "genrb",
             "pkgdata",
             "libicui18n.a",
@@ -1140,16 +1120,21 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         ],
     )?;
     ensure_file_contains_all(
-        "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/postgres_mod.rs",
-        &["ICU_DATA", "/share/icu", "wasix_icu_data_is_available"],
+        "src/runtimes/liboliphaunt/native/bin/icu.sh",
+        &[
+            "oliphaunt_icu_canonical_data_sha256",
+            "oliphaunt_icu_require_canonical_data",
+            "oliphaunt_icu_install_canonical_files_data",
+            "members=\"$(ar -t \"$archive\")\"",
+            "stubdata\\.ao",
+            "makeconv",
+            "genrb",
+            "pkgdata",
+        ],
     )?;
     ensure_file_contains_all(
-        "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/pg_dump.rs",
-        &[
-            "ICU_DATA",
-            "/oliphaunt/share/icu",
-            "install_optional_icu_data",
-        ],
+        "src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/postgres_mod.rs",
+        &["ICU_DATA", "/share/icu", "wasix_icu_data_is_available"],
     )?;
     ensure_file_contains_all(
         "src/runtimes/liboliphaunt/wasix/assets/build/pg_config_wasix.sh",
@@ -1164,24 +1149,18 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "PostgreSQL $(postgres_version)",
             "--includedir-server",
             "$BUILD_DIR/src/include",
+            "-DOLIPHAUNT_WASM_SIDE_MODULE",
         ],
     )?;
     ensure_file_contains_all(
         WASIX_BRIDGE_PATH,
         &[
-            "oliphaunt_wasix_backend_timing_reset",
-            "oliphaunt_wasix_backend_timing_start",
-            "oliphaunt_wasix_backend_timing_end",
-            "oliphaunt_wasix_backend_timing_elapsed_us",
-            "CLOCK_MONOTONIC",
-            "#ifdef OLIPHAUNT_WASIX_BACKEND_TIMING",
             "oliphaunt_wasix_set_force_host_error_recovery",
             "force_host_error_recovery",
             "Hosts without that support",
             "oliphaunt_wasix_set_active",
             "oliphaunt_wasix_longjmp",
             "oliphaunt_wasix_siglongjmp",
-            "memcmp(env, (void *) postgresmain_sigjmp_buf, sizeof(jmp_buf)) == 0",
             "oliphaunt_wasix_getegid",
             "oliphaunt_wasix_getpwuid_r",
             "oliphaunt_wasix_run_atexit_funcs",
@@ -1193,7 +1172,6 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         "src/runtimes/liboliphaunt/wasix/assets/build/docker_oliphaunt.sh",
         &[
             "OLIPHAUNT_WASM_BUILD_PROFILE",
-            "OLIPHAUNT_WASM_WASIX_BACKEND_TIMING",
             ".oliphaunt-wasix-build-profile",
             ".oliphaunt-wasix-icu-build",
             "oliphaunt_wasix_wasix_profile_signature",
@@ -1210,23 +1188,40 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         ],
     )?;
     ensure_file_contains_all(
-        "src/runtimes/liboliphaunt/wasix/assets/build/docker_pgdump.sh",
+        "src/runtimes/liboliphaunt/wasix/assets/build/wasix_frontend_tools.sh",
         &[
             "build_wasix_icu.sh",
-            "oliphaunt_wasix_icu_cflags",
+            "wasix_icu_link.sh",
             "oliphaunt_wasix_icu_libs",
-            "ICU_CFLAGS",
-            "ICU_LIBS",
+            "configure_wasix_dl.sh",
+            "docker-frontend-tools",
+            "icu-native-tools",
+            "OLIPHAUNT_WASM_BUILD_PROFILE=release-os",
+            "OLIPHAUNT_WASM_WASIX_COPT=\"-O2 -g0\"",
+            "OLIPHAUNT_WASM_WASIX_LOPT=\"-Wl,--threads=1\"",
+            "OLIPHAUNT_WASM_SHIM_OBJECT=\"$tool_shim\"",
+            "src/interfaces/libpq",
+            "src/fe_utils",
+        ],
+    )?;
+    ensure_file_contains_all(
+        "src/runtimes/liboliphaunt/wasix/assets/build/docker_pgdump.sh",
+        &[
+            "wasix_frontend_tools.sh",
+            "oliphaunt_wasix_prepare_frontend_tools",
+            "OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR",
+            "OLIPHAUNT_WASIX_FRONTEND_ICU_LIBS",
+            "wasixnm -u",
         ],
     )?;
     ensure_file_contains_all(
         "src/runtimes/liboliphaunt/wasix/assets/build/docker_psql.sh",
         &[
-            "build_wasix_icu.sh",
-            "oliphaunt_wasix_icu_cflags",
-            "oliphaunt_wasix_icu_libs",
-            "ICU_CFLAGS",
-            "ICU_LIBS",
+            "wasix_frontend_tools.sh",
+            "oliphaunt_wasix_prepare_frontend_tools",
+            "OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR",
+            "OLIPHAUNT_WASIX_FRONTEND_ICU_LIBS",
+            "wasixnm -u",
         ],
     )?;
     for path in [
@@ -1249,6 +1244,7 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
             "oliphaunt_wasix_extension_build_outputs_exist",
             "required_build_files",
             "required_build_globs",
+            "OLIPHAUNT_WASM_POSTGIS_DEPENDENCY_COPT:--O2 -g0",
         ],
     )?;
     ensure_file_contains_all(
@@ -1256,8 +1252,18 @@ pub(crate) fn check_production_wasix_build_inputs() -> Result<()> {
         &[
             "oliphaunt_wasix_run_extension_build_in_docker_if_needed",
             "oliphaunt_wasix_extension_build_outputs_exist",
+            "ac_cv_lib_xml2_xmlInitParser=yes",
+            "oliphaunt_wasix_verify_side_module_sjlj \"$postgis_deps_module\"",
+            "oliphaunt_wasix_verify_side_module_sjlj \"$POSTGIS_BUILD_DIR/postgis/postgis-3.so\"",
         ],
     )?;
+    for path in [
+        "src/runtimes/liboliphaunt/wasix/assets/build/docker_runtime_support.sh",
+        "src/runtimes/liboliphaunt/wasix/assets/build/docker_pgxs_extensions.sh",
+        "src/runtimes/liboliphaunt/wasix/assets/build/docker_contrib_extensions.sh",
+    ] {
+        ensure_file_contains_all(path, &["oliphaunt_wasix_verify_side_module_sjlj"])?;
+    }
     ensure_file_contains_all(
         "src/runtimes/liboliphaunt/wasix/assets/build/build_wasix_libiconv.sh",
         &[
@@ -1307,7 +1313,8 @@ fn check_root_asset_metadata_keys() -> Result<()> {
         "postgres-patch-count",
         "runtime-archive-sha256",
         "oliphaunt-wasix-sha256",
-        "pgdata-template-archive-sha256",
+        "cluster-seed-standard-archive-sha256",
+        "cluster-seed-icu-archive-sha256",
         "initdb-wasix-sha256",
     ] {
         let needle = format!("{required} = \"");
@@ -1351,8 +1358,7 @@ pub(crate) fn check_canonical_asset_layout_in(asset_dir: &Path, strict: bool) ->
 
     let runtime_entries = archive_entries(&runtime_archive)?;
     let required_paths = [
-        "oliphaunt/bin/oliphaunt",
-        "oliphaunt/bin/postgres",
+        RUNTIME_MODULE_ARCHIVE_MEMBER,
         "oliphaunt/bin/initdb",
         "oliphaunt/lib/postgresql/dict_snowball.so",
         "oliphaunt/lib/postgresql/plpgsql.so",
@@ -1412,6 +1418,7 @@ pub(crate) fn check_canonical_asset_layout_in(asset_dir: &Path, strict: bool) ->
         "oliphaunt/lib/dict_snowball.so",
         "oliphaunt/bin/pg_dump",
         "oliphaunt/bin/psql",
+        "oliphaunt/bin/oliphaunt",
     ] {
         if runtime_entries.contains(forbidden)
             || runtime_entries

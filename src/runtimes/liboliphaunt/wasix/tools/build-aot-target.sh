@@ -12,6 +12,8 @@ root="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null)" || {
 }
 cd "$root"
 
+. "$root/tools/test/cargo-test-filter.sh"
+
 target="${AOT_TARGET:-${1:-}}"
 if [ -z "$target" ]; then
   target="$(rustc -vV | awk '/^host:/{print $2}')"
@@ -30,7 +32,7 @@ cargo run -p xtask -- assets check-aot --target-triple "$target"
 cargo check -p "$package" --locked
 cargo run -p xtask -- assets smoke --core-only
 
-# The portable/Linux regression exercises every promoted extension.  Each host
+# The portable/Linux regression exercises every catalogued extension. Each host
 # must also deserialize and execute machine code produced for that exact host,
 # including a side module and the split pg_dump/psql tool artifacts.  Keep this
 # bounded representative lane on all four AOT builders so cross-host coverage
@@ -44,9 +46,14 @@ OLIPHAUNT_WASIX_EXTENSION_AOT_ARTIFACT_ROOT="$root/target/extensions/wasix/aot-a
     --family wasix \
     --require-wasix \
     oliphaunt-extension-contrib-pg18
-OLIPHAUNT_WASM_AOT_VERIFY=full \
-OLIPHAUNT_WASIX_EXTENSION_ARTIFACT_ROOT="$proof_root/extension-artifacts" \
-  cargo test -p oliphaunt-wasix --locked --no-default-features \
-  --features extension-uuid-ossp,tools \
-  --lib candidate_tests::uuid_ossp_candidate \
-  -- --nocapture --test-threads=1
+aot_test_filter="extension_tests::uuid_ossp_aot_"
+aot_test_command=(
+  env
+  OLIPHAUNT_WASM_AOT_VERIFY=full
+  OLIPHAUNT_WASIX_EXTENSION_ARTIFACT_ROOT="$proof_root/extension-artifacts"
+  cargo test -p oliphaunt-wasix --locked --no-default-features
+  --features extension-uuid-ossp,tools
+  --lib "$aot_test_filter"
+)
+oliphaunt_assert_cargo_test_filter_count 4 "$aot_test_filter" "${aot_test_command[@]}"
+"${aot_test_command[@]}" -- --nocapture --test-threads=1

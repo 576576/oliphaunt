@@ -26,9 +26,6 @@ ICU_CFLAGS="$(oliphaunt_wasix_icu_cflags "$ICU_PREFIX")"
 ICU_LIBS="$(oliphaunt_wasix_icu_libs "$ICU_PREFIX")"
 
 COMMON_CPPFLAGS="-I$PGSRC/src/include/port/wasix-dl"
-if [ "${OLIPHAUNT_WASM_WASIX_BACKEND_TIMING:-0}" = "1" ]; then
-  COMMON_CPPFLAGS="$COMMON_CPPFLAGS -DOLIPHAUNT_WASIX_BACKEND_TIMING"
-fi
 COMMON_CPPFLAGS="$COMMON_CPPFLAGS $ICU_CFLAGS"
 COMMON_CFLAGS="$OLIPHAUNT_WASM_PROFILE_CFLAGS -sWASM_EXCEPTIONS=yes -sPIC=yes -Wno-unused-command-line-argument"
 COMMON_LDFLAGS="$OLIPHAUNT_WASM_PROFILE_LDFLAGS -sWASM_EXCEPTIONS=yes -sPIC=yes -L$ICU_PREFIX/lib"
@@ -41,8 +38,8 @@ if [ "${OLIPHAUNT_WASM_PG18_DISABLE_SPINLOCKS:-0}" = "1" ]; then
   CONFIGURE_EXTRA_ARGS+=("--disable""-spinlocks")
 fi
 
-mkdir -p "$GENERATED_ROOT/build/wasix-oliphaunt"
-OLIPHAUNT_SHIM="$GENERATED_ROOT/build/wasix-oliphaunt/oliphaunt_wasix_bridge.o"
+OLIPHAUNT_SHIM="${OLIPHAUNT_WASM_SHIM_OBJECT:-$GENERATED_ROOT/build/wasix-oliphaunt/oliphaunt_wasix_bridge.o}"
+mkdir -p "$(dirname "$OLIPHAUNT_SHIM")"
 
 wasixcc $COMMON_CFLAGS $COMMON_CPPFLAGS \
   -include stdbool.h \
@@ -58,7 +55,7 @@ OLIPHAUNT_CFLAGS="\
  -Dfcntl=oliphaunt_wasix_fcntl\
  -Datexit=oliphaunt_wasix_atexit\
  -Dsetsockopt=oliphaunt_wasix_setsockopt -Dgetsockopt=oliphaunt_wasix_getsockopt -Dgetsockname=oliphaunt_wasix_getsockname\
- -Dconnect=oliphaunt_wasix_connect\
+ -Dsocket=oliphaunt_wasix_socket -Dconnect=oliphaunt_wasix_connect -Drecv=oliphaunt_wasix_recv -Dsend=oliphaunt_wasix_send\
  -Dpoll=oliphaunt_wasix_poll\
  -Dlongjmp=oliphaunt_wasix_longjmp -Dsiglongjmp=oliphaunt_wasix_siglongjmp\
  -Wno-declaration-after-statement\

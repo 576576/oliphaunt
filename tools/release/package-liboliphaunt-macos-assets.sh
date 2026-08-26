@@ -57,12 +57,12 @@ OLIPHAUNT_BUILD_EXTENSIONS="${OLIPHAUNT_BUILD_EXTENSIONS:-0}" \
 [ -f "$lib" ] || fail "missing macOS liboliphaunt dylib at $lib"
 oliphaunt_assert_base_embedded_modules_exact "$embedded_modules" dylib ||
   fail "base $target_id embedded module inventory must contain only regular dict_snowball.dylib and plpgsql.dylib modules"
-for tool in initdb pg_ctl pg_dump postgres psql; do
+for tool in initdb pg_basebackup pg_ctl pg_dump postgres psql; do
   [ -x "$runtime/bin/$tool" ] || fail "missing macOS $tool at $runtime/bin/$tool"
 done
 
 echo "==> Verifying base liboliphaunt $target_id runtime is extension-clean"
-cargo run -p oliphaunt --bin oliphaunt-resources --locked -- --list-extensions >"$catalog_file"
+cargo run -p oliphaunt-native-packaging --bin oliphaunt-resources --locked -- --list-extensions >"$catalog_file"
 oliphaunt_assert_base_runtime_has_no_optional_extensions "$catalog_file" "$runtime" ||
   fail "base $target_id runtime must not ship optional extension assets"
 
@@ -71,10 +71,28 @@ cp "$lib" "$stage/lib/"
 rsync -a --delete "$embedded_modules/" "$stage/lib/modules/"
 rsync -a --delete \
   --exclude '/bin/pg_dump' \
+  --exclude '/bin/pg_basebackup' \
   --exclude '/bin/psql' \
   --exclude 'share/icu/***' \
   "$runtime/" "$stage/runtime/"
-for tool in pg_dump psql; do
+tools/dev/bun.sh tools/release/stage-native-cluster-seed.mjs \
+  --runtime "$runtime" \
+  --destination "$stage/cluster-seed" \
+  --target "$target_id" \
+  --profile standard
+tools/dev/bun.sh tools/release/stage-native-cluster-seed.mjs \
+  --runtime "$runtime" \
+  --destination "$stage/cluster-seed-icu" \
+  --target "$target_id" \
+  --profile icu \
+  --icu-data "$work_root/icu/share/icu"
+tools/dev/bun.sh tools/release/finalize-native-runtime-carrier.mjs \
+  --root "$stage" \
+  --target "$target_id" \
+  --icu-data "$work_root/icu/share/icu" \
+  --runtime-source "$runtime" \
+  --embedded-modules "$embedded_modules"
+for tool in pg_basebackup pg_dump psql; do
   cp -p "$runtime/bin/$tool" "$tools_stage/runtime/bin/"
 done
 
@@ -103,7 +121,10 @@ env \
   OLIPHAUNT_INSTALL_DIR="$stage/runtime" \
   OLIPHAUNT_SMOKE_BIN_DIR="$stage_root/smoke-bin-$target_id" \
   OLIPHAUNT_SMOKE_ROOT="$stage_root/smoke-root-$target_id" \
-  node src/runtimes/liboliphaunt/native/tools/run-host-c-smoke.mjs
+  OLIPHAUNT_STANDARD_CLUSTER_SEED="$stage/cluster-seed" \
+  OLIPHAUNT_ICU_CLUSTER_SEED="$stage/cluster-seed-icu" \
+  OLIPHAUNT_ICU_DATA_DIR="$work_root/icu/share/icu" \
+  node src/runtimes/liboliphaunt/native/tools/run-host-c-smoke.mjs --cluster-seeds
 
 tools/release/archive_dir.mjs "$stage" "$out_dir/$asset"
 tools/release/archive_dir.mjs "$tools_stage" "$out_dir/$tools_asset"

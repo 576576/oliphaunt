@@ -1,6 +1,6 @@
 ---
 title: Build With React Native
-description: Install the React Native package, build a native app binary, configure exact extensions, use JSI transport, and wire lifecycle APIs.
+description: Install the React Native package, build a native app binary, configure exact extensions, use JSI transport, and own app lifecycle policy.
 ---
 
 # Build With React Native
@@ -74,8 +74,7 @@ needs the handle.
 import { Oliphaunt } from '@oliphaunt/react-native';
 
 const db = await Oliphaunt.open({
-  root: 'main.oliphaunt',
-  engine: 'nativeDirect',
+  storage: { kind: 'applicationData', name: 'main' },
   extensions: ['vector'],
 });
 
@@ -85,8 +84,10 @@ const value = rows.getText(0, 'value');
 await db.close();
 ```
 
-Keep the database handle in app state or a service object. Multiple JavaScript
-objects share the same mobile direct session through the platform SDK.
+Keep the database object in app state or a service object and share references
+to that object. A second `Oliphaunt.open()` is rejected while the native direct
+session is opening, active, or closing; call it again only after `close()`
+completes.
 
 </Step>
 <Step>
@@ -108,7 +109,7 @@ await db.execute(`
 
 await db.query(
   'INSERT INTO notes (title, body) VALUES ($1, $2) RETURNING id::text AS id',
-  ['First note', 'Stored in an embedded PostgreSQL root'],
+  ['First note', 'Stored by embedded PostgreSQL'],
 );
 
 const notes = await db.query(
@@ -117,57 +118,54 @@ const notes = await db.query(
 const firstTitle = notes.getText(0, 'title');
 ```
 
-Reach for raw protocol APIs only when building adapters, COPY flows, or
-streaming paths that need PostgreSQL wire messages directly.
+Reach for the buffered raw protocol API only when building adapters that need
+PostgreSQL wire messages directly.
 
 </Step>
 <Step>
 
 ### Configure
 
-Configure root, mode, selected exact extensions, durability, startup identity,
-and native runtime overrides through the JS API and config plugin. Build-time
-extension selection controls what ships in the app bundle; runtime root
-configuration controls where app data lives.
+Configure storage, selected exact extensions, PostgreSQL startup GUCs, and
+startup identity through the JS API and config plugin. Build-time extension selection
+controls what ships in the app bundle; runtime storage controls where app data
+lives.
 
 Keep build-time and runtime settings separate. The config plugin controls native
-artifacts in the installed app. `Oliphaunt.open()` controls the database root,
-mode, durability, and extension activation for that app run.
+artifacts in the installed app. `Oliphaunt.open()` controls storage, startup
+identity, GUCs, and extension activation for that app run. Omit `storage` for an
+SDK-owned temporary directory. Use
+`{ kind: 'applicationData', name: 'main' }` for normal persistent mobile data,
+or `{ kind: 'directory', path }` when the app already owns a platform path.
 
 </Step>
 <Step>
 
 ### Choose a mode
 
-React Native starts with `nativeDirect` on mobile. The database work is
-delegated to Swift on Apple platforms and Kotlin on Android, so
-`capabilities()` is the source of truth for additional broker or server mode
-reports. `OpenConfig.engine` currently accepts `nativeDirect` only.
+React Native uses native direct on mobile. Database work is delegated to Swift
+on Apple platforms and Kotlin on Android.
 
 </Step>
 <Step>
 
 ### Use binary transport
 
-New Architecture builds use binary ArrayBuffer/JSI transport for raw protocol
-bytes and chunked streaming. Bulk payloads stay in binary buffers.
+New Architecture builds use binary ArrayBuffer/JSI transport for buffered raw
+protocol bytes. Bulk payloads stay in binary buffers.
 
 Treat JSI transport as the bulk-byte boundary. Small configuration and lifecycle
-calls use the TurboModule API; protocol payloads and streamed chunks stay in
-binary buffers.
+calls use the TurboModule API; buffered protocol payloads stay in binary
+buffers.
 
 </Step>
 <Step>
 
 ### Handle lifecycle
 
-Use the SDK lifecycle hooks around background/foreground transitions. Direct
-mobile mode is same-root logically reopenable inside one resident app process.
-Broker and server runtimes add a process boundary on targets that advertise
-those modes.
-
-Call the JavaScript lifecycle API from app-level lifecycle handlers. The Swift
-and Kotlin SDKs own the platform-specific details underneath that call.
+Use `checkpoint()`, `cancel()`, and `close()` explicitly from app lifecycle
+policy. Direct mobile mode can logically reopen the same instance inside one
+resident app process.
 
 </Step>
 <Step>
@@ -185,8 +183,10 @@ target platform.
 ### Back up and restore
 
 Use the React Native backup and restore APIs instead of copying platform storage
-directories from JavaScript. The SDK delegates archive validation and root
+directories from JavaScript. The SDK delegates archive validation and destination
 materialization to Swift or Kotlin, so platform storage rules stay native.
+Restore accepts a new or existing-empty destination and rejects nonempty data
+without mutation.
 
 </Step>
 </Steps>

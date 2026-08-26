@@ -6,7 +6,6 @@ import test from "node:test";
 import { extensionReleasePropertiesText } from "./build-extension-ci-artifacts.mjs";
 import { iosBaseLegalMetadata } from "./ios-carrier-manifest.mjs";
 import {
-  CARGO_SDK_GENERATED_LEGAL_MEMBERS,
   cargoPackageMemberContractViolation,
   expectedExtensionBundleManifest,
   findSdkRuntimePayloadViolation,
@@ -16,27 +15,27 @@ import {
   validateReactNativePackagedCarrier,
   validateMobileExtensionManifestDomains,
   validatePackagedMobileRuntimeFiles,
+  validatePackagedMobileRuntimeManifest,
   validateSwiftSourceFixtureEntries,
 } from "./check-staged-artifacts.mjs";
 import { CORE_SNOWBALL_RUNTIME_DATA_FILES } from "../../src/sdks/react-native/tools/validate-mobile-runtime-files.mjs";
 
-test("WASIX Cargo packages accept only the generated legal members", () => {
-  const listed = ["Cargo.toml", "README.md", "src/lib.rs"];
-  const legalMembers = [...CARGO_SDK_GENERATED_LEGAL_MEMBERS];
-  assert.deepEqual(legalMembers, ["LICENSE", "THIRD_PARTY_NOTICES.md"]);
+test("Cargo packages exactly match their complete package listing", () => {
+  const listed = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "src/lib.rs",
+  ];
   assert.equal(
-    cargoPackageMemberContractViolation(
-      [...listed, ...legalMembers],
-      listed,
-      { generatedMembers: legalMembers },
-    ),
+    cargoPackageMemberContractViolation(listed, listed),
     null,
   );
 
   const unexpected = cargoPackageMemberContractViolation(
-    [...listed, ...legalMembers, "UNDECLARED.md"],
+    [...listed, "UNDECLARED.md"],
     listed,
-    { generatedMembers: legalMembers },
   );
   assert.deepEqual(unexpected, {
     kind: "mismatch",
@@ -56,6 +55,11 @@ test("WASIX Cargo packages accept only the generated legal members", () => {
       "src/lib.rs",
     ],
   });
+
+  assert.deepEqual(
+    cargoPackageMemberContractViolation(listed, [...listed, "LICENSE"]),
+    { kind: "listing-duplicate" },
+  );
 });
 
 const REPOSITORY_ROOT = path.join(
@@ -65,7 +69,7 @@ const REPOSITORY_ROOT = path.join(
 const ARCHIVE_ROOT = "package/Tests/Fixtures/swiftpm-extension-resources";
 const REACT_NATIVE_METADATA = JSON.parse(readFileSync(path.join(
   import.meta.dir,
-  "../../src/extensions/generated/sdk/react-native.json",
+  "../../src/extensions/generated/sdk/extensions.json",
 ), "utf8"));
 const MOBILE_STATIC_REGISTRY = JSON.parse(readFileSync(path.join(
   import.meta.dir,
@@ -85,22 +89,36 @@ function packagedMobileRuntimeNames(prefix, extensionAssets) {
   ];
 }
 
+test("packaged mobile apps require the native-direct runtime contract", () => {
+  assert.doesNotThrow(() => validatePackagedMobileRuntimeManifest({
+    schema: "oliphaunt-runtime-resources-v1",
+    mode: "native-direct",
+  }));
+  assert.throws(
+    () => validatePackagedMobileRuntimeManifest({
+      schema: "oliphaunt-runtime-resources-v1",
+      mode: "native-server",
+    }),
+    /mode=native-direct/u,
+  );
+});
+
 test("staged iOS evidence and the Expo runner share the Payload CocoaPods file-list contract", () => {
   const scratchPath = path.join(path.sep, "candidate-scratch");
   const contract = iosPayloadCocoaPodsFileListPaths(scratchPath);
   assert.deepEqual(contract, {
     inputFile: path.join(
       scratchPath,
-      "src/sdks/react-native/examples/expo/ios/Pods/Target Support Files/OliphauntReactNativePayload/OliphauntReactNativePayload-xcframeworks-input-files.xcfilelist",
+      "examples/react-native-expo/ios/Pods/Target Support Files/OliphauntReactNativePayload/OliphauntReactNativePayload-xcframeworks-input-files.xcfilelist",
     ),
     outputFile: path.join(
       scratchPath,
-      "src/sdks/react-native/examples/expo/ios/Pods/Target Support Files/OliphauntReactNativePayload/OliphauntReactNativePayload-xcframeworks-output-files.xcfilelist",
+      "examples/react-native-expo/ios/Pods/Target Support Files/OliphauntReactNativePayload/OliphauntReactNativePayload-xcframeworks-output-files.xcfilelist",
     ),
     podName: "OliphauntReactNativePayload",
     supportRoot: path.join(
       scratchPath,
-      "src/sdks/react-native/examples/expo/ios/Pods/Target Support Files/OliphauntReactNativePayload",
+      "examples/react-native-expo/ios/Pods/Target Support Files/OliphauntReactNativePayload",
     ),
   });
 
@@ -241,8 +259,8 @@ function selectionNeutralCarrier(version = "1.2.3") {
   const tag = `${product}-v${version}`;
   const assets = [
     ["base-xcframework", `liboliphaunt-${version}-apple-spm-xcframework.zip`, "zip", "liboliphaunt.xcframework", "a"],
-    ["runtime-resources", `liboliphaunt-${version}-runtime-resources.tar.gz`, "tar.gz", "oliphaunt", "b"],
-    ["icu-data", `liboliphaunt-${version}-icu-data.tar.gz`, "tar.gz", "share/icu", "c"],
+    ["runtime-resources", `liboliphaunt-${version}-runtime-resources-ios-datum64.tar.gz`, "tar.gz", "oliphaunt", "b"],
+    ["icu-data", `liboliphaunt-${version}-icu-data.tar.gz`, "tar.gz", ".", "c"],
   ].map(([role, name, format, member, digit], index) => ({
     bytes: index + 1,
     format,
@@ -615,12 +633,9 @@ test("renders every single-extension asset identity into the public properties m
       dataFiles: ["contrib/postgis-3.6/postgis.sql", "proj/proj.db"],
       extensionSqlFileNames: ["uninstall_postgis.sql"],
       extensionSqlFilePrefixes: ["postgis_comments", "rtpostgis"],
-      nativeDependencies: [],
       nativeModuleStem: "postgis-3",
       iosNativeDependencies: dependencyIdentities,
       sharedPreloadLibraries: [],
-      mobileReleaseReady: true,
-      desktopReleaseReady: true,
       assets,
     },
     releaseData: {
@@ -668,12 +683,9 @@ test("freezes each bundle member desktop inventory in the public properties mani
         dataFiles: [],
         extensionSqlFileNames: ["uninstall_pgtap.sql"],
         extensionSqlFilePrefixes: ["pgtap-core", "pgtap-schema"],
-        nativeDependencies: [],
         nativeModuleStem: null,
         iosNativeDependencies: [],
         sharedPreloadLibraries: [],
-        mobileReleaseReady: true,
-        desktopReleaseReady: true,
         assets: [],
       }],
     },

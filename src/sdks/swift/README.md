@@ -6,14 +6,14 @@ Add Oliphaunt from Swift Package Manager:
 
 ```text
 dependencies: [
-    .package(url: "https://github.com/f0rr0/oliphaunt.git", exact: "0.6.0")
+    .package(url: "https://github.com/f0rr0/oliphaunt.git", exact: "0.6.1")
 ]
 ```
 
 Then add the `Oliphaunt` product to the iOS or macOS app target. Release tags
 are source tags for the Swift API and are paired with compatible
 `liboliphaunt-native-v<version>` GitHub release assets, for example
-`liboliphaunt-native-v0.1.0`. Those assets contain the base Apple XCFramework,
+`liboliphaunt-native-v0.1.1`. Those assets contain the base Apple XCFramework,
 portable runtime resources, and checksum manifest.
 CocoaPods trunk is not a release path for Oliphaunt. The SwiftPM release tag
 resolves a generated manifest with a checksum-pinned `liboliphaunt` binary
@@ -26,9 +26,10 @@ and checksum-pinned binary/runtime assets for the selected release.
 Base Apple packages do not include full ICU data. Applications that need
 PostgreSQL ICU collations add the `OliphauntICU` SwiftPM product to the same app
 target as `Oliphaunt`. The generated release manifest exposes `OliphauntICU` as
-a resource-only product containing `share/icu`; `Oliphaunt` discovers that
-bundle resource at runtime. Do not add `OliphauntICU` for applications that do
-not use ICU collations.
+a resource-only product containing the canonical ICU data. The target runtime
+resources carry the matching platform-qualified cluster seed, and `Oliphaunt`
+resolves the pair as one checked closure. Do not add `OliphauntICU` for
+applications that do not use ICU collations.
 
 Optional PostgreSQL extensions are exact-extension artifacts. PostgreSQL 18
 contrib members share the logical `oliphaunt-extension-contrib-pg18` artifact;
@@ -119,12 +120,10 @@ missing or version-skewed dependency, duplicate SQL row, unused carrier file,
 or conflicting native dependency asset stops generation before output.
 
 Normal use accepts HTTPS assets only. `--offline` requires a complete verified
-cache; `--allow-file-urls` exists only for local CI fixtures. The older
-`--input oliphaunt-swiftpm-extension-input-v1` form remains available for
-advanced tooling, but consumers do not need to hand-author that intermediate
-schema. That input explicitly pins `nativeRuntime.product` and
-`nativeRuntime.version`; generation requires every extracted resource manifest
-to carry the same stable `liboliphaunt-native` identity. Native carrier rows
+cache; `--allow-file-urls` exists only for local CI fixtures. Carrier resolution
+pins `nativeRuntime.product` and `nativeRuntime.version`; generation requires
+every extracted resource manifest to carry the same stable
+`liboliphaunt-native` identity. Native carrier rows
 include an extension XCFramework plus exact dependency XCFramework roles and
 build-derived registration symbols. SQL-only rows such as `pgtap` carry runtime
 resources without a fake binary target.
@@ -132,8 +131,8 @@ resources without a fake binary target.
 The generator copies only `files/share/postgresql` from each resource artifact;
 native libraries and build archives cannot enter a Swift resource bundle. Each
 generated product registers its `Bundle.module` fragment before database open.
-`OliphauntRuntimeResources` resolves mandatory dependencies and atomically
-composes the extension-free base with exactly those registered fragments into a
+Oliphaunt's internal resource loader resolves mandatory dependencies and
+atomically composes the extension-free base with exactly those registered fragments into a
 deterministic cache entry. It regenerates runtime, static-registry, and size
 metadata, rejects conflicting paths, and supports multiple independent native
 extensions plus SQL-only extensions. Consumers add the generated product and
@@ -153,7 +152,7 @@ plugin. It does not carry a second native database runtime.
 
 | SDK | Native core | Apple distribution |
 | --- | --- | --- |
-| `Oliphaunt` `0.6.0` | `liboliphaunt` `0.1.0` | SwiftPM source tag plus checksum-covered GitHub release assets |
+| `Oliphaunt` `0.6.1` | `liboliphaunt` `0.1.1` | SwiftPM source tag plus checksum-covered GitHub release assets |
 
 Exact extensions are selected by PostgreSQL SQL extension name and released as
 separate exact-extension artifacts. Selecting `vector` must only fetch/link
@@ -166,8 +165,7 @@ XCFrameworks and runtime files must not enter the app bundle.
 ```swift
 let db = try await OliphauntDatabase.open(
     configuration: OliphauntConfiguration(
-        mode: .nativeDirect,
-        runtimeFootprint: .balancedMobile,
+        storage: .directory(applicationDatabaseURL),
         startupGUCs: [
             OliphauntStartupGUC("shared_buffers", "32MB")
         ],
@@ -175,74 +173,51 @@ let db = try await OliphauntDatabase.open(
         database: "postgres"
     )
 )
-let response = try await db.execProtocolRaw(simpleQueryBytes)
+let rows = try await db.query(
+    "SELECT name FROM widgets WHERE id = $1",
+    parameters: [.text("42")]
+)
+let name = try rows.getText(row: 0, column: "name")
+
+let command = try await db.execute(
+    "UPDATE widgets SET active = $1 WHERE id = $2",
+    parameters: [.text("true"), .text("42")]
+)
+print(command.commandTag ?? "")
+print(command.rowCount as Any)
 try await db.close()
 ```
 
+`username` selects an existing PostgreSQL role. New roots are always
+bootstrapped with `postgres`; create another role from that account before
+reopening the root with a different username.
+
 Swift package for iOS and macOS apps on the native `liboliphaunt` product line.
 
-The public API is actor-based and mirrors the Rust SDK shape: open a database,
-execute raw PostgreSQL protocol bytes, inspect capabilities, create SQL or
-physical backup artifacts, restore same-version physical archives into an
-explicit root, run transaction closures on the active physical session, request
-PostgreSQL checkpoints, configure startup `username`/`database` identity,
-cancel active work, and close. The package includes
-`OliphauntNativeDirectEngine`, a C-ABI-backed native direct runtime that loads
-`liboliphaunt` dynamically or resolves already-linked symbols. `OliphauntDatabase`
-uses that native-direct engine by default for `.nativeDirect`; broker and server
-still fail explicitly until those Swift runtimes are linked.
-Use `OliphauntDatabase.supportedModes()` to discover that support before opening a
-database; the returned entries include canonical direct/broker/server
-capabilities and the reason unavailable modes are not currently openable.
-Capabilities report the same product contract as Rust: raw and streaming
-protocol support, cancellation, backup/restore, simple-query execution,
-extensions, session semantics, multi-root support, and the concrete backup/restore formats
-the opened mode accepts. Use `supportsBackupFormat(_:)` and
-`supportsRestoreFormat(_:)` on either `OliphauntCapabilities` or `OliphauntDatabase`
-for UI/action gating instead of manually matching arrays. `backup(_:)` enforces
-those capabilities before it calls the native session, and
-`OliphauntDatabase.restore` rejects unsupported restore artifact formats before it
-calls the engine. Lifecycle capability fields follow the Rust contract:
-`sameRootLogicalReopen`, `rootSwitchable`, and `crashRestartable` distinguish
-direct's same-root resident reopen from broker/server process-managed behavior.
-Native direct is not root-switchable or crash-restartable. Mobile direct mode
-has one resident backend per app process and one physical session. Use server
-mode only where the SDK reports true server support; it is not a
-crash-isolated server and it does not provide independent concurrent client
-sessions.
+The public API is actor-based and deliberately small: `query`, `execute`,
+callback-scoped transactions, `checkpoint`, `cancel`, physical `backup` and
+`restore`, raw PostgreSQL protocol execution, and `close`. `query` and `execute`
+preserve PostgreSQL command tags; their nullable `rowCount` is derived from the
+`CommandComplete` tag. SQL errors preserve SQLSTATE and PostgreSQL error fields.
+Raw protocol execution remains available for PostgreSQL features without a
+typed API. `execProtocolRaw` returns one owned response, while
+`execProtocolStream` delivers raw backend protocol chunks to a callback without
+buffering the complete response. Neither API adds a second protocol parser.
 
-Swift defaults to the mobile resident profile: `runtimeFootprint:
-.balancedMobile` and `durability: .balanced`. Use `.safe` when last-commit
-survival matters more than commit latency, `.throughput` for throughput-lane
-diagnostics, or `.smallMobile` for memory-pressure experiments. `startupGUCs`
-are validated and appended after the footprint and durability defaults so
-profiling builds can override specific PostgreSQL GUCs without changing the
-public ABI.
+Transactions use one physical session and require PostgreSQL's exact `BEGIN`,
+`COMMIT`, and `ROLLBACK` completion tags. A failed rollback poisons the facade:
+close it and reopen the database before issuing more work.
 
-For large responses or COPY-style traffic, stream backend protocol bytes through
-the C ABI instead of materializing one owned response first:
+`startupGUCs` are passed directly as PostgreSQL `-c name=value` arguments.
+There are no SDK-specific durability, memory, or runtime profiles.
 
-<!-- liboliphaunt-doc-example:swift-streaming -->
-```swift
-try await db.execProtocolStream(simpleQueryBytes) { chunk in
-    consume(chunk)
-}
-```
-
-For ordinary one-result-set SQL, use the typed simple-query helper:
-
-<!-- liboliphaunt-doc-example:swift-typed-query -->
-```swift
-let result = try await db.query("SELECT 1::text AS value")
-let value = try result.getText(row: 0, column: "value")
-```
-
-`query(_:)` parses normal PostgreSQL backend protocol frames into field
-metadata, rows, command tags, nulls, and structured PostgreSQL errors through
-`OliphauntError.postgres(OliphauntPostgresError)`, preserving SQLSTATE and raw
-`ErrorResponse` fields. Multi-result-set and COPY traffic stay on
-`execProtocolRaw`.
-Pass `parameters:` for PostgreSQL extended-protocol parameters:
+Database storage is optional in the common case. The default,
+`.temporaryDirectory`, uses an SDK-owned directory below the operating system's
+temporary location. Native direct keeps that directory for its process-resident
+database so a logical close can be reopened safely; it is not durable storage
+and may be reclaimed after the process exits. Select persistence explicitly
+with `storage: .directory(applicationDatabaseURL)`. `close()` never deletes a
+directory supplied by the application.
 
 Use `transaction {}` for multi-step work that must stay on the same physical
 session. Database calls outside the active `OliphauntTransaction` are rejected
@@ -257,6 +232,32 @@ let result = try await db.query(
     parameters: [.text("hello")]
 )
 ```
+
+## Physical backup and storage
+
+`backup()` returns the native physical archive as `Data`. Restore accepts those
+bytes and a new destination; it never replaces an existing database root.
+
+<!-- liboliphaunt-doc-example:swift-backup-restore -->
+```swift
+let bytes = try await db.backup()
+try await db.close()
+try await OliphauntDatabase.restore(destination: restoredDatabaseURL, bytes: bytes)
+```
+
+A persistent database directory is a managed root:
+
+```text
+.oliphaunt.json
+pgdata/
+```
+
+The descriptor is published only after a packaged cluster seed or packaged `initdb`
+has produced complete PGDATA. Existing managed roots must contain PostgreSQL 18 `PG_VERSION`, `global/pg_control`, and
+`pg_wal`. A pre-existing nonempty directory without the descriptor is rejected
+without modification. Physical archives contain PGDATA and the exact physical
+backup manifest. Restore creates the receiving root descriptor after validating
+the extracted PGDATA.
 
 ## Local Development
 
@@ -275,64 +276,71 @@ OLIPHAUNT_INSTALL_DIR=/path/to/postgres/install \
 swift test
 ```
 
-The native-direct env-backed test opens a temporary root, executes `SELECT 1`
-through raw and streaming PostgreSQL protocol bytes, cancels an active
+The native-direct env-backed test opens temporary storage, executes `SELECT 1`
+through PostgreSQL protocol bytes, cancels an active
 `pg_sleep`, creates a
-same-version physical backup through the C ABI, restores it into a new root, and
-closes the runtime. Exact extensions are accepted when
-`OliphauntNativeDirectEngine` is constructed with a `runtimeDirectory` built with
-those extensions, or with `OliphauntRuntimeResources` pointing at packaged runtime
-resources whose manifest lists the requested extensions. Extension names are validated
-before loading native code.
+same-version physical backup through the C ABI, restores it into a new destination, and
+closes the runtime. Exact extensions are accepted when the app links their
+generated SwiftPM products and calls each product's `register()` method before
+opening the database. Extension names are validated before loading native code.
 
-For iOS and app-bundled macOS builds, package resources using this layout and
-construct the engine with `OliphauntRuntimeResources(bundle:)` or
-`OliphauntRuntimeResources(resourceRoot:)`:
+For iOS and app-bundled macOS builds, generated products package resources using
+this layout; the SDK discovers them automatically:
 
 ```text
 oliphaunt/
+  manifest.properties
   runtime/
     manifest.properties
     files/
-  template-pgdata/
+  cluster-seed/
     manifest.properties
     files/
       PG_VERSION
+      global/pg_control
+  cluster-seed-icu/
+    manifest.properties
+    files/
+      PG_VERSION
+      global/pg_control
 ```
 
-Release automation publishes `liboliphaunt-<version>-runtime-resources.tar.gz`
-with that layout and covers it in
-`liboliphaunt-<version>-release-assets.sha256`. App integrations should consume
-that artifact through the SwiftPM/RN package integration or through a clean
-release asset resolver, never by asking app developers to build PostgreSQL from
-this repository.
+The macOS XCFramework slice embeds the `macos-arm64` closure. Both iOS slices
+embed the `ios-datum64` closure. SwiftPM links exactly one platform slice, so an
+application receives one target-qualified closure. React Native uses the separate
+`liboliphaunt-<version>-runtime-resources-ios-datum64.tar.gz` carrier when it
+composes its app-owned resource bundle; there is no generic or multi-target
+runtime-resource archive.
+
+The root receipt binds the closure to one seed target and the two sibling seed
+paths. Both seed manifests use the exact native cluster-seed contract; extension
+selection and static-registry metadata belong only to the runtime manifest.
 `runtime/manifest.properties` must include
 `schema=oliphaunt-runtime-resources-v1`,
-`layout=postgres-runtime-files-v1`, `cacheKey=<portable-id>`, and
+`layout=postgres-runtime-files-v1`, `mode=native-direct`,
+`cacheKey=<portable-id>`, and
 two distinct extension domains. `selectedExtensions` is the complete,
 dependency-closed set of packaged SQL identities, including module-only
 products such as `auto_explain`. `extensions` is exactly the subset whose
 catalog rows support `CREATE EXTENSION`; it must be a subset of
 `selectedExtensions`. Runtime availability and requested-extension checks use
 `selectedExtensions`, while control/install-SQL checks apply only to requested
-members of `extensions`. New producers must always write both fields. The SDK
-reads `extensions` as the full selection only for a legacy manifest in which
-`selectedExtensions` is absent; an explicitly empty `selectedExtensions` never
-falls back.
+members of `extensions`. Producers must always write both fields. The SDK
+rejects a missing `selectedExtensions`; an explicitly empty value means that
+no extensions were selected.
+The runtime manifest uses an exact field set. When
+`mobileStaticRegistryState=complete`, `mobileStaticRegistrySource` is exactly
+`static-registry/oliphaunt_static_registry.c` for packaged generator output or
+`swiftpm-linked-products` for SwiftPM product composition; it is empty for all
+other registry states.
 
-`template-pgdata` manifests must use
-`layout=postgres-template-pgdata-v1`. Current packages also record
-`sharedPreloadLibraries`, `mobileStaticRegistryState`,
-`mobileStaticRegistryPending`, `mobileStaticRegistryRegistered`, and
-`nativeModuleStems`. `mobileStaticRegistryRegistered` is exactly the selected
-SQL-name subset that has native modules, and `nativeModuleStems` is the
-corresponding exact native-module-stem set; neither may claim an unselected SQL
-identity. iOS-family targets reject selected extensions while the registry
-state is `pending`. The Swift SDK rejects unknown package layouts, materializes
-runtime files into Application Support using the cache key, and hydrates new
-PGDATA roots from `template-pgdata/files`.
-Apple mobile platforms require either a packaged template PGDATA or an existing
-root with `PG_VERSION`; they do not rely on executing `initdb` from app storage.
+The Swift SDK rejects unknown package layouts, materializes runtime files into
+Application Support using the cache key, and hydrates a new standard or ICU
+PGDATA root from its matching target-qualified cluster seed. iOS-family targets
+reject selected extensions while the runtime static-registry state is
+`pending`.
+Apple mobile platforms require either a packaged cluster seed or existing
+storage whose `pgdata` child contains `PG_VERSION`; they do not rely on executing `initdb` from app storage.
 When a selected extension contains native modules, the Swift package must
 link those modules with the generated static-registry source. Complete Rust
 runtime-resource generator output includes
@@ -354,10 +362,5 @@ The generated registry source strongly references selected extension magic and
 SQL symbols. If an app selects `vector` but omits the matching prebuilt
 `liboliphaunt_extension_vector.xcframework`, the build should fail rather than
 shipping an app that fails later at `CREATE EXTENSION vector`.
-The resource root also includes `package-size.tsv`; call
-`OliphauntRuntimeResources.packageSizeReport()` to inspect total package bytes,
-runtime/template/static-registry bytes, de-duplicated selected extension bytes,
-and per-extension footprints before shipping an app bundle.
-
-Broker and server engines still follow the Rust SDK shape and fail explicitly
-until those Swift runtimes are linked.
+The generated resource root also includes `package-size.tsv` for release and
+bundle-size auditing.

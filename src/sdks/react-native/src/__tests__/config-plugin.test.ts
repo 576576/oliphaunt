@@ -93,9 +93,12 @@ function writeCarrierPackage(
   const [firstExtension] = extensions;
   writeCarrier(carrier, extensions, {
     baseVersion: nativeVersion,
-    ownerVersions: firstExtension === undefined
-      ? {}
-      : { [releaseOwnerForSqlName(firstExtension.sqlName).releaseProduct]: packageVersion },
+    ownerVersions:
+      firstExtension === undefined
+        ? {}
+        : {
+            [releaseOwnerForSqlName(firstExtension.sqlName).releaseProduct]: packageVersion,
+          },
   });
   writeJson(path.join(packageRoot, 'package.json'), {
     name: packageName,
@@ -182,10 +185,7 @@ test('Podfile patch is app-owned, fail-closed, and idempotent', () => {
     patchedPodfile,
     /pod 'OliphauntReactNativePayload', :path => oliphaunt_payload_path/,
   );
-  assert.doesNotMatch(
-    patchedPodfile,
-    /pod 'OliphauntReactNativePayload', :podspec/,
-  );
+  assert.doesNotMatch(patchedPodfile, /pod 'OliphauntReactNativePayload', :podspec/);
   assert.doesNotMatch(patchedPodfile, /OliphauntICU/);
   assert.equal(insertIosPodfileBlock(patchedPodfile, { icu: true }), patchedPodfile);
 
@@ -200,10 +200,18 @@ test('Podfile patch is app-owned, fail-closed, and idempotent', () => {
 });
 
 test('Expo iOS deployment target meets the packaged pod minimum without lowering newer apps', () => {
-  assert.deepEqual(ensureIosDeploymentTarget({}), { 'ios.deploymentTarget': '17.0' });
+  assert.deepEqual(ensureIosDeploymentTarget({}), {
+    'ios.deploymentTarget': '17.0',
+  });
   assert.deepEqual(
-    ensureIosDeploymentTarget({ 'ios.deploymentTarget': '16.4', keep: 'value' }),
-    { 'ios.deploymentTarget': '17.0', keep: 'value' },
+    ensureIosDeploymentTarget({
+      'ios.deploymentTarget': '16.4',
+      keep: 'value',
+    }),
+    {
+      'ios.deploymentTarget': '17.0',
+      keep: 'value',
+    },
   );
   assert.deepEqual(ensureIosDeploymentTarget({ 'ios.deploymentTarget': '17' }), {
     'ios.deploymentTarget': '17',
@@ -220,7 +228,9 @@ test('Expo iOS deployment target meets the packaged pod minimum without lowering
     ios: { deploymentTarget: '17.0' },
   });
   assert.deepEqual(
-    ensureIosConfigDeploymentTarget({ ios: { bundleIdentifier: 'dev.example', deploymentTarget: '18.0' } }),
+    ensureIosConfigDeploymentTarget({
+      ios: { bundleIdentifier: 'dev.example', deploymentTarget: '18.0' },
+    }),
     { ios: { bundleIdentifier: 'dev.example', deploymentTarget: '18.0' } },
   );
 });
@@ -562,7 +572,9 @@ test('carrier discovery and staging fail closed', () => {
     writeCarrier(vectorCarrier, [{ sqlName: 'vector', dependencies: [] }]);
     const stageEnv = {
       OLIPHAUNT_REACT_NATIVE_IOS_BASE_CARRIER: baseCarrier,
-      OLIPHAUNT_REACT_NATIVE_IOS_EXTENSION_CARRIERS: JSON.stringify({ vector: vectorCarrier }),
+      OLIPHAUNT_REACT_NATIVE_IOS_EXTENSION_CARRIERS: JSON.stringify({
+        vector: vectorCarrier,
+      }),
     };
     assert.throws(
       () =>

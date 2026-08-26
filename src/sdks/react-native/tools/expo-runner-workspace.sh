@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 
-# Shared scratch-workspace and template-PGDATA helpers for the React Native
+# Shared scratch-workspace and cluster-seed helpers for the React Native
 # Expo mobile runners. Callers provide platform-specific variables such as
 # scratch_root, example_dir, package_work, source_example_dir, rn_dir,
-# mobile_template_initdb, wal_segsize_mb, and react_native_package_extra_excludes.
+# mobile_packaging_initdb and react_native_package_extra_excludes.
 
 react_native_package_extra_excludes=()
+
+react_native_source_package_fingerprint() {
+  node "$rn_dir/tools/react-native-package-inputs.mjs" \
+    --root "$root" \
+    --rn-dir "$rn_dir" \
+    --example-package "$source_example_dir/package.json"
+}
 
 host_runtime_label() {
   case "$(uname -s):$(uname -m)" in
@@ -71,7 +78,7 @@ ensure_host_runtime_assets() {
   printf '%s\n' "$runtime_source"
 }
 
-normalize_template_pgdata() {
+normalize_cluster_seed() {
   local pgdata="$1"
   local conf="$pgdata/postgresql.conf"
   [ -f "$conf" ] || return 0
@@ -128,85 +135,6 @@ ensure_mobile_runtime_tool_permissions() {
   done
 }
 
-prepare_mobile_template_pgdata() {
-  local initdb="${mobile_template_initdb:-}"
-  if [ -z "$initdb" ]; then
-    local runtime_source
-    runtime_source="$(ensure_host_runtime_assets)"
-    initdb="$runtime_source/bin/initdb"
-  fi
-  local pgdata="$scratch_root/mobile-template-pgdata"
-  local stamp="$pgdata/.liboliphaunt-mobile-template-v1"
-
-  [ -x "$initdb" ] || return 1
-
-  local wanted
-  wanted="$(
-    printf 'initdb=%s\n' "$initdb"
-    shasum -a 256 "$initdb"
-    shasum -a 256 "$script_path"
-    printf 'locale=C\nencoding=UTF8\nnormalizer=mobile-template-v1\n'
-    printf 'walSegsizeMB=%s\n' "$wal_segsize_mb"
-  )"
-  if [ -f "$pgdata/PG_VERSION" ] &&
-    [ -f "$stamp" ] &&
-    [ "$wanted" = "$(cat "$stamp")" ]; then
-    printf '%s\n' "$pgdata"
-    return
-  fi
-
-  rm -rf "$pgdata"
-  mkdir -p "$pgdata"
-  "$initdb" \
-    -D "$pgdata" \
-    -U postgres \
-    --auth=trust \
-    --no-sync \
-    --locale-provider=libc \
-    --locale=C \
-    --wal-segsize="$wal_segsize_mb" \
-    --encoding=UTF8 >/dev/null
-  normalize_template_pgdata "$pgdata"
-  printf '%s' "$wanted" > "$stamp"
-  printf '%s\n' "$pgdata"
-}
-
-find_latest_mobile_pgdata() {
-  local platform="$1"
-  local configured="$2"
-  local configured_template_env="$3"
-  local initdb_env="$4"
-  if [ -n "$configured" ]; then
-    [ -f "$configured/PG_VERSION" ] || fail "template PGDATA is missing PG_VERSION: $configured"
-    printf '%s\n' "$configured"
-    return
-  fi
-
-  if prepare_mobile_template_pgdata; then
-    return
-  fi
-
-  if [ "$wal_segsize_mb" != "16" ]; then
-    fail "OLIPHAUNT_EXPO_MOBILE_WAL_SEGSIZE_MB=$wal_segsize_mb requires initdb so the mobile template PGDATA can be generated with --wal-segsize=$wal_segsize_mb; set $initdb_env or $configured_template_env"
-  fi
-
-  local selected=""
-  local selected_mtime=0
-  local version_file pgdata mtime
-  while IFS= read -r version_file; do
-    pgdata="$(dirname "$version_file")"
-    [ -f "$pgdata/postgresql.conf" ] || continue
-    mtime="$(stat_mtime "$pgdata")"
-    if [ "$mtime" -gt "$selected_mtime" ]; then
-      selected="$pgdata"
-      selected_mtime="$mtime"
-    fi
-  done < <(find "$root/target/liboliphaunt-pg18" -path '*/.oliphaunt-pgdata/PG_VERSION' -type f 2>/dev/null)
-
-  [ -n "$selected" ] || fail "no template PGDATA found for $platform; run src/runtimes/liboliphaunt/native/bin/smoke-host-happy-path.sh once or set $configured_template_env"
-  printf '%s\n' "$selected"
-}
-
 directory_fingerprint() {
   local dir="$1"
   (
@@ -242,14 +170,14 @@ JSON
     --source "$root/pnpm-workspace.yaml" \
     --output "$scratch_root/pnpm-workspace.yaml" \
     --package "src/sdks/react-native" \
-    --package "src/sdks/react-native/examples/expo"
+    --package "examples/react-native-expo"
   if [ "$scratch_root/pnpm-lock.yaml" != "$root/pnpm-lock.yaml" ]; then
     cp "$root/pnpm-lock.yaml" "$scratch_root/pnpm-lock.yaml"
   fi
 }
 
 install_expo_example_dependencies() {
-  if [ "$example_dir" = "$scratch_root/src/sdks/react-native/examples/expo" ]; then
+  if [ "$example_dir" = "$scratch_root/examples/react-native-expo" ]; then
     run pnpm --dir "$scratch_root" install --no-frozen-lockfile --prefer-offline --filter react-native-oliphaunt-expo
   else
     run pnpm --dir "$example_dir" install --no-frozen-lockfile --prefer-offline
@@ -303,6 +231,15 @@ prepare_react_native_package_worktree() {
   fi
   rsync_args+=("$rn_dir/" "$package_work/")
   rsync "${rsync_args[@]}"
+  mkdir -p "$package_work/src/generated"
+  cp \
+    "$root/src/extensions/generated/sdk/extensions.json" \
+    "$package_work/src/generated/extensions.json"
+  cp \
+    "$root/src/extensions/generated/sdk/ios-static-dependencies.json" \
+    "$package_work/src/generated/ios-static-dependencies.json"
+  mkdir -p "$scratch_root/tools/dev"
+  cp "$root/tools/dev/clean-package-lib.mjs" "$scratch_root/tools/dev/clean-package-lib.mjs"
   if [ -d "$rn_dir/node_modules" ]; then
     ln -s "$rn_dir/node_modules" "$package_work/node_modules"
   else

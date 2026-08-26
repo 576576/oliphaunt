@@ -1,0 +1,68 @@
+---
+title: WASIX TypeScript SDK
+description: Run portable PostgreSQL in browsers, Node.js, Bun, and Deno with one small asynchronous API.
+---
+
+# WASIX TypeScript SDK
+
+<SdkLanding id="wasix-typescript" />
+
+`@oliphaunt/wasix-ts` hosts the portable `liboliphaunt-wasix` runtime in a
+browser, Node.js, Bun, or Deno. It is a separate product from native
+`@oliphaunt/ts`: neither package selects or falls back to the other.
+
+## Install
+
+```sh
+pnpm add @oliphaunt/wasix-ts
+```
+
+Deno uses the same npm package through an `npm:` import.
+
+## Open And Query
+
+```ts
+import Oliphaunt from '@oliphaunt/wasix-ts';
+
+await using database = await Oliphaunt.open();
+const result = await database.query('select $1::int + 1 as answer', [41]);
+console.log(result.getText(0, 'answer'));
+```
+
+Omitted storage creates a fresh in-memory database. Browser pages must be
+cross-origin isolated with COOP `same-origin` and COEP `require-corp`.
+
+## Runtime Shape
+
+Worker execution is the default. `execution: 'direct'` runs the same database
+API in the caller's JavaScript realm and blocks that realm while PostgreSQL is
+working. This is host placement, not a second database engine or compatibility
+mode.
+
+The core package provides queries, commands, callback transactions, buffered
+and callback-streamed raw PostgreSQL protocol bytes, checkpoint, one physical
+backup, restore into persistent storage, and close. Optional
+`@oliphaunt/wasix-tools` adds `pgDump` in direct or worker placement and
+non-interactive `psql` in worker placement on every host. Explicit server
+subpaths add a local endpoint on Node, Bun, and Deno. Cancellation and a
+dedicated typed COPY API remain absent.
+
+## App Responsibilities
+
+- Import only the persistent-storage adapter and exact WASIX extension packages
+  the application uses.
+- Keep the same extension selection when reopening a persistent database.
+- Call `close()` or use `await using`; call `checkpoint()` when the application
+  needs an explicit PostgreSQL checkpoint and publication boundary.
+- Treat physical archives as same-format recovery artifacts. Use logical SQL
+  dumps for version upgrades or transfers outside the WASIX physical format.
+- Use direct or worker placement for `pgDump`; use worker placement for `psql`.
+  Use the lightweight local endpoint for one compatibility client, or the
+  separate postmaster product for concurrency.
+
+## First Query
+
+Use the [guide](/docs/sdk/wasix-typescript/guide) for storage, transactions,
+backup, restore, tools, and local endpoints. Use the [API reference](/docs/sdk/wasix-typescript/api-reference)
+for the exact exported declarations. Rust hosts use the separate
+[Rust WASIX SDK](/docs/sdk/wasix-rust).

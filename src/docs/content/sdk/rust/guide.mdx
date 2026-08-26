@@ -1,6 +1,6 @@
 ---
 title: Build With Rust
-description: Use the Rust SDK in Tauri or native Rust apps with direct, broker, server, app-owned roots, exact extensions, lifecycle, and backup APIs.
+description: Use the Rust SDK in Tauri or native Rust apps with direct, broker, server, explicit storage, exact extensions, lifecycle, and backup APIs.
 ---
 
 # Build With Rust
@@ -45,8 +45,8 @@ use oliphaunt::{Extension, Oliphaunt};
 
 async fn open_database() -> oliphaunt::Result<()> {
     let db = Oliphaunt::builder()
-        .path(".oliphaunt")
-        .native_direct()
+        .directory(".oliphaunt")
+        .direct()
         .extension(Extension::Vector)
         .open()
         .await?;
@@ -84,9 +84,9 @@ db.execute(
 )
 .await?;
 
-db.query_params(
+db.query_with_params(
     "INSERT INTO notes (title, body) VALUES ($1, $2) RETURNING id::text AS id",
-    ["First note", "Stored in an embedded PostgreSQL root"],
+    ["First note", "Stored by embedded PostgreSQL"],
 )
 .await?;
 
@@ -103,24 +103,26 @@ handles directly to frontend code.
 
 ### Configure
 
-Configure engine mode, root, durability, startup identity, selected extensions,
-runtime assets, broker executable, and server executable through the builder.
-Use a persistent app-owned directory for user data. Temporary roots are useful
-for tests and short-lived tools.
+Configure storage, runtime selection, startup identity, PostgreSQL startup GUCs,
+selected extensions, broker executable, and server executable through the
+builder. `Oliphaunt::builder()` defaults to an SDK-owned temporary directory
+initialized from the packaged cluster seed; call `.directory(path)` when data must
+persist.
 
 </Step>
 <Step>
 
 ### Choose a mode
 
-`NativeDirect` runs one serialized embedded session in the process. It gives the
-lowest round-trip latency and rejects pool sizes above one.
+`direct()` runs one serialized embedded session in the process. It gives
+the lowest round-trip latency.
 
-`NativeBroker` talks to a local helper process. Use it for desktop apps that need
-process isolation, crash recovery, or several roots managed by one application.
+`broker()` talks to a local helper process. Use it for desktop apps that need
+process isolation, crash recovery, or several instances managed by one application.
 
-`NativeServer` starts a PostgreSQL-compatible server process. Use it when `psql`,
-`pg_dump`, ORMs, or true independent client sessions matter.
+`open_server()` starts a PostgreSQL-compatible server process and returns an
+`OliphauntServer`. Use its connection string when `psql`, ORMs, or true
+independent client sessions matter.
 
 </Step>
 <Step>
@@ -146,9 +148,28 @@ implicit selectors. If you select `vector`, the generated artifacts include
 
 ### Back up and restore
 
-Use SDK backup and restore APIs instead of copying PostgreSQL directories from
-application code. The SDK validates formats, target roots, locks, and restore
-options before materializing data.
+Use `backup()` and static restore instead of copying PostgreSQL directories from
+application code. Direct and broker expose the one native physical archive;
+restore accepts a new or existing-empty destination. Server applications use
+normal PostgreSQL tooling.
+
+</Step>
+<Step>
+
+### Use logical tools
+
+Add the separate `oliphaunt-tools` crate when a server application needs plain
+`pg_dump` or non-interactive `psql`. Pass `server.connection_string()` to the
+tool; the core `oliphaunt` crate does not install or depend on client programs.
+
+```rust
+use oliphaunt_tools::{PgDumpOptions, pg_dump};
+
+let sql = pg_dump(
+    server.connection_string(),
+    PgDumpOptions::new().arg("--schema-only"),
+)?;
+```
 
 </Step>
 </Steps>
@@ -157,7 +178,7 @@ options before materializing data.
 
 ## Troubleshooting
 
-Check root locks, missing runtime assets, mode capability errors, extension
+Check storage ownership errors, missing runtime assets, unsupported-mode errors, extension
 selection errors, and SQLSTATE-bearing PostgreSQL errors. If concurrency looks
 surprising, confirm the selected mode first: direct mode serializes work by
 design, while independent sessions require server mode.

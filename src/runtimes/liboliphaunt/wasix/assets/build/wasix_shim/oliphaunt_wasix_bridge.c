@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <pwd.h>
 #include <setjmp.h>
@@ -41,9 +42,6 @@
 #define OLIPHAUNT_PROTOCOL_FD 1
 #define POSTGRES_MAIN_LONGJMP 100
 #define MAX_ATEXIT_FUNCS 32
-#ifdef OLIPHAUNT_WASIX_BACKEND_TIMING
-#define OLIPHAUNT_BACKEND_TIMING_MAX 104
-#endif
 
 volatile int is_oliphaunt_active = 0;
 volatile int force_host_error_recovery = 0;
@@ -58,10 +56,11 @@ extern const char *pg_encoding_to_char_private(int encoding);
 /*
  * Oliphaunt's libpq sources intentionally use private encoding symbols in the
  * embedded backend build so libpq does not leak a second copy of the encoding
- * table into the main module. A standalone WASIX pg_dump links the same static
- * libpq archive, whose connection path still expects libpq's public aliases.
- * Provide only those aliases here so pg_dump can use the normal static
- * libpgcommon archive without also pulling in libpgcommon_shlib.
+ * table into the main module. The standalone WASIX frontend tools link the
+ * same static libpq archive, whose connection path still expects libpq's
+ * public aliases. Provide only those aliases here so the tools can use the
+ * normal static libpgcommon archive without also pulling in
+ * libpgcommon_shlib.
  */
 int __attribute__((weak)) EMSCRIPTEN_KEEPALIVE
 pg_char_to_encoding(const char *name)
@@ -78,10 +77,14 @@ pg_encoding_to_char(int encoding)
 static unsigned char *oliphaunt_wasix_input_buf;
 static size_t oliphaunt_wasix_input_len;
 static size_t oliphaunt_wasix_input_off;
+static size_t oliphaunt_wasix_input_cap;
+static size_t oliphaunt_wasix_input_reserved;
 
 static unsigned char *oliphaunt_wasix_output_buf;
 static size_t oliphaunt_wasix_output_len_value;
 static size_t oliphaunt_wasix_output_cap;
+static size_t oliphaunt_wasix_output_scan_off;
+static bool oliphaunt_wasix_output_contains_error_value;
 enum
 {
 	OLIPHAUNT_WASIX_PROTOCOL_BUFFERED = 0,
@@ -97,6 +100,10 @@ enum
 };
 
 static int oliphaunt_wasix_protocol_transport;
+static int oliphaunt_wasix_protocol_fd = OLIPHAUNT_PROTOCOL_FD;
+static int oliphaunt_wasix_protocol_status_flags;
+static bool oliphaunt_wasix_direct_tool_active;
+static bool oliphaunt_wasix_direct_tool_read_permitted;
 static int oliphaunt_wasix_protocol_copy_state_value;
 static bool oliphaunt_wasix_protocol_stream_requested;
 static bool oliphaunt_wasix_protocol_stream_active_value;
@@ -104,15 +111,9 @@ static void (*atexit_funcs[MAX_ATEXIT_FUNCS])(void);
 static int atexit_func_count;
 
 int oliphaunt_wasix_set_protocol_transport(int mode);
+int oliphaunt_wasix_socket(int domain, int type, int protocol);
 ssize_t oliphaunt_wasix_recv(int fd, void *buf, size_t n, int flags);
 ssize_t oliphaunt_wasix_send(int fd, const void *buf, size_t n, int flags);
-
-int EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_set_protocol_stdio(int enabled)
-{
-	return oliphaunt_wasix_set_protocol_transport(enabled ? OLIPHAUNT_WASIX_PROTOCOL_STREAM
-											  : OLIPHAUNT_WASIX_PROTOCOL_BUFFERED);
-}
 
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_set_protocol_transport(int mode)
@@ -194,7 +195,7 @@ oliphaunt_wasix_longjmp(jmp_buf env, int val)
 	 */
 	if (is_oliphaunt_active &&
 		(force_host_error_recovery ||
-		 memcmp(env, (void *) postgresmain_sigjmp_buf, sizeof(jmp_buf)) == 0))
+		 env == (void *) postgresmain_sigjmp_buf))
 	{
 		exit(POSTGRES_MAIN_LONGJMP);
 	}
@@ -207,88 +208,27 @@ oliphaunt_wasix_siglongjmp(sigjmp_buf env, int val)
 	oliphaunt_wasix_longjmp(env, val);
 }
 
-#ifdef OLIPHAUNT_WASIX_BACKEND_TIMING
-static uint64_t oliphaunt_wasix_backend_timing_started_us[OLIPHAUNT_BACKEND_TIMING_MAX];
-static uint64_t oliphaunt_wasix_backend_timing_elapsed_us_value[OLIPHAUNT_BACKEND_TIMING_MAX];
-static bool oliphaunt_wasix_backend_timing_seen[OLIPHAUNT_BACKEND_TIMING_MAX];
-
-static uint64_t
-oliphaunt_wasix_monotonic_us(void)
-{
-	struct timespec ts;
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return ((uint64_t) ts.tv_sec * 1000000ULL) + ((uint64_t) ts.tv_nsec / 1000ULL);
-}
-
-void EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_backend_timing_reset(void)
-{
-	memset(oliphaunt_wasix_backend_timing_started_us, 0, sizeof(oliphaunt_wasix_backend_timing_started_us));
-	memset(oliphaunt_wasix_backend_timing_elapsed_us_value, 0, sizeof(oliphaunt_wasix_backend_timing_elapsed_us_value));
-	memset(oliphaunt_wasix_backend_timing_seen, 0, sizeof(oliphaunt_wasix_backend_timing_seen));
-}
-
-void EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_backend_timing_start(int id)
-{
-	if (id <= 0 || id >= OLIPHAUNT_BACKEND_TIMING_MAX)
-		return;
-	oliphaunt_wasix_backend_timing_started_us[id] = oliphaunt_wasix_monotonic_us();
-}
-
-void EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_backend_timing_end(int id)
-{
-	if (id <= 0 || id >= OLIPHAUNT_BACKEND_TIMING_MAX)
-		return;
-
-	uint64_t started = oliphaunt_wasix_backend_timing_started_us[id];
-	uint64_t ended = oliphaunt_wasix_monotonic_us();
-	if (started == 0 || ended < started)
-		return;
-
-	oliphaunt_wasix_backend_timing_elapsed_us_value[id] += ended - started;
-	oliphaunt_wasix_backend_timing_seen[id] = true;
-	oliphaunt_wasix_backend_timing_started_us[id] = 0;
-}
-
-void EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_backend_timing_add(int id, uint64_t value)
-{
-	if (id <= 0 || id >= OLIPHAUNT_BACKEND_TIMING_MAX)
-		return;
-
-	oliphaunt_wasix_backend_timing_elapsed_us_value[id] += value;
-	oliphaunt_wasix_backend_timing_seen[id] = true;
-}
-
-int64_t EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_backend_timing_elapsed_us(int id)
-{
-	if (id <= 0 || id >= OLIPHAUNT_BACKEND_TIMING_MAX || !oliphaunt_wasix_backend_timing_seen[id])
-		return -1;
-	return (int64_t) oliphaunt_wasix_backend_timing_elapsed_us_value[id];
-}
-#endif
-
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_input_reset(void)
 {
 	oliphaunt_wasix_input_len = 0;
 	oliphaunt_wasix_input_off = 0;
+	oliphaunt_wasix_input_reserved = 0;
 	return 0;
 }
 
-int EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_input_write(const void *buffer, size_t length)
+void *EMSCRIPTEN_KEEPALIVE
+oliphaunt_wasix_input_reserve(size_t length)
 {
-	if (length == 0)
-		return 0;
-	if (buffer == NULL)
+	if (length == 0 || oliphaunt_wasix_input_reserved != 0)
 	{
 		errno = EINVAL;
-		return -1;
+		return NULL;
+	}
+	if (length > INT_MAX || oliphaunt_wasix_input_len > (size_t) INT_MAX - length)
+	{
+		errno = EOVERFLOW;
+		return NULL;
 	}
 
 	if (oliphaunt_wasix_input_off == oliphaunt_wasix_input_len)
@@ -297,17 +237,48 @@ oliphaunt_wasix_input_write(const void *buffer, size_t length)
 		oliphaunt_wasix_input_off = 0;
 	}
 
-	size_t new_len = oliphaunt_wasix_input_len + length;
-	unsigned char *new_buf = realloc(oliphaunt_wasix_input_buf, new_len);
-	if (new_buf == NULL)
+	if (length > SIZE_MAX - oliphaunt_wasix_input_len)
 	{
-		errno = ENOMEM;
-		return -1;
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	size_t new_len = oliphaunt_wasix_input_len + length;
+	if (new_len > oliphaunt_wasix_input_cap)
+	{
+		size_t next_cap = oliphaunt_wasix_input_cap ? oliphaunt_wasix_input_cap : 8192;
+		while (next_cap < new_len)
+		{
+			if (next_cap > SIZE_MAX / 2)
+			{
+				next_cap = new_len;
+				break;
+			}
+			next_cap *= 2;
+		}
+		unsigned char *new_buf = realloc(oliphaunt_wasix_input_buf, next_cap);
+		if (new_buf == NULL)
+		{
+			errno = ENOMEM;
+			return NULL;
+		}
+		oliphaunt_wasix_input_buf = new_buf;
+		oliphaunt_wasix_input_cap = next_cap;
 	}
 
-	oliphaunt_wasix_input_buf = new_buf;
-	memcpy(oliphaunt_wasix_input_buf + oliphaunt_wasix_input_len, buffer, length);
-	oliphaunt_wasix_input_len = new_len;
+	oliphaunt_wasix_input_reserved = length;
+	return oliphaunt_wasix_input_buf + oliphaunt_wasix_input_len;
+}
+
+int EMSCRIPTEN_KEEPALIVE
+oliphaunt_wasix_input_commit(size_t length)
+{
+	if (length == 0 || length != oliphaunt_wasix_input_reserved)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	oliphaunt_wasix_input_len += length;
+	oliphaunt_wasix_input_reserved = 0;
 	return (int) length;
 }
 
@@ -368,6 +339,8 @@ int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_output_reset(void)
 {
 	oliphaunt_wasix_output_len_value = 0;
+	oliphaunt_wasix_output_scan_off = 0;
+	oliphaunt_wasix_output_contains_error_value = false;
 	oliphaunt_wasix_protocol_copy_state_value = OLIPHAUNT_WASIX_PROTOCOL_COPY_NONE;
 	oliphaunt_wasix_protocol_stream_requested = false;
 	return 0;
@@ -379,17 +352,38 @@ oliphaunt_wasix_output_len(void)
 	return oliphaunt_wasix_output_len_value;
 }
 
-size_t EMSCRIPTEN_KEEPALIVE
-oliphaunt_wasix_output_read(void *buffer, size_t max_length)
+const void *EMSCRIPTEN_KEEPALIVE
+oliphaunt_wasix_output_data(void)
 {
-	if (buffer == NULL || max_length == 0 || oliphaunt_wasix_output_len_value == 0)
-		return 0;
+	return oliphaunt_wasix_output_buf;
+}
 
-	size_t to_copy = oliphaunt_wasix_output_len_value < max_length
-		? oliphaunt_wasix_output_len_value
-		: max_length;
-	memcpy(buffer, oliphaunt_wasix_output_buf, to_copy);
-	return to_copy;
+int EMSCRIPTEN_KEEPALIVE
+oliphaunt_wasix_output_contains_error(void)
+{
+	return oliphaunt_wasix_output_contains_error_value ? 1 : 0;
+}
+
+static void
+oliphaunt_wasix_scan_buffered_output(void)
+{
+	while (oliphaunt_wasix_output_scan_off + 5 <= oliphaunt_wasix_output_len_value)
+	{
+		const unsigned char *message =
+			oliphaunt_wasix_output_buf + oliphaunt_wasix_output_scan_off;
+		size_t body_len = ((size_t) message[1] << 24) |
+			((size_t) message[2] << 16) |
+			((size_t) message[3] << 8) |
+			(size_t) message[4];
+		if (body_len < 4 || body_len > SIZE_MAX - 1)
+			return;
+		size_t message_len = body_len + 1;
+		if (message_len > oliphaunt_wasix_output_len_value - oliphaunt_wasix_output_scan_off)
+			return;
+		if (message[0] == 'E')
+			oliphaunt_wasix_output_contains_error_value = true;
+		oliphaunt_wasix_output_scan_off += message_len;
+	}
 }
 
 static ssize_t
@@ -403,12 +397,25 @@ oliphaunt_wasix_buffer_write(const void *buffer, size_t length)
 		return -1;
 	}
 
+	if (length > INT_MAX || oliphaunt_wasix_output_len_value > (size_t) INT_MAX - length)
+	{
+		errno = EOVERFLOW;
+		return -1;
+	}
+
 	size_t required = oliphaunt_wasix_output_len_value + length;
 	if (required > oliphaunt_wasix_output_cap)
 	{
 		size_t next_cap = oliphaunt_wasix_output_cap ? oliphaunt_wasix_output_cap : 8192;
 		while (next_cap < required)
+		{
+			if (next_cap > SIZE_MAX / 2)
+			{
+				next_cap = required;
+				break;
+			}
 			next_cap *= 2;
+		}
 		unsigned char *new_buf = realloc(oliphaunt_wasix_output_buf, next_cap);
 		if (new_buf == NULL)
 		{
@@ -421,6 +428,7 @@ oliphaunt_wasix_buffer_write(const void *buffer, size_t length)
 
 	memcpy(oliphaunt_wasix_output_buf + oliphaunt_wasix_output_len_value, buffer, length);
 	oliphaunt_wasix_output_len_value += length;
+	oliphaunt_wasix_scan_buffered_output();
 	if (oliphaunt_wasix_protocol_transport == OLIPHAUNT_WASIX_PROTOCOL_HYBRID &&
 		oliphaunt_wasix_protocol_stream_requested)
 	{
@@ -436,14 +444,14 @@ ssize_t
 oliphaunt_wasix_host_read(void *context, void *buffer, size_t max_length)
 {
 	(void) context;
-	return oliphaunt_wasix_recv(OLIPHAUNT_PROTOCOL_FD, buffer, max_length, 0);
+	return oliphaunt_wasix_recv(oliphaunt_wasix_protocol_fd, buffer, max_length, 0);
 }
 
 ssize_t
 oliphaunt_wasix_host_write(void *context, const void *buffer, size_t length)
 {
 	(void) context;
-	return oliphaunt_wasix_send(OLIPHAUNT_PROTOCOL_FD, buffer, length, 0);
+	return oliphaunt_wasix_send(oliphaunt_wasix_protocol_fd, buffer, length, 0);
 }
 
 int EMSCRIPTEN_KEEPALIVE
@@ -697,13 +705,13 @@ oliphaunt_wasix_fcntl(int fd, int cmd, ...)
 	{
 #ifdef F_GETFL
 		case F_GETFL:
-			if (fd == OLIPHAUNT_PROTOCOL_FD)
-				return 0;
+			if (fd == oliphaunt_wasix_protocol_fd)
+				return oliphaunt_wasix_protocol_status_flags;
 			return fcntl(fd, cmd);
 #endif
 #ifdef F_GETFD
 		case F_GETFD:
-			if (fd == OLIPHAUNT_PROTOCOL_FD)
+			if (fd == oliphaunt_wasix_protocol_fd)
 				return 0;
 			return fcntl(fd, cmd);
 #endif
@@ -712,11 +720,14 @@ oliphaunt_wasix_fcntl(int fd, int cmd, ...)
 			va_start(args, cmd);
 			arg = va_arg(args, long);
 			va_end(args);
-			if (fd == OLIPHAUNT_PROTOCOL_FD)
+			if (fd == oliphaunt_wasix_protocol_fd)
 			{
 #ifdef O_NONBLOCK
 				if ((arg & ~((long) O_NONBLOCK)) == 0)
+				{
+					oliphaunt_wasix_protocol_status_flags = (int) arg;
 					return 0;
+				}
 #else
 				if (arg == 0)
 					return 0;
@@ -731,7 +742,7 @@ oliphaunt_wasix_fcntl(int fd, int cmd, ...)
 			va_start(args, cmd);
 			arg = va_arg(args, long);
 			va_end(args);
-			if (fd == OLIPHAUNT_PROTOCOL_FD)
+			if (fd == oliphaunt_wasix_protocol_fd)
 			{
 #ifdef FD_CLOEXEC
 				if ((arg & ~((long) FD_CLOEXEC)) == 0)
@@ -767,7 +778,7 @@ oliphaunt_wasix_write_int_sockopt(void *optval, socklen_t *optlen, int value)
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
 {
-	if (fd != OLIPHAUNT_PROTOCOL_FD)
+	if (fd != oliphaunt_wasix_protocol_fd)
 		return setsockopt(fd, level, optname, optval, optlen);
 
 	if (optval == NULL && optlen != 0)
@@ -833,7 +844,7 @@ oliphaunt_wasix_setsockopt(int fd, int level, int optname, const void *optval, s
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen)
 {
-	if (fd != OLIPHAUNT_PROTOCOL_FD)
+	if (fd != oliphaunt_wasix_protocol_fd)
 		return getsockopt(fd, level, optname, optval, optlen);
 
 	if (level == SOL_SOCKET)
@@ -890,7 +901,7 @@ oliphaunt_wasix_getsockopt(int fd, int level, int optname, void *optval, socklen
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_getsockname(int fd, struct sockaddr *addr, socklen_t *len)
 {
-	if (fd != OLIPHAUNT_PROTOCOL_FD)
+	if (fd != oliphaunt_wasix_protocol_fd)
 		return getsockname(fd, addr, len);
 
 	if (addr == NULL || len == NULL || *len < (socklen_t) sizeof(sa_family_t))
@@ -908,13 +919,20 @@ oliphaunt_wasix_getsockname(int fd, struct sockaddr *addr, socklen_t *len)
 ssize_t EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_recv(int fd, void *buf, size_t n, int flags)
 {
-	if (fd != OLIPHAUNT_PROTOCOL_FD)
+	if (fd != oliphaunt_wasix_protocol_fd)
 		return recv(fd, buf, n, flags);
 	if (oliphaunt_wasix_protocol_transport == OLIPHAUNT_WASIX_PROTOCOL_STREAM ||
 		oliphaunt_wasix_protocol_stream_active_value)
 	{
 		(void) flags;
-		return read(STDIN_FILENO, buf, n);
+		if (oliphaunt_wasix_direct_tool_active &&
+			!oliphaunt_wasix_direct_tool_read_permitted)
+		{
+			errno = EAGAIN;
+			return -1;
+		}
+		oliphaunt_wasix_direct_tool_read_permitted = false;
+		return read(oliphaunt_wasix_direct_tool_active ? fd : STDIN_FILENO, buf, n);
 	}
 	return oliphaunt_wasix_buffer_read(buf, n);
 }
@@ -922,21 +940,61 @@ oliphaunt_wasix_recv(int fd, void *buf, size_t n, int flags)
 ssize_t EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_send(int fd, const void *buf, size_t n, int flags)
 {
-	if (fd != OLIPHAUNT_PROTOCOL_FD)
+	if (fd != oliphaunt_wasix_protocol_fd)
 		return send(fd, buf, n, flags);
 	if (oliphaunt_wasix_protocol_transport == OLIPHAUNT_WASIX_PROTOCOL_STREAM ||
 		oliphaunt_wasix_protocol_stream_active_value)
 	{
 		(void) flags;
-		return write(STDOUT_FILENO, buf, n);
+		return write(oliphaunt_wasix_direct_tool_active ? fd : STDOUT_FILENO, buf, n);
 	}
 	return oliphaunt_wasix_buffer_write(buf, n);
+}
+
+static const char *
+oliphaunt_wasix_direct_tool_path(void)
+{
+	const char *value = getenv("OLIPHAUNT_DIRECT_PGWIRE");
+	return value != NULL && value[0] != '\0' ? value : NULL;
+}
+
+int EMSCRIPTEN_KEEPALIVE
+oliphaunt_wasix_socket(int domain, int type, int protocol)
+{
+	const char *path = oliphaunt_wasix_direct_tool_path();
+	if (path == NULL)
+		return socket(domain, type, protocol);
+
+	/*
+	 * Direct tools use a private full-duplex virtual file. Claim the descriptor
+	 * here, before libpq configures it with fcntl and socket options, while
+	 * leaving the tool's standard streams available for normal PostgreSQL I/O.
+	 */
+	int fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+
+	oliphaunt_wasix_protocol_fd = fd;
+	oliphaunt_wasix_protocol_status_flags = 0;
+	oliphaunt_wasix_direct_tool_active = true;
+	oliphaunt_wasix_direct_tool_read_permitted = false;
+	return fd;
 }
 
 int EMSCRIPTEN_KEEPALIVE
 oliphaunt_wasix_connect(int socket, const struct sockaddr *address, socklen_t address_len)
 {
-	if (socket != OLIPHAUNT_PROTOCOL_FD)
+	if (oliphaunt_wasix_direct_tool_path() != NULL)
+	{
+		oliphaunt_wasix_protocol_fd = socket;
+		oliphaunt_wasix_protocol_status_flags = 0;
+		oliphaunt_wasix_direct_tool_active = true;
+		oliphaunt_wasix_direct_tool_read_permitted = false;
+		oliphaunt_wasix_protocol_transport = OLIPHAUNT_WASIX_PROTOCOL_STREAM;
+		oliphaunt_wasix_protocol_stream_active_value = true;
+		return 0;
+	}
+	if (socket != oliphaunt_wasix_protocol_fd)
 		return connect(socket, address, address_len);
 	errno = ENOSYS;
 	return -1;
@@ -950,7 +1008,7 @@ oliphaunt_wasix_poll(struct pollfd fds[], nfds_t nfds, int timeout)
 
 	for (nfds_t i = 0; i < nfds; i++)
 	{
-		if (fds[i].fd == OLIPHAUNT_PROTOCOL_FD)
+		if (fds[i].fd == oliphaunt_wasix_protocol_fd)
 		{
 			has_protocol_fd = true;
 			break;
@@ -963,7 +1021,7 @@ oliphaunt_wasix_poll(struct pollfd fds[], nfds_t nfds, int timeout)
 	for (nfds_t i = 0; i < nfds; i++)
 	{
 		fds[i].revents = 0;
-		if (fds[i].fd != OLIPHAUNT_PROTOCOL_FD)
+		if (fds[i].fd != oliphaunt_wasix_protocol_fd)
 		{
 			struct pollfd one = fds[i];
 			int rc = poll(&one, 1, 0);
@@ -977,6 +1035,26 @@ oliphaunt_wasix_poll(struct pollfd fds[], nfds_t nfds, int timeout)
 		if (oliphaunt_wasix_protocol_transport == OLIPHAUNT_WASIX_PROTOCOL_STREAM ||
 			oliphaunt_wasix_protocol_stream_active_value)
 		{
+			if (oliphaunt_wasix_direct_tool_active)
+			{
+				/*
+				 * The synthetic socket writes to stdout immediately. The generic
+				 * Wasmer stdio pipe does not reliably wake poll(2), so a blocking
+				 * libpq read wait is made readable and the following recv(2) blocks
+				 * on stdin itself. Zero-timeout readiness probes must remain false:
+				 * claiming those are readable makes libpq perform an opportunistic
+				 * recv with no protocol response pending and deadlocks the tool.
+				 */
+				fds[i].revents = fds[i].events & POLLOUT;
+				if ((fds[i].events & POLLIN) && timeout != 0)
+				{
+					fds[i].revents |= POLLIN;
+					oliphaunt_wasix_direct_tool_read_permitted = true;
+				}
+				if (fds[i].revents)
+					ready++;
+				continue;
+			}
 			struct pollfd one;
 			int rc;
 

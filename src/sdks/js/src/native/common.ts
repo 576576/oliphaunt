@@ -1,30 +1,19 @@
-import type { BackupFormat } from '../types.js';
-
-export const ABI_VERSION = 6;
-export const INIT_OPTIONS_ABI_VERSION = 1;
-export const RESTORE_REPLACE_EXISTING = 1n;
+export const ABI_VERSION = 8;
 export const LIBOLIPHAUNT_RUNTIME_DIR_ENV = 'OLIPHAUNT_RUNTIME_DIR';
 export const OLIPHAUNT_ICU_DATA_DIR_ENV = 'OLIPHAUNT_ICU_DATA_DIR';
 export const ICU_DATA_ENV = 'ICU_DATA';
 export const OLIPHAUNT_EMBEDDED_MODULE_DIR_ENV = 'OLIPHAUNT_EMBEDDED_MODULE_DIR';
-
-export const CAP_PROTOCOL_RAW = 1n << 0n;
-export const CAP_PROTOCOL_STREAM = 1n << 1n;
-export const CAP_MULTI_INSTANCE = 1n << 2n;
-export const CAP_SERVER_MODE = 1n << 3n;
-export const CAP_EXTENSIONS = 1n << 4n;
-export const CAP_QUERY_CANCEL = 1n << 5n;
-export const CAP_BACKUP_RESTORE = 1n << 6n;
-export const CAP_SIMPLE_QUERY = 1n << 7n;
-export const CAP_LOGICAL_REOPEN = 1n << 9n;
+export const INTERNAL_NATIVE_POSTGRES_ENVIRONMENT = [
+  'OLIPHAUNT_INTERNAL_ICU_READY',
+  'OLIPHAUNT_INTERNAL_SKIP_ICU_DISCOVERY',
+  'OLIPHAUNT_INTERNAL_SKIP_SYSTEM_COLLATION_DISCOVERY',
+] as const;
 
 export type NativePackageTarget = {
   id: string;
   packageName: string;
   libraryRelativePath: string;
   runtimeRelativePath: string;
-  toolsPackageName: string;
-  toolsRuntimeRelativePath: string;
 };
 
 export function resolveLibraryPath(libraryPath?: string): string {
@@ -65,6 +54,20 @@ export function applyNativeIcuDataEnvironment(icuDataDirectory?: string): void {
   }
   if (icuDataDirectory.includes('\0')) {
     throw new Error(`${OLIPHAUNT_ICU_DATA_DIR_ENV} must not contain NUL bytes`);
+  }
+  setRuntimeEnvironment(OLIPHAUNT_ICU_DATA_DIR_ENV, icuDataDirectory);
+  setRuntimeEnvironment(ICU_DATA_ENV, icuDataDirectory);
+}
+
+/** Replace ambient ICU selection with one exact resolved runtime closure. */
+export function replaceNativeIcuDataEnvironment(icuDataDirectory?: string): void {
+  if (icuDataDirectory === undefined) {
+    unsetRuntimeEnvironment(OLIPHAUNT_ICU_DATA_DIR_ENV);
+    unsetRuntimeEnvironment(ICU_DATA_ENV);
+    return;
+  }
+  if (icuDataDirectory.trim().length === 0 || icuDataDirectory.includes('\0')) {
+    throw new Error(`${OLIPHAUNT_ICU_DATA_DIR_ENV} must be a nonempty path without NUL bytes`);
   }
   setRuntimeEnvironment(OLIPHAUNT_ICU_DATA_DIR_ENV, icuDataDirectory);
   setRuntimeEnvironment(ICU_DATA_ENV, icuDataDirectory);
@@ -115,8 +118,6 @@ export function liboliphauntPackageTarget(
       packageName: '@oliphaunt/liboliphaunt-darwin-arm64',
       libraryRelativePath: 'lib/liboliphaunt.dylib',
       runtimeRelativePath: 'runtime',
-      toolsPackageName: '@oliphaunt/tools-darwin-arm64',
-      toolsRuntimeRelativePath: 'runtime',
     };
   }
   if (normalizedPlatform === 'linux' && normalizedArch === 'x64') {
@@ -125,8 +126,6 @@ export function liboliphauntPackageTarget(
       packageName: '@oliphaunt/liboliphaunt-linux-x64-gnu',
       libraryRelativePath: 'lib/liboliphaunt.so',
       runtimeRelativePath: 'runtime',
-      toolsPackageName: '@oliphaunt/tools-linux-x64-gnu',
-      toolsRuntimeRelativePath: 'runtime',
     };
   }
   if (normalizedPlatform === 'linux' && normalizedArch === 'arm64') {
@@ -135,8 +134,6 @@ export function liboliphauntPackageTarget(
       packageName: '@oliphaunt/liboliphaunt-linux-arm64-gnu',
       libraryRelativePath: 'lib/liboliphaunt.so',
       runtimeRelativePath: 'runtime',
-      toolsPackageName: '@oliphaunt/tools-linux-arm64-gnu',
-      toolsRuntimeRelativePath: 'runtime',
     };
   }
   if (normalizedPlatform === 'windows' && normalizedArch === 'x64') {
@@ -145,30 +142,11 @@ export function liboliphauntPackageTarget(
       packageName: '@oliphaunt/liboliphaunt-win32-x64-msvc',
       libraryRelativePath: 'bin/oliphaunt.dll',
       runtimeRelativePath: 'runtime',
-      toolsPackageName: '@oliphaunt/tools-win32-x64-msvc',
-      toolsRuntimeRelativePath: 'runtime',
     };
   }
   throw new Error(
     `no liboliphaunt package is defined for ${platform}/${architecture}; pass libraryPath and runtimeDirectory explicitly for this platform`,
   );
-}
-
-export function nativeBackupFormat(format: BackupFormat): number {
-  switch (format) {
-    case 'physicalArchive':
-      return 2;
-    case 'sql':
-      return 1;
-    case 'oliphauntArchive':
-      return 3;
-  }
-}
-
-export function assertSupportedDirectBackupFormat(format: BackupFormat): void {
-  if (format !== 'physicalArchive') {
-    throw new Error(`${format} backup is not supported by nativeDirect`);
-  }
 }
 
 export function errorMessage(prefix: string, status: number, lastError?: string | null): Error {
@@ -195,7 +173,11 @@ function setRuntimeEnvironment(name: string, value: string): void {
     processEnv[name] = value;
     return;
   }
-  const deno = (globalThis as { Deno?: { env?: { set(name: string, value: string): void } } }).Deno;
+  const deno = (
+    globalThis as {
+      Deno?: { env?: { set(name: string, value: string): void } };
+    }
+  ).Deno;
   if (deno?.env?.set === undefined) {
     throw new Error(
       `cannot set ${name}; this JavaScript runtime does not expose process.env or Deno.env`,
@@ -209,6 +191,24 @@ function setRuntimeEnvironment(name: string, value: string): void {
       {
         cause: error,
       },
+    );
+  }
+}
+
+function unsetRuntimeEnvironment(name: string): void {
+  const processEnv = globalThis.process?.env;
+  if (processEnv !== undefined) {
+    delete processEnv[name];
+    return;
+  }
+  const deno = (globalThis as { Deno?: { env?: { delete(name: string): void } } }).Deno;
+  if (deno?.env?.delete === undefined) return;
+  try {
+    deno.env.delete(name);
+  } catch (error) {
+    throw new Error(
+      `cannot clear ${name}; grant environment-write permission for native runtime data`,
+      { cause: error },
     );
   }
 }

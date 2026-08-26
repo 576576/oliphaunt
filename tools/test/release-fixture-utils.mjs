@@ -37,6 +37,10 @@ export async function writeEntriesArchive(output, entries, modes = {}) {
       left.localeCompare(right),
     )) {
       const file = path.join(stage, ...name.split('/'));
+      if (name.endsWith('/')) {
+        await fs.mkdir(file, { recursive: true });
+        continue;
+      }
       await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.writeFile(file, data);
       await fs.chmod(file, modes[name] ?? 0o644);
@@ -261,12 +265,7 @@ export function windowsImportLibraryFixture({
   objectMachine = 0x8664,
   symbol,
   importSymbols = symbol === undefined
-    ? [
-        'oliphaunt_close_if_generation',
-        'oliphaunt_init',
-        'oliphaunt_init_ex',
-        'oliphaunt_logical_generation',
-      ]
+    ? ['oliphaunt_close_if_generation', 'oliphaunt_init', 'oliphaunt_logical_generation']
     : [symbol],
 } = {}) {
   if (!Array.isArray(importSymbols) || importSymbols.length === 0) {

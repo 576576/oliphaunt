@@ -393,8 +393,8 @@ function sdkRows(sdkManifest) {
 
 function generateSdkMatrix(sdkManifest) {
   const rows = sdkRows(sdkManifest).map(([id, sdk]) => {
-    const modes = (sdk.available_modes ?? []).join(', ');
-    return `| ${escapeMarkdown(id)} | ${escapeMarkdown(sdk.package_identity)} | ${escapeMarkdown((sdk.supported_consumer_targets ?? []).join(', '))} | ${escapeMarkdown((sdk.planned_consumer_targets ?? []).join(', ') || 'none')} | ${escapeMarkdown(sdk.runtime_boundary)} | ${escapeMarkdown(modes)} |`;
+    const modes = (sdk.execution_modes ?? []).join(', ');
+    return `| ${escapeMarkdown(id)} | ${escapeMarkdown(sdk.package_identity)} | ${escapeMarkdown((sdk.consumer_targets ?? []).join(', '))} | ${escapeMarkdown(sdk.runtime_boundary)} | ${escapeMarkdown(modes)} |`;
   });
   return `---
 title: SDK Matrix
@@ -402,18 +402,18 @@ title: SDK Matrix
 
 # SDK Matrix
 
-Use this matrix to compare registry-qualified package identities, supported and
-planned consumer targets, runtime boundaries, and advertised modes.
+Use this matrix to compare registry-qualified package identities, supported
+consumer targets, runtime boundaries, and advertised modes.
 
-| SDK | Package identity | Supported targets | Planned targets | Runtime boundary | Advertised modes |
-| --- | --- | --- | --- | --- | --- |
+| SDK | Package identity | Supported targets | Runtime boundary | Advertised modes |
+| --- | --- | --- | --- | --- |
 ${rows.join('\n')}
 `;
 }
 
 function generatePlatformMatrix(sdkManifest) {
   const rows = sdkRows(sdkManifest).flatMap(([id, sdk]) =>
-    (sdk.supported_consumer_targets ?? []).map(
+    (sdk.consumer_targets ?? []).map(
       (target) =>
         `| ${escapeMarkdown(target)} | ${escapeMarkdown(id)} | ${escapeMarkdown(sdk.package_identity)} |`,
     ),
@@ -439,10 +439,6 @@ function generateExtensionCatalog() {
   }
   const catalog = JSON.parse(readText(catalogPath));
   const rows = (catalog.extensions ?? [])
-    .filter((extension) => {
-      const promotion = extension.promotion ?? {};
-      return promotion.stable && promotion.packaged && promotion.promoted;
-    })
     .sort((left, right) =>
       String(left['sql-name'] ?? left.id).localeCompare(String(right['sql-name'] ?? right.id)),
     )
@@ -457,7 +453,7 @@ title: Extension Catalog
 # Extension Catalog
 
 Use this table to find exact SQL extension names. SDK and app packaging
-selection uses the SQL extension name. The table shows stable packaged
+selection uses the SQL extension name. Every listed extension is supported
 extensions only.
 
 | SQL extension | Display name | Version | Family | Activation |
@@ -583,12 +579,20 @@ function staticArtifactPlan(record) {
         label: 'Open TypeDoc reference',
       },
     ],
-    'oliphaunt-wasix': [
+    'oliphaunt-wasix-rust': [
       {
-        source: 'target/docs/generated/api/wasm/doc',
-        destination: 'wasm/doc',
-        href: apiArtifactHref('wasm/doc/oliphaunt_wasix/index.html'),
-        label: 'Open WASM rustdoc',
+        source: 'target/docs/generated/api/wasix-rust/doc',
+        destination: 'wasix-rust/doc',
+        href: apiArtifactHref('wasix-rust/doc/oliphaunt_wasix/index.html'),
+        label: 'Open Rust WASIX rustdoc',
+      },
+    ],
+    'oliphaunt-wasix-typescript': [
+      {
+        source: 'target/docs/generated/api/wasix-typescript/html',
+        destination: 'wasix-typescript/html',
+        href: apiArtifactHref('wasix-typescript/html/index.html'),
+        label: 'Open WASIX TypeScript TypeDoc reference',
       },
     ],
   };
@@ -645,20 +649,20 @@ title: API Reference
 
 Use this page when you know the SDK and need the API surface by task. SDK guides
 show the first integration path. These maps point to the language reference for
-configuration, query results, lifecycle, extension selection, backup and
-restore, and error handling.
+configuration, query results, lifecycle, extension selection, data movement
+where exposed, and error handling. Shared concepts do not imply API parity.
 
 ## Choose By Task
 
 | Task | Look for |
 | --- | --- |
-| Open a database | builder or open configuration, root storage, runtime mode, durability |
+| Open a database | builder or open configuration, storage, runtime host or mode, durability |
 | Run SQL | query, execute, parameters, row access, result typing |
-| Use raw protocol | raw bytes, streaming, response ownership, cancellation |
-| Manage lifecycle | close, background, foreground, cancellation, capability checks |
-| Move data | backup, restore, dump, archive validation |
-| Ship extensions | exact SQL extension names, dependency files, artifact reports |
-| Handle errors | SDK errors, PostgreSQL SQLSTATE data, capability errors |
+| Use raw protocol | owned buffered bytes and response ownership |
+| Manage lifecycle | close, checkpoint, and cancellation where exposed |
+| Move data | backup, restore, dump, checkpoint, or archive APIs where exposed |
+| Ship extensions | exact ecosystem-native selectors, dependency files, artifact reports |
+| Handle errors | SDK errors, PostgreSQL SQLSTATE data, and runtime errors |
 
 ## Language References
 
@@ -696,7 +700,8 @@ function apiReferenceFileName(record) {
     'oliphaunt-kotlin': 'kotlin',
     'oliphaunt-react-native': 'react-native',
     'oliphaunt-js': 'typescript',
-    'oliphaunt-wasix': 'wasm',
+    'oliphaunt-wasix-rust': 'wasix-rust',
+    'oliphaunt-wasix-typescript': 'wasix-typescript',
   };
   return names[record.id] ?? record.id;
 }
@@ -863,7 +868,7 @@ const routePresentation = {
     collapsible: false,
   },
   sdk: {
-    description: 'Choose Rust, Swift, Kotlin, React Native, TypeScript, WASM, or the C ABI.',
+    description: 'Choose a native SDK, Rust WASIX, WASIX TypeScript, or the C ABI.',
     icon: 'PackageCheck',
     defaultOpen: false,
   },
@@ -902,8 +907,12 @@ const routePresentation = {
     description: 'TypeScript SDK for Node.js, Bun, and Deno.',
     icon: 'Braces',
   },
-  'oliphaunt-wasix': {
-    description: 'First-class WASM/WASIX runtime family and dump/restore flows.',
+  'oliphaunt-wasix-rust': {
+    description: 'Rust SDK for the portable WASIX runtime.',
+    icon: 'Boxes',
+  },
+  'oliphaunt-wasix-typescript': {
+    description: 'Portable TypeScript SDK for browsers, Node.js, Bun, and Deno.',
     icon: 'Boxes',
   },
 };
@@ -1019,7 +1028,7 @@ function writeFumadocsMeta(manifest) {
   writeJson(path.join(siteDocsRoot, 'meta.json'), {
     title: 'Oliphaunt',
     description:
-      'Embedded PostgreSQL SDK documentation for native, mobile, desktop, React Native, TypeScript, and WASM apps.',
+      'Embedded PostgreSQL SDK documentation for native, Rust WASIX, and WASIX TypeScript apps.',
     pages: ['start', 'sdk', 'learn', 'reference'],
   });
   for (const route of manifest.routes ?? []) {
@@ -1067,7 +1076,7 @@ function writeLlmFiles(routeRecords) {
   const summary = [
     '# Oliphaunt Docs',
     '',
-    'Oliphaunt is embedded PostgreSQL for native, mobile, desktop, React Native, TypeScript, and WASM apps.',
+    'Oliphaunt is embedded PostgreSQL for native, Rust WASIX, and WASIX TypeScript apps.',
     '',
     '## Public routes',
     ...routeRecords.map((record) => `- ${record.title}: ${record.route}`),

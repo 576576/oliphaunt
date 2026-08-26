@@ -7,7 +7,7 @@ description: Understand the latency, throughput, memory, package-size, and SQLit
 
 Oliphaunt is designed for app-embedded PostgreSQL. Performance work focuses on
 the operations developers feel in production apps: open time, simple-query
-latency, transaction throughput, bulk load speed, large result streaming,
+latency, transaction throughput, bulk load speed, large result transfer,
 backup/restore time, memory footprint, and packaged app size.
 
 <PerformanceResultsGrid />
@@ -23,12 +23,12 @@ Use performance numbers in context:
 | Query latency | UI responsiveness for small reads and writes |
 | Transaction throughput | Sync, import, and local-first write workloads |
 | Bulk load | Initial dataset import and cache hydration |
-| Large result streaming | Reports, sync scans, and export flows |
+| Large result transfer | Reports, sync scans, and export flows |
 | Backup and restore | User data migration and support workflows |
 | RSS and package size | Mobile distribution and desktop app footprint |
 
 Native direct mode is the lowest-latency embedded path. Broker mode adds
-an IPC boundary in exchange for process isolation and multi-root management.
+an IPC boundary in exchange for process isolation and multi-instance management.
 Server mode is the right choice when an app needs real PostgreSQL client
 connections, tools, pools, or ORMs.
 
@@ -38,7 +38,7 @@ Compare each mode against the problem it solves:
 
 - Use direct mode when one embedded database session is enough and latency is
   the primary concern.
-- Use broker mode when crash isolation, recovery, upgrades, or multiple roots
+- Use broker mode when crash isolation, recovery, upgrades, or multiple instances
   are more important than the last microseconds of latency.
 - Use server mode when independent PostgreSQL clients are part of the product.
 

@@ -1,12 +1,12 @@
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { createServer } from 'node:net';
 
 import type { NormalizedOpenConfig } from '../config.js';
+import type { ServerListen } from '../types.js';
 import { simpleQuery } from '../protocol.js';
-import type { BackupFormat, EngineCapabilities, EngineModeSupport } from '../types.js';
 import { envVar } from '../native/common.js';
 import {
   connectEndpoint,
@@ -16,14 +16,18 @@ import {
   type LocalEndpoint,
   type ManagedChild,
 } from './node-adapter.js';
-import { createPhysicalArchive } from './physical-archive.js';
 import { PostgresWireClient } from './pgwire.js';
+import {
+  initializeNativePgdata,
+  nativeInitdbArgs,
+  nativePostgresChildEnvironment,
+} from '../native/initialize.js';
 import type { RuntimeBinding, RuntimeHandle } from './types.js';
 import {
   materializeNodeExtensionInstall,
-  resolveNodeIcuDataDirectory,
   resolveNodeNativeInstall,
 } from '../native/assets-node.js';
+import { resolveExactNativeRuntimeProfile } from '../native/runtime-profile.js';
 
 const SERVER_HOST = '127.0.0.1';
 const SERVER_STARTUP_TIMEOUT_MS_ENV = 'OLIPHAUNT_SERVER_STARTUP_TIMEOUT_MS';
@@ -36,24 +40,19 @@ type ServerTools = {
   executable: string;
   toolDirectory: string;
   icuDataDirectory?: string;
+  catalogProfile: 'standard' | 'icu';
 };
 
 export function createServerRuntimeBinding(): RuntimeBinding {
   return {
-    runtime: runtimeName(),
-    rawProtocolTransport: 'server-wire',
-    protocolStream: true,
-    capabilities(handle: RuntimeHandle): EngineCapabilities {
-      return asServerHandle(handle).capabilities();
+    connectionString(handle: RuntimeHandle): string {
+      return asServerHandle(handle).connectionString;
     },
     async open(config: NormalizedOpenConfig): Promise<ServerHandle> {
       return openServer(config);
     },
     execProtocolRaw(handle: RuntimeHandle, request: Uint8Array): Promise<Uint8Array> {
       return asServerHandle(handle).execProtocolRaw(request);
-    },
-    execSimpleQuery(handle: RuntimeHandle, sql: string): Promise<Uint8Array> {
-      return asServerHandle(handle).execProtocolRaw(simpleQuery(sql));
     },
     execProtocolStream(
       handle: RuntimeHandle,
@@ -62,8 +61,8 @@ export function createServerRuntimeBinding(): RuntimeBinding {
     ): Promise<void> {
       return asServerHandle(handle).execProtocolStream(request, onChunk);
     },
-    backup(handle: RuntimeHandle, format: BackupFormat): Promise<Uint8Array> {
-      return asServerHandle(handle).backup(format);
+    execSimpleQuery(handle: RuntimeHandle, sql: string): Promise<Uint8Array> {
+      return asServerHandle(handle).execProtocolRaw(simpleQuery(sql));
     },
     cancel(handle: RuntimeHandle): Promise<void> {
       return asServerHandle(handle).cancel();
@@ -74,70 +73,20 @@ export function createServerRuntimeBinding(): RuntimeBinding {
   };
 }
 
-export async function serverModeSupport(options: {
-  serverExecutable?: string;
-  serverToolDirectory?: string;
-}): Promise<EngineModeSupport> {
-  const capabilities = serverCapabilities(32);
-  try {
-    await resolveServerTools(options);
-    return { engine: 'nativeServer', available: true, capabilities };
-  } catch (error) {
-    return {
-      engine: 'nativeServer',
-      available: false,
-      capabilities,
-      unavailableReason: `native server executable is unavailable: ${errorString(error)}`,
-    };
-  }
-}
-
-export function serverCapabilities(
-  maxClientSessions: number,
-  connectionString?: string,
-): EngineCapabilities {
-  return {
-    engine: 'nativeServer',
-    processIsolated: true,
-    multiRoot: false,
-    reopenable: true,
-    sameRootLogicalReopen: false,
-    rootSwitchable: true,
-    crashRestartable: false,
-    independentSessions: true,
-    maxClientSessions,
-    protocolRaw: true,
-    protocolStream: true,
-    queryCancel: true,
-    backupRestore: true,
-    backupFormats: ['sql', 'physicalArchive'],
-    restoreFormats: ['physicalArchive'],
-    simpleQuery: true,
-    extensions: true,
-    connectionString,
-    rawProtocolTransport: 'server-wire',
-  };
-}
-
 class ServerHandle {
   #closed = false;
 
   constructor(
     readonly child: ManagedChild,
     readonly client: PostgresWireClient,
-    readonly root: string,
+    readonly instanceDirectory: string,
     readonly pgdata: string,
-    readonly pgCtl: string | undefined,
-    readonly pgDump: string | undefined,
-    readonly socketDir: string | undefined,
+    readonly pgCtl: string,
+    readonly toolEnvironment: Record<string, string>,
+    readonly ownedSocketDir: string | undefined,
     readonly connectionString: string,
-    readonly maxClientSessions: number,
-    readonly temporary: boolean,
+    readonly temporaryDirectory: boolean,
   ) {}
-
-  capabilities(): EngineCapabilities {
-    return serverCapabilities(this.maxClientSessions, this.connectionString);
-  }
 
   async execProtocolRaw(request: Uint8Array): Promise<Uint8Array> {
     this.assertOpen();
@@ -152,23 +101,6 @@ class ServerHandle {
     await this.client.execProtocolStream(request, onChunk);
   }
 
-  async backup(format: BackupFormat): Promise<Uint8Array> {
-    this.assertOpen();
-    if (format === 'sql') {
-      if (this.pgDump === undefined) {
-        throw new Error('native server SQL backup requires pg_dump');
-      }
-      return runPgDump(this.pgDump, this.connectionString);
-    }
-    if (format === 'physicalArchive') {
-      return createPhysicalArchive({
-        pgdata: this.pgdata,
-        execSimpleQuery: (sql) => this.execProtocolRaw(simpleQuery(sql)),
-      });
-    }
-    throw new Error(`${format} backup is not supported by nativeServer`);
-  }
-
   async cancel(): Promise<void> {
     this.assertOpen();
     await this.client.cancel();
@@ -180,17 +112,37 @@ class ServerHandle {
     }
     this.#closed = true;
     await this.client.terminate().catch(() => {});
-    if (this.pgCtl !== undefined && (await isFile(this.pgCtl))) {
-      await runCommand(this.pgCtl, ['-D', this.pgdata, '-m', 'fast', '-w', 'stop']).catch(() => {});
+    let failure: unknown;
+    try {
+      await runCommand(
+        this.pgCtl,
+        ['-D', this.pgdata, '-m', 'fast', '-w', 'stop'],
+        this.toolEnvironment,
+        STOP_TIMEOUT_MS,
+      );
+    } catch (error) {
+      failure = error;
     }
     const exited = await waitForChild(this.child, STOP_TIMEOUT_MS);
     if (!exited) {
       this.child.kill('SIGKILL');
       await this.child.wait();
+      failure ??= new Error(`native server did not stop within ${STOP_TIMEOUT_MS}ms`);
     }
-    await removeTree(this.socketDir);
-    if (this.temporary) {
-      await removeTree(this.root);
+    try {
+      await removeTree(this.ownedSocketDir);
+    } catch (error) {
+      failure ??= error;
+    }
+    if (this.temporaryDirectory) {
+      try {
+        await removeTree(this.instanceDirectory);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (failure !== undefined) {
+      throw failure;
     }
   }
 
@@ -202,30 +154,36 @@ class ServerHandle {
 }
 
 async function openServer(config: NormalizedOpenConfig): Promise<ServerHandle> {
-  const startupTimeoutMs = serverStartupTimeoutMs();
-  const tools = await resolveServerTools({
-    serverExecutable: config.serverExecutable,
-    serverToolDirectory: config.serverToolDirectory,
-    extensions: config.extensions,
-  });
-  const executable = tools.executable;
-  const toolDirectory = tools.toolDirectory;
-  let socketDir: string | undefined;
+  let ownedSocketDir: string | undefined;
   let child: ManagedChild | undefined;
   try {
-    await initializeServerDataDir(config, toolDirectory);
+    const startupTimeoutMs = serverStartupTimeoutMs();
+    const tools = await resolveServerTools({
+      serverExecutable: config.serverExecutable,
+      runtimeDirectory: config.runtimeDirectory,
+      extensions: config.extensions,
+    });
+    const executable = tools.executable;
+    const toolDirectory = tools.toolDirectory;
+    await initializeServerDataDir(config, toolDirectory, tools);
     const pgCtl = await optionalTool(toolDirectory, 'pg_ctl');
-    const pgDump = await optionalTool(toolDirectory, 'pg_dump');
-    const port = config.serverPort ?? (await pickPort());
-    socketDir = hostPlatform() === 'win32' ? undefined : await createSocketDir();
-    if (socketDir !== undefined && !unixSocketPathsFit(join(socketDir, `.s.PGSQL.${port}`))) {
-      await removeTree(socketDir);
-      socketDir = undefined;
+    if (pgCtl === undefined) {
+      throw new Error(`native server shutdown requires pg_ctl in ${toolDirectory}`);
     }
+    const toolEnvironment = await nativeServerRuntimeEnv(toolDirectory, tools.icuDataDirectory);
+    const configuredListen = config.serverListen ?? { transport: 'tcp' as const };
+    const listen: ServerListen =
+      configuredListen.transport === 'unix'
+        ? { ...configuredListen, directory: resolve(configuredListen.directory) }
+        : configuredListen;
+    const port = listen.port ?? (listen.transport === 'tcp' ? await pickPort() : 5432);
+    const socketDir = await prepareSocketDirectory(listen, port);
+    ownedSocketDir = listen.transport === 'tcp' ? socketDir : undefined;
     child = spawnManagedChild({
       executable,
-      args: postgresArgs(config, port, socketDir),
-      env: await nativeServerRuntimeEnv(toolDirectory, tools.icuDataDirectory),
+      args: postgresArgs(config, listen, port, socketDir),
+      env: toolEnvironment,
+      replaceEnv: true,
     });
     const endpoint = sdkEndpoint(port, socketDir);
     const client = await waitForServer(
@@ -238,59 +196,55 @@ async function openServer(config: NormalizedOpenConfig): Promise<ServerHandle> {
     return new ServerHandle(
       child,
       client,
-      config.root,
+      config.instanceDirectory,
       config.pgdata,
       pgCtl,
-      pgDump,
-      socketDir,
-      serverConnectionString(config.username, config.database, port),
-      config.maxClientSessions,
-      config.temporary,
+      toolEnvironment,
+      ownedSocketDir,
+      serverConnectionString(config.username, config.database, listen, port),
+      config.temporaryDirectory,
     );
   } catch (error) {
     if (child !== undefined) {
       child.kill('SIGKILL');
       await child.wait();
     }
-    await removeTree(socketDir);
-    if (config.temporary) {
-      await removeTree(config.root);
+    await removeTree(ownedSocketDir);
+    if (config.temporaryDirectory) {
+      await removeTree(config.instanceDirectory);
     }
     throw error;
   }
 }
 
-async function initializeServerDataDir(
+export async function initializeServerDataDir(
   config: NormalizedOpenConfig,
   toolDirectory: string,
+  closure: Pick<ServerTools, 'icuDataDirectory' | 'catalogProfile'> = {
+    catalogProfile: 'standard',
+  },
 ): Promise<void> {
-  if (await isFile(join(config.pgdata, 'PG_VERSION'))) {
-    return;
-  }
   const initdb = await optionalTool(toolDirectory, 'initdb');
   if (initdb === undefined) {
     throw new Error(`native server bootstrap requires initdb in ${toolDirectory}`);
   }
-  await mkdir(config.pgdata, { recursive: true });
-  await runCommand(
-    initdb,
-    [
-      '-D',
-      config.pgdata,
-      '-U',
-      config.username,
-      '--auth=trust',
-      '--no-sync',
-      '--locale-provider=libc',
-      '--locale=C',
-      '--encoding=UTF8',
-    ],
-    await nativeServerRuntimeEnv(toolDirectory),
-  );
+  await initializeNativePgdata({
+    root: config.instanceDirectory,
+    pgdata: config.pgdata,
+    username: config.username,
+    populatePgdata: async (staging) => {
+      const env = await nativeServerInitdbEnvironment(toolDirectory, {
+        icuDataDirectory: closure.icuDataDirectory,
+        catalogProfile: closure.catalogProfile,
+      });
+      await runCommand(initdb, nativeInitdbArgs(staging), env);
+    },
+  });
 }
 
 function postgresArgs(
   config: NormalizedOpenConfig,
+  listen: ServerListen,
   port: number,
   socketDir: string | undefined,
 ): string[] {
@@ -298,20 +252,19 @@ function postgresArgs(
     '-D',
     config.pgdata,
     '-h',
-    SERVER_HOST,
+    listen.transport === 'tcp' ? SERVER_HOST : '',
     '-p',
     String(port),
     '-c',
     'logging_collector=off',
     '-c',
-    'listen_addresses=127.0.0.1',
+    listen.transport === 'tcp' ? 'listen_addresses=127.0.0.1' : 'listen_addresses=',
   ];
   args.push(
     '-c',
     socketDir === undefined ? 'unix_socket_directories=' : `unix_socket_directories=${socketDir}`,
   );
   args.push(...config.startupArgs);
-  args.push('-c', `max_connections=${config.maxClientSessions}`);
   return args;
 }
 
@@ -349,24 +302,62 @@ function sdkEndpoint(port: number, socketDir: string | undefined): LocalEndpoint
   return { kind: 'tcp', host: SERVER_HOST, port };
 }
 
-export function serverConnectionString(username: string, database: string, port: number): string {
-  return `postgres://${percentEncode(username)}@${SERVER_HOST}:${port}/${percentEncode(database)}`;
+function serverConnectionString(
+  username: string,
+  database: string,
+  listen: ServerListen,
+  port: number,
+): string {
+  const user = encodeURIComponent(username);
+  const db = encodeURIComponent(database);
+  if (listen.transport === 'unix') {
+    return `postgresql:///${db}?host=${encodeURIComponent(listen.directory)}&port=${port}&user=${user}&sslmode=disable`;
+  }
+  return `postgresql://${user}@${SERVER_HOST}:${port}/${db}?sslmode=disable`;
 }
 
-function percentEncode(value: string): string {
-  return [...new TextEncoder().encode(value)]
-    .map((byte) =>
-      (byte >= 0x30 && byte <= 0x39) ||
-      (byte >= 0x41 && byte <= 0x5a) ||
-      (byte >= 0x61 && byte <= 0x7a) ||
-      byte === 0x2d ||
-      byte === 0x2e ||
-      byte === 0x5f ||
-      byte === 0x7e
-        ? String.fromCharCode(byte)
-        : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`,
-    )
-    .join('');
+async function prepareSocketDirectory(
+  listen: ServerListen,
+  port: number,
+): Promise<string | undefined> {
+  if (listen.transport === 'unix') {
+    if (hostPlatform() === 'win32') {
+      throw new Error('Unix-domain server listeners are not supported on Windows');
+    }
+    await mkdir(listen.directory, { recursive: true, mode: 0o700 });
+    const metadata = await lstat(listen.directory);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error('server Unix socket directory must be a real directory, not a symlink');
+    }
+    if (!unixSocketPathsFit(join(listen.directory, `.s.PGSQL.${port}`))) {
+      throw new Error('server Unix socket path is too long for this platform');
+    }
+    const socket = join(listen.directory, `.s.PGSQL.${port}`);
+    await rejectExistingUnixEndpoint(socket);
+    await rejectExistingUnixEndpoint(`${socket}.lock`);
+    return listen.directory;
+  }
+  if (hostPlatform() === 'win32') {
+    return undefined;
+  }
+  const directory = await createSocketDir();
+  if (!unixSocketPathsFit(join(directory, `.s.PGSQL.${port}`))) {
+    await removeTree(directory);
+    return undefined;
+  }
+  return directory;
+}
+
+async function rejectExistingUnixEndpoint(path: string): Promise<void> {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error(
+    `native server refuses to replace existing Unix endpoint ${path}; remove it explicitly if it is stale`,
+  );
 }
 
 function serverStartupTimeoutMs(): number {
@@ -383,52 +374,63 @@ function serverStartupTimeoutMs(): number {
   return parsed;
 }
 
-async function resolveServerTools(options: {
+export async function resolveServerTools(options: {
   serverExecutable?: string;
-  serverToolDirectory?: string;
+  runtimeDirectory?: string;
   extensions?: readonly string[];
 }): Promise<ServerTools> {
   const candidates = [
     options.serverExecutable,
     envVar(OLIPHAUNT_POSTGRES_ENV),
-    options.serverToolDirectory === undefined
+    options.runtimeDirectory === undefined
       ? undefined
-      : join(options.serverToolDirectory, executableName('postgres')),
+      : join(options.runtimeDirectory, executableName('postgres')),
   ].filter((value): value is string => value !== undefined && value.length > 0);
   for (const candidate of candidates) {
     if (await isFile(candidate)) {
-      const toolDirectory = options.serverToolDirectory ?? dirname(candidate);
-      await requireServerClientTools(toolDirectory);
+      const toolDirectory = options.runtimeDirectory ?? dirname(candidate);
+      const profile = await resolveExactNativeRuntimeProfile(dirname(toolDirectory));
       return {
         executable: candidate,
         toolDirectory,
+        ...profile,
       };
     }
   }
-  if (options.serverExecutable !== undefined || options.serverToolDirectory !== undefined) {
-    throw new Error(`set serverExecutable, serverToolDirectory, or ${OLIPHAUNT_POSTGRES_ENV}`);
+  if (options.serverExecutable !== undefined || options.runtimeDirectory !== undefined) {
+    throw new Error(`set serverExecutable, runtimeDirectory, or ${OLIPHAUNT_POSTGRES_ENV}`);
   }
   const install = await resolvePackageManagedServerInstall(options.extensions ?? []);
   if (install.runtimeDirectory !== undefined) {
     const toolDirectory = join(install.runtimeDirectory, 'bin');
     const executable = join(toolDirectory, executableName('postgres'));
     if (await isFile(executable)) {
-      await requireServerClientTools(toolDirectory);
-      return { executable, toolDirectory, icuDataDirectory: install.icuDataDirectory };
+      const catalogProfile = install.catalogProfile ?? 'standard';
+      if (catalogProfile === 'icu' && install.icuDataDirectory === undefined) {
+        throw new Error('package-managed ICU server runtime is missing verified ICU data');
+      }
+      return {
+        executable,
+        toolDirectory,
+        icuDataDirectory: install.icuDataDirectory,
+        catalogProfile,
+      };
     }
   }
   throw new Error(
-    `set serverExecutable, serverToolDirectory, or ${OLIPHAUNT_POSTGRES_ENV}, or install @oliphaunt/ts with optional native runtime packages enabled`,
+    `set serverExecutable, runtimeDirectory, or ${OLIPHAUNT_POSTGRES_ENV}, or install @oliphaunt/ts with optional native runtime packages enabled`,
   );
 }
 
-async function resolvePackageManagedServerInstall(
-  extensions: readonly string[],
-): Promise<{ runtimeDirectory?: string; icuDataDirectory?: string }> {
+async function resolvePackageManagedServerInstall(extensions: readonly string[]): Promise<{
+  runtimeDirectory?: string;
+  icuDataDirectory?: string;
+  catalogProfile?: 'standard' | 'icu';
+}> {
   if (runtimeName() === 'deno') {
     if (extensions.length > 0) {
       throw new Error(
-        `Deno nativeServer does not automatically materialize extension packages; pass serverToolDirectory with the selected extension assets or use Node/Bun nativeServer. Selected extensions: ${extensions.join(', ')}`,
+        `Deno server execution does not automatically materialize extension packages; pass runtimeDirectory with the selected extension assets or use Node/Bun openServer(). Selected extensions: ${extensions.join(', ')}`,
       );
     }
     const install = await import('../native/assets-deno.js').then((module) =>
@@ -437,6 +439,7 @@ async function resolvePackageManagedServerInstall(
     return {
       runtimeDirectory: install.runtimeDirectory,
       icuDataDirectory: install.icuDataDirectory,
+      catalogProfile: install.catalogProfile,
     };
   }
 
@@ -452,19 +455,6 @@ async function optionalTool(
   }
   const path = join(directory, executableName(name));
   return (await isFile(path)) ? path : undefined;
-}
-
-async function requireServerClientTools(toolDirectory: string): Promise<void> {
-  await requireTool(toolDirectory, 'pg_dump');
-  await requireTool(toolDirectory, 'psql');
-}
-
-async function requireTool(toolDirectory: string, name: string): Promise<string> {
-  const path = join(toolDirectory, executableName(name));
-  if (!(await isFile(path))) {
-    throw new Error(`native server tool directory is missing ${executableName(name)} at ${path}`);
-  }
-  return path;
 }
 
 function executableName(name: string): string {
@@ -492,34 +482,29 @@ export async function nativeServerRuntimeEnv(
   icuDataDirectory?: string,
 ): Promise<Record<string, string>> {
   const runtimeDirectory = dirname(toolDirectory);
-  const env: Record<string, string> = {};
   const dynamicLibraryDirs = await nativeDynamicLibraryDirs(runtimeDirectory);
   const dynamicLibraryEnv = prependEnvPaths(
     nativeDynamicLibraryEnvName(),
     dynamicLibraryDirs,
     envVar(nativeDynamicLibraryEnvName()),
   );
-  if (dynamicLibraryEnv !== undefined) {
-    env[nativeDynamicLibraryEnvName()] = dynamicLibraryEnv;
-  }
 
-  const icuData = join(runtimeDirectory, 'share/icu');
-  if (await isDirectory(icuData)) {
-    env.ICU_DATA = icuData;
-    return env;
-  }
-  if (icuDataDirectory !== undefined) {
-    env.ICU_DATA = icuDataDirectory;
-    return env;
-  }
-  if (runtimeName() === 'deno') {
-    return env;
-  }
-  const packagedIcuData = await resolveNodeIcuDataDirectory();
-  if (packagedIcuData !== undefined) {
-    env.ICU_DATA = packagedIcuData;
-  }
+  const env = nativePostgresChildEnvironment(process.env, {
+    icuDataDirectory,
+  });
+  if (dynamicLibraryEnv !== undefined) env[nativeDynamicLibraryEnvName()] = dynamicLibraryEnv;
   return env;
+}
+
+export async function nativeServerInitdbEnvironment(
+  toolDirectory: string,
+  profile: Pick<ServerTools, 'icuDataDirectory' | 'catalogProfile'>,
+): Promise<Record<string, string>> {
+  const liveEnvironment = await nativeServerRuntimeEnv(toolDirectory, profile.icuDataDirectory);
+  return nativePostgresChildEnvironment(liveEnvironment, {
+    icuDataDirectory: profile.icuDataDirectory,
+    initdbCatalogProfile: profile.catalogProfile,
+  });
 }
 
 function nativeDynamicLibraryEnvName(): 'DYLD_LIBRARY_PATH' | 'LD_LIBRARY_PATH' | 'PATH' {
@@ -580,22 +565,33 @@ async function createSocketDir(): Promise<string> {
   return path;
 }
 
-async function runPgDump(pgDump: string, connectionString: string): Promise<Uint8Array> {
-  return runCommand(pgDump, [connectionString], await nativeServerRuntimeEnv(dirname(pgDump)));
-}
-
 async function runCommand(
   command: string,
   args: string[],
   env?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<Uint8Array> {
   const child = spawn(command, args, {
-    env: { ...process.env, ...env },
+    env: env ?? process.env,
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   const chunks: Uint8Array[] = [];
   child.stdout.on('data', (chunk: Buffer) => chunks.push(new Uint8Array(chunk)));
-  const code = await new Promise<number | null>((resolve) => child.once('exit', resolve));
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`${command} did not finish within ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+  }).finally(() => {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  });
   if (code !== 0) {
     throw new Error(`${command} exited with status ${code}`);
   }

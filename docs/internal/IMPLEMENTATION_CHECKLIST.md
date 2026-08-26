@@ -61,8 +61,8 @@ intentionally not maintained here.
 - [x] Stable CI job names are derived from Moon task `ci-*` tags. Evidence:
   `tools/graph/ci_plan.mjs` and `tools/policy/check-moon-product-graph.mjs`.
 - [x] Runtime target fan-out is metadata-driven, not hardcoded in mobile jobs.
-  Evidence: focused mobile planner output narrows native runtime and native
-  extension matrices by surface, and `tools/policy/check-release-policy.py`
+  Evidence: focused mobile planner output selects complete native runtime and
+  native extension compatibility domains by surface, and `tools/policy/check-release-policy.py`
   asserts Android mobile builds request only `android-arm64-v8a` and
   `android-x86_64` extension artifacts while iOS mobile builds request only
   `ios-xcframework`.
@@ -257,7 +257,7 @@ intentionally not maintained here.
 - [x] Release dry-run SDK validation consumes staged builder artifacts in
   all release modes instead of rebuilding SDKs from source. Evidence:
   `release.py` validates staged Cargo crates, Kotlin Maven repository
-  artifacts, Swift release manifests/source archives, and npm/JSR tarballs;
+  artifacts, Swift release manifests/source archives, and npm tarballs;
   Kotlin, React Native, TypeScript, WASIX Rust, and Rust dry-runs return after
   staged validation rather than invoking `check-sdk.sh`, Gradle local publish,
   `cargo package`, or `cargo publish --dry-run`.
@@ -504,7 +504,7 @@ intentionally not maintained here.
   installed-app E2E evidence from staged mobile app artifacts.
 - [x] TypeScript package artifacts stay SDK-scoped. Evidence:
   `tools/dev/bun.sh tools/release/build-sdk-ci-artifacts.mjs oliphaunt-js` stages the npm tarball
-  and JSR source only; the affected planner now selects only `js-sdk-package`
+  and npm source only; the affected planner now selects only `js-sdk-package`
   for `oliphaunt-js:package-artifacts`. Broker and Node-direct helper artifacts
   are built and downloaded only when the helper products themselves are being
   released.
@@ -532,7 +532,7 @@ intentionally not maintained here.
 - [x] Repository tasks are Moon-first. Root package-manager aliases are not the
   public orchestration surface.
 - [x] pnpm remains JS dependency/package-manager tooling, not the global graph.
-- [x] Cargo, SwiftPM/Xcode, Gradle, npm/JSR, and Expo are invoked through
+- [x] Cargo, SwiftPM/Xcode, Gradle, npm, and Expo are invoked through
   product-local Moon tasks or product-owned scripts.
 - [x] Policy checks reject stale release graphs, root product aliases, broad
   generated-state inputs, and mobile source-build fallbacks.
@@ -655,7 +655,7 @@ Run before claiming this architecture complete:
   --require-sdk-product oliphaunt-wasix-rust`
 - [x] `tools/dev/bun.sh tools/release/check-staged-artifacts.mjs --require-mobile ios
   --require-mobile-prebuilt-extensions` passes after rebuilding
-  `pnpm --dir src/sdks/react-native/examples/expo run mobile-build:ios` with
+  `pnpm --dir examples/react-native-expo run mobile-build:ios` with
   staged SDK, native runtime, and exact-extension artifacts. The fresh app
   keeps generated static-registry C under compile-only
   `ios/generated/static-registry`, bundles runtime resources under
@@ -682,11 +682,11 @@ Run before claiming this architecture complete:
 - [x] Focused mobile builder plans are target-consistent:
   `GITHUB_EVENT_NAME=workflow_dispatch NATIVE_TARGET=android-arm64-v8a
   WASM_TARGET=all MOBILE_TARGET=android tools/dev/bun.sh tools/graph/ci_plan.mjs`
-  emits one Android exact-extension row, one Android app row, and
-  `mobile_extension_package_native_targets=["android-arm64-v8a"]`; the matching
-  iOS probe emits only `ios-xcframework`. Incompatible focused inputs such as
-  `MOBILE_TARGET=android NATIVE_TARGET=ios-xcframework` now fail closed in the
-  planner.
+  expands to both Android ABI receipt/extension producers and one representative
+  `android-x86_64` emulator app; the matching iOS probe emits only
+  `ios-xcframework`. Incompatible focused inputs such as
+  `MOBILE_TARGET=android NATIVE_TARGET=ios-xcframework` fail closed in the
+  planner instead of producing a partial compatibility-domain proof.
 - [x] Android SDK provisioning is shared and reproducible. Evidence:
   `.github/actions/setup-android` calls `tools/dev/setup-android-sdk.sh`; the
   script bootstraps Android command-line tools when `sdkmanager` is absent,
@@ -728,7 +728,7 @@ Run before claiming this architecture complete:
   extension source fetch skip PostgreSQL preparation and making the Windows base
   runtime prune exact-extension artifacts before packaging:
   `bash -n src/extensions/artifacts/native/tools/package-release-assets.sh`,
-  `git diff --check`, `cargo run -p oliphaunt --bin oliphaunt-resources
+  `git diff --check`, `cargo run -p oliphaunt-native-packaging --bin oliphaunt-resources
   --locked -- --list-extensions`, `cargo run -p xtask -- assets
   verify-committed`, `actionlint .github/workflows/ci.yml
   .github/workflows/mobile-e2e.yml .github/workflows/release.yml`,

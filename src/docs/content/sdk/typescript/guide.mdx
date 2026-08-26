@@ -1,19 +1,23 @@
 ---
 title: Build With TypeScript
-description: Use the desktop JavaScript SDK in Node.js, Bun, or Deno with helper-backed runtimes and selected extensions.
+description: Use the native desktop JavaScript SDK in Node.js, Bun, or Deno with native engines and selected extensions.
 ---
 
 # Build With TypeScript
 
-Use the TypeScript SDK in Node.js, Bun, and Deno. It
-provides a JavaScript API over Oliphaunt runtime assets and broker/server
-helpers where supported.
+Use `@oliphaunt/ts` in Node.js, Bun, and Deno. It provides a JavaScript API over
+native Oliphaunt runtime assets and native engines where supported.
 
 <Callout type="info" title="Desktop JavaScript uses native helpers">
 Use this package for Node.js, Bun, and Deno. Tauri apps currently keep the
-database in Rust state behind narrow app-owned commands; direct webview
-integration is planned. React Native apps use the React Native SDK because
+database in Rust state behind narrow app-owned commands. React Native apps use
+the React Native SDK because
 mobile runtime work flows through Swift and Kotlin.
+
+Browser applications use the separate
+[`@oliphaunt/wasix-ts`](/docs/sdk/wasix-typescript) package. This native
+package does not fall back to WASIX, and the WASIX package does not fall back to
+native execution.
 </Callout>
 
 <SdkGuideSummary id="typescript" />
@@ -35,7 +39,8 @@ npm install @oliphaunt/ts
 
 ### Open and query
 
-Create a client, open a root, run SQL, and close the handle.
+Open the package client, choose persistent storage, run SQL, and close the
+database.
 
 <!-- oliphaunt-snippet: oliphaunt-js -->
 
@@ -43,8 +48,7 @@ Create a client, open a root, run SQL, and close the handle.
 import { Oliphaunt } from '@oliphaunt/ts';
 
 const db = await Oliphaunt.open({
-  engine: 'nativeBroker',
-  root: './app-data/main.oliphaunt',
+  storage: { kind: 'directory', path: './app-data/main.oliphaunt' },
   extensions: ['vector'],
 });
 
@@ -54,7 +58,7 @@ const value = rows.getText(0, 'value');
 await db.close();
 ```
 
-Keep one client per app database root unless you intentionally use a mode that
+Keep one client per database instance unless you intentionally use a mode that
 supports independent sessions.
 
 </Step>
@@ -77,7 +81,7 @@ await db.execute(`
 
 await db.query(
   'INSERT INTO notes (title, body) VALUES ($1, $2) RETURNING id::text AS id',
-  ['First note', 'Stored in an embedded PostgreSQL root'],
+  ['First note', 'Stored by embedded PostgreSQL'],
 );
 
 const notes = await db.query(
@@ -87,26 +91,27 @@ const firstTitle = notes.getText(0, 'title');
 ```
 
 Tauri apps keep the database in Rust state and expose narrow app-owned commands
-to the webview. A direct TypeScript/webview adapter is planned, not supported in
-the first release.
+to the webview.
 
 </Step>
 <Step>
 
 ### Configure
 
-Configure mode, root, selected exact extensions, runtime asset locations,
-durability, startup identity, broker helper path, and server helper path through
-the JS configuration object.
+Configure storage, mode, selected exact extensions, startup identity,
+PostgreSQL startup GUCs, and advanced runtime overrides through the JS
+configuration object.
+Omit `storage` for an SDK-owned temporary directory; pass
+`{ kind: 'directory', path }` for persistence.
 
 </Step>
 <Step>
 
 ### Choose a mode
 
-Direct mode is lowest-latency where a native binding is available. Broker mode
-uses a helper process and is the preferred robust desktop JavaScript path.
-Server mode is for PostgreSQL-compatible tools and independent clients.
+Omit `execution` for direct execution. Select `execution: 'broker'` when process
+isolation and crash recovery matter. Use `Oliphaunt.openServer()` when
+PostgreSQL-compatible tools and independent clients are required.
 
 </Step>
 <Step>
@@ -129,8 +134,27 @@ selected extensions and mandatory dependencies.
 
 ### Back up and restore
 
-Use SDK backup and restore helpers for physical archives and supported server
-flows. Keep live PostgreSQL directories behind the SDK data-movement APIs.
+Use `backup()` and static restore for the native physical archive. Keep live
+PostgreSQL directories behind these APIs. Restore accepts a new or
+existing-empty destination and rejects nonempty data without mutation. Native
+server applications use normal PostgreSQL tools.
+
+</Step>
+<Step>
+
+### Use logical tools
+
+Install the separate `@oliphaunt/tools` package when a server application needs
+plain `pg_dump` or non-interactive `psql`. Pass `server.connectionString` to the
+tool; the core `@oliphaunt/ts` package does not install client programs.
+
+```ts
+import { pgDump } from '@oliphaunt/tools';
+
+const sql = await pgDump(server.connectionString, {
+  args: ['--schema-only'],
+});
+```
 
 </Step>
 </Steps>
@@ -139,6 +163,6 @@ flows. Keep live PostgreSQL directories behind the SDK data-movement APIs.
 
 ## Troubleshooting
 
-Check runtime asset resolution, helper executable availability, root locks,
-mode capability errors, extension selection, and SQLSTATE-bearing PostgreSQL
+Check runtime asset resolution, helper executable availability, storage ownership,
+unsupported-mode errors, extension selection, and SQLSTATE-bearing PostgreSQL
 errors.

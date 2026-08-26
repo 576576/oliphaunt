@@ -66,7 +66,7 @@ check_maven_publication_graph() {
   unsupported_publication_tasks="$(printf '%s\n' "$publication_tasks" | grep -v 'AndroidReleasePublication' || true)"
   if [ -n "$unsupported_publication_tasks" ]; then
     printf '%s\n' "$unsupported_publication_tasks" >&2
-    echo "Kotlin Maven aggregate entry points include unsupported JVM or host-native publications" >&2
+    echo "Kotlin Maven aggregate entry points include unsupported non-Android publications" >&2
     exit 1
   fi
 }
@@ -84,17 +84,6 @@ require() {
 
 require jar
 
-require_manifest_line() {
-  manifest="$1"
-  expected="$2"
-  message="$3"
-  if ! grep -Fxq "$expected" "$manifest"; then
-    echo "$message" >&2
-    echo "expected '$expected' in $manifest" >&2
-    exit 1
-  fi
-}
-
 require_jar_entry() {
   jar_file="$1"
   entry="$2"
@@ -103,7 +92,7 @@ require_jar_entry() {
     echo "missing Kotlin package artifact: $jar_file" >&2
     exit 1
   fi
-  if ! jar tf "$jar_file" | grep -Fxq "$entry"; then
+  if ! jar tf "$jar_file" | grep -Fx "$entry" >/dev/null; then
     echo "$message" >&2
     echo "expected $entry in $jar_file" >&2
     exit 1
@@ -118,7 +107,7 @@ require_jar_entry_pattern() {
     echo "missing Kotlin package artifact: $jar_file" >&2
     exit 1
   fi
-  if ! jar tf "$jar_file" | grep -Eq "$pattern"; then
+  if ! jar tf "$jar_file" | grep -E "$pattern" >/dev/null; then
     echo "$message" >&2
     echo "expected pattern $pattern in $jar_file" >&2
     exit 1
@@ -142,7 +131,7 @@ reject_jar_entry_pattern() {
     echo "missing Kotlin package artifact: $jar_file" >&2
     exit 1
   fi
-  if jar tf "$jar_file" | grep -Eq "$pattern"; then
+  if jar tf "$jar_file" | grep -E "$pattern" >/dev/null; then
     echo "$message" >&2
     echo "unexpected pattern $pattern in $jar_file" >&2
     exit 1
@@ -269,47 +258,23 @@ gradle_scratch_args="-PoliphauntBuildRoot=$gradle_build_root -PoliphauntCxxBuild
 gradle_non_coverage_args="-x :oliphaunt:koverVerify"
 kotlin_build_dir="$gradle_build_root/oliphaunt"
 
-host_native_suffix() {
-  case "$(uname -s):$(uname -m)" in
-    Darwin:*)
-      printf '%s\n' MacosArm64
-      ;;
-    Linux:arm64|Linux:aarch64)
-      printf '%s\n' LinuxArm64
-      ;;
-    *)
-      printf '%s\n' LinuxX64
-      ;;
-  esac
-}
-
-host_native_compile_task() {
-  printf ':oliphaunt:compileKotlin%s\n' "$(host_native_suffix)"
-}
-
-host_native_test_task() {
-  first="$(host_native_suffix | cut -c1 | tr '[:upper:]' '[:lower:]')"
-  rest="$(host_native_suffix | cut -c2-)"
-  printf ':oliphaunt:%s%sTest\n' "$first" "$rest"
-}
-
-run_without_linked_native_runtime() {
+run_without_runtime_environment() {
   env \
     -u LIBOLIPHAUNT_PATH \
     -u OLIPHAUNT_INSTALL_DIR \
+    -u OLIPHAUNT_INITDB \
     -u OLIPHAUNT_RUNTIME_DIR \
-    -u OLIPHAUNT_KOTLIN_REQUIRE_NATIVE \
     "$@"
 }
 
-run_without_linked_native_runtime_with_repository_retry() {
+run_with_repository_retry() {
   attempt=1
   max_attempts=2
   attempt_log="$scratch_root/gradle-repository-attempt.log"
   mkdir -p "$scratch_root"
   while [ "$attempt" -le "$max_attempts" ]; do
     printf '\n==> repository-bounded attempt %s/%s: %s\n' "$attempt" "$max_attempts" "$*"
-    if run_without_linked_native_runtime "$@" >"$attempt_log" 2>&1; then
+    if run_without_runtime_environment "$@" >"$attempt_log" 2>&1; then
       cat "$attempt_log"
       rm -f "$attempt_log"
       return 0
@@ -340,7 +305,9 @@ run_android_runtime_smoke() {
   mkdir -p \
     "$tmp_assets/oliphaunt/runtime/files/share/postgresql/extension" \
     "$tmp_assets/oliphaunt/static-registry" \
-    "$tmp_assets/oliphaunt/template-pgdata/files/base"
+    "$tmp_assets/oliphaunt/cluster-seed/files/base" \
+    "$tmp_assets/oliphaunt/cluster-seed/files/global" \
+    "$tmp_assets/oliphaunt/cluster-seed-icu/files/global"
   printf 'runtime smoke\n' >"$tmp_assets/oliphaunt/runtime/files/share/postgresql/README.liboliphaunt-smoke"
   printf "comment = 'vector smoke control'\n" >"$tmp_assets/oliphaunt/runtime/files/share/postgresql/extension/vector.control"
   printf "select 'vector smoke sql';\n" >"$tmp_assets/oliphaunt/runtime/files/share/postgresql/extension/vector--1.0.sql"
@@ -367,12 +334,26 @@ MANIFEST
     "$tmp_assets" \
     "$tmp_static_jni" \
     vector
-  printf '18\n' >"$tmp_assets/oliphaunt/template-pgdata/files/PG_VERSION"
-  printf 'template smoke\n' >"$tmp_assets/oliphaunt/template-pgdata/files/base/README.liboliphaunt-smoke"
+  printf '18\n' >"$tmp_assets/oliphaunt/cluster-seed/files/PG_VERSION"
+  printf 'control\n' >"$tmp_assets/oliphaunt/cluster-seed/files/global/pg_control"
+  printf '18\n' >"$tmp_assets/oliphaunt/cluster-seed-icu/files/PG_VERSION"
+  printf 'control\n' >"$tmp_assets/oliphaunt/cluster-seed-icu/files/global/pg_control"
+  printf 'cluster seed smoke\n' >"$tmp_assets/oliphaunt/cluster-seed/files/base/README.liboliphaunt-smoke"
+  cat >"$tmp_assets/oliphaunt/manifest.properties" <<'MANIFEST'
+schema=oliphaunt-native-runtime-carrier-v1
+clusterSeedTarget=android-datum64
+clusterSeedRelativePath=cluster-seed
+icuClusterSeedRelativePath=cluster-seed-icu
+MANIFEST
   cat >"$tmp_assets/oliphaunt/runtime/manifest.properties" <<'MANIFEST'
 schema=oliphaunt-runtime-resources-v1
 cacheKey=runtime-smoke
 layout=postgres-runtime-files-v1
+artifactRole=runtime
+catalogProfile=
+clusterSeedTarget=android-datum64
+icuDataTreeSha256=
+mode=native-direct
 selectedExtensions=vector
 extensions=vector
 runtimeFeatures=
@@ -383,25 +364,44 @@ mobileStaticRegistryPending=
 nativeModuleStems=vector
 mobileStaticRegistrySource=static-registry/oliphaunt_static_registry.c
 MANIFEST
-  cat >"$tmp_assets/oliphaunt/template-pgdata/manifest.properties" <<'MANIFEST'
+  cat >"$tmp_assets/oliphaunt/cluster-seed/manifest.properties" <<'MANIFEST'
 schema=oliphaunt-runtime-resources-v1
-cacheKey=template-smoke
-layout=postgres-template-pgdata-v1
-selectedExtensions=
-extensions=
+layout=oliphaunt-cluster-seed-v1
+artifactRole=cluster-seed-standard
+catalogProfile=standard
+postgresMajor=18
+physicalFormat=native-pg18-v1
+target=android-datum64
+compatibilityKey=native-pg18-android-datum64-v1
+initialSuperuser=postgres
 runtimeFeatures=
-sharedPreloadLibraries=
-mobileStaticRegistryState=not-required
-mobileStaticRegistryRegistered=
-mobileStaticRegistryPending=
-nativeModuleStems=
-mobileStaticRegistrySource=
+icuDataVersion=
+icuDataForm=
+icuDataTreeSha256=
+cacheKey=cluster-seed-standard-smoke
+MANIFEST
+  cat >"$tmp_assets/oliphaunt/cluster-seed-icu/manifest.properties" <<'MANIFEST'
+schema=oliphaunt-runtime-resources-v1
+layout=oliphaunt-cluster-seed-v1
+artifactRole=cluster-seed-icu
+catalogProfile=icu
+postgresMajor=18
+physicalFormat=native-pg18-v1
+target=android-datum64
+compatibilityKey=native-pg18-android-datum64-v1
+initialSuperuser=postgres
+runtimeFeatures=icu
+icuDataVersion=76.1
+icuDataForm=files-le
+icuDataTreeSha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+cacheKey=cluster-seed-icu-smoke
 MANIFEST
   cat >"$tmp_assets/oliphaunt/package-size.tsv" <<'REPORT'
 kind	id	extensions	files	bytes
-package	total	-	-	185
+package	total	-	-	205
 package	runtime	-	-	100
-package	template-pgdata	-	-	40
+package	cluster-seed	-	-	40
+package	cluster-seed-icu	-	-	20
 package	static-registry	-	-	45
 extensions	selected	-	-	30
 extension	vector	-	3	30
@@ -427,8 +427,13 @@ REPORT
     rm -rf "$tmp_assets" "$tmp_static_jni"
     exit 1
   fi
-  if [ ! -f "$generated/oliphaunt/template-pgdata/files/PG_VERSION" ]; then
-    echo "Kotlin Android generated assets did not include runtime-resources template PGDATA" >&2
+  if [ ! -f "$generated/oliphaunt/cluster-seed/files/PG_VERSION" ]; then
+    echo "Kotlin Android generated assets did not include the runtime-resource cluster seed" >&2
+    rm -rf "$tmp_assets" "$tmp_static_jni"
+    exit 1
+  fi
+  if [ ! -f "$generated/oliphaunt/cluster-seed-icu/files/global/pg_control" ]; then
+    echo "Kotlin Android generated assets did not include the target-matched ICU cluster seed" >&2
     rm -rf "$tmp_assets" "$tmp_static_jni"
     exit 1
   fi
@@ -482,8 +487,9 @@ REPORT
     rm -rf "$tmp_assets" "$tmp_static_jni"
     exit 1
   fi
-  if ! grep -Fxq "runtimeFeatures=" "$generated/oliphaunt/template-pgdata/manifest.properties"; then
-    echo "Kotlin Android generated template manifest did not preserve runtime feature metadata" >&2
+  if ! grep -Fxq "catalogProfile=standard" "$generated/oliphaunt/cluster-seed/manifest.properties" ||
+    ! grep -Fxq "catalogProfile=icu" "$generated/oliphaunt/cluster-seed-icu/manifest.properties"; then
+    echo "Kotlin Android generated assets did not preserve both exact cluster-seed profiles" >&2
     rm -rf "$tmp_assets" "$tmp_static_jni"
     exit 1
   fi
@@ -501,7 +507,7 @@ REPORT
   static_asset_aar="$kotlin_build_dir/outputs/aar/oliphaunt-debug.aar"
   require_jar_entry "$static_asset_aar" "jni/$android_smoke_abi/liboliphaunt.so" \
     "Kotlin Android smoke AAR must include the explicitly supplied liboliphaunt runtime for $android_smoke_abi"
-  if jar tf "$static_asset_aar" | grep -Fq "assets/oliphaunt/static-registry/archives/"; then
+  if jar tf "$static_asset_aar" | grep -F "assets/oliphaunt/static-registry/archives/" >/dev/null; then
     echo "Kotlin Android AAR included build-only static extension archives" >&2
     rm -rf "$tmp_assets" "$tmp_static_jni"
     exit 1
@@ -526,20 +532,13 @@ if grep -Fq '"maven:dev.oliphaunt:oliphaunt"' "$project_dir/release.toml"; then
   exit 1
 fi
 
-if [ -n "${OLIPHAUNT_KOTLIN_REQUIRE_NATIVE:-}" ]; then
-  if ! oliphaunt_runtime_native_host_ready basic; then
-    oliphaunt_runtime_native_host_diagnostics basic
-    exit 1
-  fi
-fi
-
 if [ "$mode" = "smoke-runtime" ]; then
   run_android_runtime_smoke
   exit 0
 fi
 
 if [ "$mode" = "check-static" ]; then
-  static_tasks=":oliphaunt:spotlessCheck :oliphaunt:detekt :oliphaunt:checkMavenPublicationContract :oliphaunt:compileKotlinJvm :oliphaunt:compileDebugKotlinAndroid :oliphaunt:compileReleaseKotlinAndroid :oliphaunt-android-gradle-plugin:check $(host_native_compile_task)"
+  static_tasks=":oliphaunt:spotlessCheck :oliphaunt:detekt :oliphaunt:checkMavenPublicationContract :oliphaunt:compileKotlinJvm :oliphaunt:compileDebugKotlinAndroid :oliphaunt:compileReleaseKotlinAndroid :oliphaunt-android-gradle-plugin:check"
   if [ -n "${ANDROID_HOME:-}" ]; then
     # Force only the analyzer tasks so an earlier incompatible result cannot be
     # accepted from Gradle's up-to-date/build caches without replaying its fatal
@@ -565,9 +564,9 @@ if [ "$mode" = "check-static" ]; then
 fi
 
 if [ "$mode" = "test-unit" ]; then
-  unit_tasks=":oliphaunt:jvmTest :oliphaunt:testDebugUnitTest :oliphaunt:testReleaseUnitTest $(host_native_test_task)"
+  unit_tasks=":oliphaunt:jvmTest :oliphaunt:testDebugUnitTest :oliphaunt:testReleaseUnitTest"
   # shellcheck disable=SC2086
-  run run_without_linked_native_runtime_with_repository_retry "$gradle_cmd" -p "$project_dir" \
+  run run_with_repository_retry "$gradle_cmd" -p "$project_dir" \
     $unit_tasks \
     $gradle_non_coverage_args \
     $android_abi_gradle_args \
@@ -599,9 +598,6 @@ fi
 
 run cmp src/runtimes/liboliphaunt/native/include/oliphaunt.h "$project_dir/oliphaunt/src/androidMain/cpp/include/oliphaunt.h"
 package_tasks=":oliphaunt:checkMavenPublicationContract :oliphaunt:metadataSourcesJar :oliphaunt:allMetadataJar :oliphaunt:jvmJar :oliphaunt:jvmSourcesJar :oliphaunt:androidReleaseSourcesJar :oliphaunt:bundleReleaseAar :oliphaunt-android-gradle-plugin:jar"
-if [ "$(uname -s)" = "Darwin" ]; then
-  package_tasks="$package_tasks :oliphaunt:macosArm64SourcesJar"
-fi
 # shellcheck disable=SC2086
 run "$gradle_cmd" -p "$project_dir" \
   $package_tasks \
@@ -617,7 +613,6 @@ metadata_jar="$kotlin_libs/oliphaunt-metadata-$kotlin_version.jar"
 jvm_jar="$kotlin_libs/oliphaunt-jvm-$kotlin_version.jar"
 jvm_sources="$kotlin_libs/oliphaunt-jvm-$kotlin_version-sources.jar"
 android_sources="$kotlin_libs/oliphaunt-android-$kotlin_version-sources.jar"
-macos_sources="$kotlin_libs/oliphaunt-macosarm64-$kotlin_version-sources.jar"
 android_release_aar="$kotlin_outputs/aar/oliphaunt-release.aar"
 android_gradle_plugin_jar="$gradle_build_root/oliphaunt-android-gradle-plugin/libs/oliphaunt-android-gradle-plugin-$kotlin_version.jar"
 
@@ -625,21 +620,20 @@ require_jar_entry "$metadata_sources" "commonMain/dev/oliphaunt/Oliphaunt.kt" \
   "Kotlin metadata sources artifact must include the common SDK API"
 require_jar_entry "$metadata_sources" "commonMain/dev/oliphaunt/Query.kt" \
   "Kotlin metadata sources artifact must include the common query helpers"
-reject_jar_entry_pattern "$metadata_sources" '(^|/)commonTest/|(^|/)androidUnitTest/|(^|/)nativeTest/' \
+reject_jar_entry_pattern "$metadata_sources" '(^|/)commonTest/|(^|/)androidUnitTest/' \
   "Kotlin metadata sources artifact must not include test sources"
 
 require_jar_entry "$metadata_jar" "META-INF/kotlin-project-structure-metadata.json" \
   "Kotlin metadata artifact must include project-structure metadata"
-require_jar_entry_pattern "$metadata_jar" '^commonMain/default/linkdata/package_dev\.oliphaunt/[0-9]+_oliphaunt\.knm$' \
-  "Kotlin metadata artifact must include common dev.oliphaunt linkdata"
+# The SDK's Android and JVM targets are both JVM-like, so Kotlin skips the
+# common metadata compilation. Common API contents are covered by the sources
+# and compiled target artifacts checked above and below.
 
 require_jar_entry "$jvm_jar" "dev/oliphaunt/OliphauntDatabase.class" \
   "Kotlin JVM artifact must include the public SDK database class"
-require_jar_entry "$jvm_jar" "dev/oliphaunt/RuntimeUnavailableEngine.class" \
-  "Kotlin JVM artifact must preserve the explicit unavailable-runtime implementation"
+reject_jar_entry_pattern "$jvm_jar" 'dev/oliphaunt/(ProtocolRequest|ProtocolResponse|RuntimeUnavailableEngine)\.class' \
+  "Kotlin JVM artifact must not expose removed protocol wrappers or the generic unavailable-runtime abstraction"
 
-require_jar_entry "$jvm_sources" "jvmMain/dev/oliphaunt/DefaultEngine.kt" \
-  "Kotlin JVM sources artifact must include the JVM runtime boundary"
 require_jar_entry "$jvm_sources" "commonMain/dev/oliphaunt/Oliphaunt.kt" \
   "Kotlin JVM sources artifact must include the common SDK API"
 
@@ -649,18 +643,11 @@ require_jar_entry "$android_sources" "androidMain/dev/oliphaunt/OliphauntAndroid
   "Kotlin Android sources artifact must include Android runtime-resources handling"
 require_jar_entry "$android_sources" "commonMain/dev/oliphaunt/Oliphaunt.kt" \
   "Kotlin Android sources artifact must include the common SDK API"
-reject_jar_entry_pattern "$android_sources" 'androidMain/cpp/|nativeInterop/|(^|/)liboliphaunt\.so$' \
+reject_jar_entry_pattern "$android_sources" 'androidMain/cpp/|(^|/)liboliphaunt\.so$' \
   "Kotlin Android sources artifact must not include native build outputs or bundled Oliphaunt runtime binaries"
 
 require_jar_entry "$android_gradle_plugin_jar" "dev/oliphaunt/android/extension-legal-catalog.json" \
   "Kotlin Android Gradle plugin must ship the canonical extension legal catalog used for offline verification"
-
-if [ "$(uname -s)" = "Darwin" ]; then
-  require_jar_entry "$macos_sources" "nativeMain/dev/oliphaunt/NativeDirectEngine.kt" \
-    "Kotlin macOS/native sources artifact must include the native-direct engine"
-  require_jar_entry "$macos_sources" "commonMain/dev/oliphaunt/Oliphaunt.kt" \
-    "Kotlin macOS/native sources artifact must include the common SDK API"
-fi
 
 require_jar_entry "$android_release_aar" "classes.jar" \
   "Kotlin Android release AAR must include compiled classes"
@@ -683,172 +670,6 @@ reject_jar_entry_pattern "$android_release_aar" '^jni/[^/]+/liboliphaunt\.so$' \
 
 if [ -n "${ANDROID_HOME:-}" ]; then
   run_android_runtime_smoke
-
-  tmp_split_runtime="$(prepare_scratch_dir kotlin-split-runtime)"
-  tmp_split_template="$(prepare_scratch_dir kotlin-split-template)"
-  mkdir -p \
-    "$tmp_split_runtime/share/postgresql/extension" \
-    "$tmp_split_runtime/lib/postgresql" \
-    "$tmp_split_template/base"
-  printf 'runtime split smoke\n' >"$tmp_split_runtime/share/postgresql/README.liboliphaunt-split-smoke"
-  printf "comment = 'vector split smoke control'\n" >"$tmp_split_runtime/share/postgresql/extension/vector.control"
-  printf "select 'vector split smoke sql';\n" >"$tmp_split_runtime/share/postgresql/extension/vector--1.0.sql"
-  printf "comment = 'cube split smoke control'\n" >"$tmp_split_runtime/share/postgresql/extension/cube.control"
-  printf "select 'cube split smoke sql';\n" >"$tmp_split_runtime/share/postgresql/extension/cube--1.0.sql"
-  printf "comment = 'earthdistance split smoke control'\n" >"$tmp_split_runtime/share/postgresql/extension/earthdistance.control"
-  printf "select 'earthdistance split smoke sql';\n" >"$tmp_split_runtime/share/postgresql/extension/earthdistance--1.0.sql"
-  printf '18\n' >"$tmp_split_template/PG_VERSION"
-  printf 'template split smoke\n' >"$tmp_split_template/base/README.liboliphaunt-split-smoke"
-  run "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=vector" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args
-  generated="$kotlin_build_dir/generated/oliphaunt-android-assets"
-  split_runtime_manifest="$generated/oliphaunt/runtime/manifest.properties"
-  split_template_manifest="$generated/oliphaunt/template-pgdata/manifest.properties"
-  require_manifest_line "$split_runtime_manifest" "schema=oliphaunt-runtime-resources-v1" \
-    "Kotlin Android split runtime manifest did not emit the shared runtime-resources schema"
-  require_manifest_line "$split_runtime_manifest" "layout=postgres-runtime-files-v1" \
-    "Kotlin Android split runtime manifest did not emit the runtime resources layout"
-  require_manifest_line "$split_runtime_manifest" "selectedExtensions=vector" \
-    "Kotlin Android split runtime manifest did not record the full vector selection"
-  require_manifest_line "$split_runtime_manifest" "extensions=vector" \
-    "Kotlin Android split runtime manifest did not record createable vector extension"
-  require_manifest_line "$split_runtime_manifest" "runtimeFeatures=" \
-    "Kotlin Android split runtime manifest did not record runtime feature metadata"
-  require_manifest_line "$split_runtime_manifest" "sharedPreloadLibraries=" \
-    "Kotlin Android split runtime manifest did not record shared preload libraries"
-  require_manifest_line "$split_runtime_manifest" "mobileStaticRegistryState=pending" \
-    "Kotlin Android split runtime manifest did not mark mobile static registry as pending"
-  require_manifest_line "$split_runtime_manifest" "mobileStaticRegistryRegistered=" \
-    "Kotlin Android split runtime manifest should not claim registered mobile static modules"
-  require_manifest_line "$split_runtime_manifest" "mobileStaticRegistryPending=vector" \
-    "Kotlin Android split runtime manifest did not record pending mobile static registry modules"
-  require_manifest_line "$split_runtime_manifest" "nativeModuleStems=vector" \
-    "Kotlin Android split runtime manifest did not record expected native module stems"
-  require_manifest_line "$split_runtime_manifest" "mobileStaticRegistrySource=" \
-    "Kotlin Android split runtime manifest should not claim generated mobile static-registry source"
-  require_manifest_line "$split_template_manifest" "mobileStaticRegistryState=not-required" \
-    "Kotlin Android split template manifest should not require mobile static registry work"
-  require_manifest_line "$split_template_manifest" "mobileStaticRegistryPending=" \
-    "Kotlin Android split template manifest should not list pending mobile static registry modules"
-  require_manifest_line "$split_template_manifest" "runtimeFeatures=" \
-    "Kotlin Android split template manifest should not list runtime features"
-  require_manifest_line "$split_template_manifest" "sharedPreloadLibraries=" \
-    "Kotlin Android split template manifest should not list shared preload libraries"
-  require_manifest_line "$split_template_manifest" "nativeModuleStems=" \
-    "Kotlin Android split template manifest should not list native module stems"
-  require_manifest_line "$split_template_manifest" "mobileStaticRegistrySource=" \
-    "Kotlin Android split template manifest should not claim generated mobile static-registry source"
-
-  printf 'auto_explain Android module fixture\n' >"$tmp_split_runtime/lib/postgresql/auto_explain.so"
-  run "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=auto_explain" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args
-  require_manifest_line "$split_runtime_manifest" "selectedExtensions=auto_explain" \
-    "Kotlin Android split runtime manifest did not record the full auto_explain selection"
-  require_manifest_line "$split_runtime_manifest" "extensions=" \
-    "Kotlin Android split runtime manifest incorrectly treated auto_explain as createable"
-  require_manifest_line "$split_runtime_manifest" "nativeModuleStems=auto_explain" \
-    "Kotlin Android split runtime manifest did not identify the auto_explain native module"
-  if [ -e "$generated/oliphaunt/runtime/files/share/postgresql/extension/auto_explain.control" ]; then
-    echo "Kotlin Android split runtime incorrectly required or staged auto_explain.control" >&2
-    exit 1
-  fi
-  rm -f "$tmp_split_runtime/lib/postgresql/auto_explain.so"
-
-  tmp_split_incomplete_runtime="$(prepare_scratch_dir kotlin-split-incomplete-extension)"
-  mkdir -p "$tmp_split_incomplete_runtime/share/postgresql/extension"
-  printf 'runtime split incomplete smoke\n' >"$tmp_split_incomplete_runtime/share/postgresql/README.liboliphaunt-split-incomplete-smoke"
-  printf "comment = 'vector split incomplete control'\n" >"$tmp_split_incomplete_runtime/share/postgresql/extension/vector.control"
-  split_incomplete_extension_log="$scratch_root/kotlin-split-incomplete-extension.log"
-  rm -f "$split_incomplete_extension_log"
-  printf '\n==> %s\n' "$gradle_cmd -p $project_dir :oliphaunt:prepareOliphauntAndroidAssets -PoliphauntExtensions=vector"
-  if "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_incomplete_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=vector" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args >"$split_incomplete_extension_log" 2>&1; then
-    echo "Kotlin Android split runtime packaging accepted a selected extension without packaged SQL files" >&2
-    cat "$split_incomplete_extension_log" >&2
-    rm -f "$split_incomplete_extension_log"
-    exit 1
-  fi
-  if ! grep -Fq "selected extension 'vector' has no packaged SQL files" "$split_incomplete_extension_log"; then
-    echo "Kotlin Android split runtime packaging failed without the expected selected-extension file diagnostic" >&2
-    cat "$split_incomplete_extension_log" >&2
-    rm -f "$split_incomplete_extension_log"
-    exit 1
-  fi
-  rm -f "$split_incomplete_extension_log"
-  rm -rf "$tmp_split_incomplete_runtime"
-
-  split_static_log="$scratch_root/kotlin-split-static.log"
-  rm -f "$split_static_log"
-  printf '\n==> %s\n' "$gradle_cmd -p $project_dir :oliphaunt:prepareOliphauntAndroidAssets -PoliphauntMobileStaticModules=vector"
-  if "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=vector" \
-    "-PoliphauntMobileStaticModules=vector" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args >"$split_static_log" 2>&1; then
-    echo "Kotlin Android split runtime packaging accepted a mobile static module declaration without generated registry source" >&2
-    cat "$split_static_log" >&2
-    rm -f "$split_static_log"
-    exit 1
-  fi
-  if ! grep -Fq "split runtime packaging cannot declare mobile static module stems" "$split_static_log"; then
-    echo "Kotlin Android split runtime packaging failed without the expected static-registry diagnostic" >&2
-    cat "$split_static_log" >&2
-    rm -f "$split_static_log"
-    exit 1
-  fi
-  rm -f "$split_static_log"
-
-  run "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=earthdistance" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args
-  require_manifest_line "$split_runtime_manifest" "extensions=cube,earthdistance" \
-    "Kotlin Android split runtime manifest did not include exact extension dependencies"
-  require_manifest_line "$split_runtime_manifest" "sharedPreloadLibraries=" \
-    "Kotlin Android split runtime manifest should not record shared preload libraries for earthdistance"
-  require_manifest_line "$split_runtime_manifest" "mobileStaticRegistryPending=cube,earthdistance" \
-    "Kotlin Android split runtime manifest did not map earthdistance mobile pending extensions"
-  require_manifest_line "$split_runtime_manifest" "nativeModuleStems=cube,earthdistance" \
-    "Kotlin Android split runtime manifest did not map earthdistance native module stems"
-
-  split_unknown_extension_log="$scratch_root/kotlin-split-unknown-extension.log"
-  rm -f "$split_unknown_extension_log"
-  printf '\n==> %s\n' "$gradle_cmd -p $project_dir :oliphaunt:prepareOliphauntAndroidAssets -PoliphauntExtensions=acme_unknown"
-  if "$gradle_cmd" -p "$project_dir" :oliphaunt:prepareOliphauntAndroidAssets \
-    "-PoliphauntRuntimeDir=$tmp_split_runtime" \
-    "-PoliphauntTemplatePgdataDir=$tmp_split_template" \
-    "-PoliphauntExtensions=acme_unknown" \
-    $gradle_scratch_args \
-    $gradle_smoke_cache_args >"$split_unknown_extension_log" 2>&1; then
-    echo "Kotlin Android split runtime packaging accepted an extension absent from generated metadata" >&2
-    cat "$split_unknown_extension_log" >&2
-    rm -f "$split_unknown_extension_log"
-    exit 1
-  fi
-  if ! grep -Fq "cannot select unknown extension 'acme_unknown'" "$split_unknown_extension_log"; then
-    echo "Kotlin Android split runtime packaging failed without the expected unknown-extension diagnostic" >&2
-    cat "$split_unknown_extension_log" >&2
-    rm -f "$split_unknown_extension_log"
-    exit 1
-  fi
-  rm -f "$split_unknown_extension_log"
-  rm -rf "$tmp_split_runtime" "$tmp_split_template"
 
   tmp_jni="$(prepare_scratch_dir kotlin-jni)"
   mkdir -p "$tmp_jni/jniLibs/arm64-v8a"

@@ -1,5 +1,13 @@
 #!/usr/bin/env bun
-import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import {
   allArtifactTargets,
@@ -21,12 +29,27 @@ import {
 
 const TOOL = "prepare-rust-release-source.mjs";
 const LIBOLIPHAUNT_NATIVE_PRODUCT = "liboliphaunt-native";
-const LIBOLIPHAUNT_TOOLS_PRODUCT = "oliphaunt-tools";
 const BROKER_PRODUCT = "oliphaunt-broker";
 const RUST_PRODUCT = "oliphaunt-rust";
 const DEFAULT_STAGE_DIR = path.join(ROOT, "target/release/cargo-package-sources/oliphaunt");
 const DEFAULT_BUILD_STAGE_DIR = path.join(ROOT, "target/release/cargo-package-sources/oliphaunt-build");
 const SOURCE_NOTICE_OPTIONS = Object.freeze({ profile: "source-sdk" });
+const EXTENSION_SMOKE_TESTDATA = readdirSync(path.join(ROOT, "src/shared/fixtures/extensions"), {
+  withFileTypes: true,
+})
+  .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+  .map((entry) => [
+    `tests/fixtures/extensions/${entry.name}`,
+    `src/shared/fixtures/extensions/${entry.name}`,
+  ])
+  .sort((left, right) => left[0].localeCompare(right[0]));
+const RUST_SDK_TESTDATA = Object.freeze([
+  ["testdata/query-response-cases.json", "src/shared/fixtures/protocol/query-response-cases.json"],
+  ["testdata/database-root.json", "src/shared/fixtures/storage/database-root.json"],
+  ["testdata/behavior-contract.json", "src/shared/fixtures/postgres/behavior-contract.json"],
+  ["testdata/server-listen.json", "src/shared/fixtures/postgres/server-listen.json"],
+  ...EXTENSION_SMOKE_TESTDATA,
+]);
 
 function fail(message) {
   console.error(`${TOOL}: ${message}`);
@@ -53,32 +76,22 @@ function packageSection(text) {
   return parts[1].split("\n[", 1)[0];
 }
 
-function publishedArtifactTargets({ product, kind, surface }) {
-  return allArtifactTargets({ product, kind, surface, publishedOnly: true }, TOOL);
+function artifactTargets({ product, kind, surface }) {
+  return allArtifactTargets({ product, kind, surface }, TOOL);
 }
 
 function nativeSdkArtifactTargets() {
-  const nativeTargets = publishedArtifactTargets({
+  const nativeTargets = artifactTargets({
     product: LIBOLIPHAUNT_NATIVE_PRODUCT,
     kind: "native-runtime",
     surface: "rust-native-direct",
   });
-  const toolsTargets = publishedArtifactTargets({
-    product: LIBOLIPHAUNT_NATIVE_PRODUCT,
-    kind: "native-tools",
-    surface: "rust-native-direct",
-  });
-  const brokerTargets = publishedArtifactTargets({
+  const brokerTargets = artifactTargets({
     product: BROKER_PRODUCT,
     kind: "broker-helper",
     surface: "rust-broker",
   });
   const nativeTargetIds = nativeTargets.map((target) => target.target);
-  assertSameNativeTargetSet(
-    "oliphaunt Rust SDK native runtime/tools",
-    nativeTargetIds,
-    toolsTargets.map((target) => target.target),
-  );
   assertSameNativeTargetSet(
     "oliphaunt Rust SDK native runtime/broker",
     nativeTargetIds,
@@ -121,7 +134,6 @@ function renderReleaseCargoToml(source, nativeVersion, brokerVersion, artifactTa
   for (const target of artifactTargets.nativeTargets) {
     const cfg = rustNativeTargetCfg(target);
     addTargetDependency(cfg, `${liboliphauntCargoPackageName(target.target)} = { version = "=${nativeVersion}" }`);
-    addTargetDependency(cfg, `${LIBOLIPHAUNT_TOOLS_PRODUCT} = { version = "=${nativeVersion}" }`);
   }
   for (const target of artifactTargets.brokerTargets) {
     const cfg = rustNativeTargetCfg(target);
@@ -161,15 +173,6 @@ function validateReleaseArtifactCoverage(manifest, nativeVersion, nativeTargets)
   if (missingNative.length > 0) {
     fail(`generated oliphaunt release source is missing native runtime Cargo artifact dependencies: ${missingNative.join(", ")}`);
   }
-  if (!manifest.includes(`${LIBOLIPHAUNT_TOOLS_PRODUCT} = { version = "=${nativeVersion}" }`)) {
-    fail(`generated oliphaunt release source is missing native tools facade dependency ${LIBOLIPHAUNT_TOOLS_PRODUCT}`);
-  }
-  const directToolDeps = nativeCrates
-    .filter((crate) => crate.startsWith(`${LIBOLIPHAUNT_TOOLS_PRODUCT}-`) && manifest.includes(`${crate} = `))
-    .sort(compareText);
-  if (directToolDeps.length > 0) {
-    fail(`generated oliphaunt release source must depend on oliphaunt-tools, not target tools crates: ${directToolDeps.join(", ")}`);
-  }
 }
 
 function releaseStageDir(stageDir) {
@@ -179,6 +182,14 @@ function releaseStageDir(stageDir) {
     fail(`generated Rust release stage must be a repository-contained directory, got ${stageDir}`);
   }
   return resolved;
+}
+
+function stageRustSdkTestdata(outputDir) {
+  for (const [packageRelative, canonicalRelative] of RUST_SDK_TESTDATA) {
+    const destination = path.join(outputDir, packageRelative);
+    mkdirSync(path.dirname(destination), { recursive: true });
+    copyFileSync(path.join(ROOT, canonicalRelative), destination);
+  }
 }
 
 export function prepareRustReleaseSource({ stageDir = DEFAULT_STAGE_DIR, log = true } = {}) {
@@ -193,6 +204,7 @@ export function prepareRustReleaseSource({ stageDir = DEFAULT_STAGE_DIR, log = t
     recursive: true,
     filter: (source) => path.basename(source) !== "target",
   });
+  stageRustSdkTestdata(outputDir);
   rmSync(path.join(outputDir, "crates/oliphaunt-build"), { recursive: true, force: true });
 
   const cargoToml = path.join(outputDir, "Cargo.toml");

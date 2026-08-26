@@ -1,6 +1,7 @@
 import { join } from "node:path";
 
-import { Oliphaunt, type OliphauntDatabase } from "@oliphaunt/ts";
+import { Oliphaunt, type OliphauntServer } from "@oliphaunt/ts";
+import { pgDump, psql } from "@oliphaunt/tools";
 import { Kysely, PostgresDialect, sql, type Generated } from "kysely";
 import pg from "pg";
 
@@ -36,7 +37,7 @@ type TodoRecord = {
 };
 
 type Store = {
-  native: OliphauntDatabase;
+  native: OliphauntServer;
   db: Kysely<TodoDatabase>;
 };
 
@@ -65,16 +66,11 @@ export function getDatabase(userData: string) {
 }
 
 async function openDatabase(userData: string): Promise<Store> {
-  const native = await Oliphaunt.open({
-    engine: "nativeServer",
-    root: join(userData, "oliphaunt-native-todos"),
+  const native = await Oliphaunt.openServer({
+    storage: { kind: "directory", path: join(userData, "oliphaunt-native-todos") },
     extensions: ["hstore", "pg_trgm", "unaccent"],
-    maxClientSessions: 4,
   });
-  const connectionString = await native.connectionString();
-  if (!connectionString) {
-    throw new Error("nativeServer did not expose a PostgreSQL connection string");
-  }
+  const connectionString = native.connectionString;
   const db = new Kysely<TodoDatabase>({
     dialect: new PostgresDialect({
       pool: new Pool({
@@ -86,15 +82,23 @@ async function openDatabase(userData: string): Promise<Store> {
   for (const statement of schemaStatements) {
     await sql.raw(statement).execute(db);
   }
-  await validateSqlBackup(native);
+  if (process.env.OLIPHAUNT_ELECTRON_E2E_DRIVER) {
+    await validatePostgresTools(connectionString);
+  }
   return { native, db };
 }
 
-async function validateSqlBackup(native: OliphauntDatabase) {
-  const backup = await native.backup("sql");
-  const dump = Buffer.from(backup.bytes).toString("utf8");
+async function validatePostgresTools(connectionString: string): Promise<void> {
+  const dump = await pgDump(connectionString, { args: ["--schema-only"] });
   if (!dump.includes("PostgreSQL database dump")) {
-    throw new Error("pg_dump SQL backup smoke did not look like a PostgreSQL dump");
+    throw new Error("pg_dump schema smoke did not return a PostgreSQL dump");
+  }
+  const output = await psql(connectionString, {
+    args: ["-tA"],
+    command: "SELECT 1",
+  });
+  if (!output.split("\n").some((line) => line.trim() === "1")) {
+    throw new Error("psql smoke did not return SELECT 1 output");
   }
 }
 

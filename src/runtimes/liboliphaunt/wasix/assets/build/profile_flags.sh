@@ -8,8 +8,8 @@ case "$oliphaunt_wasix_wasix_profile" in
     OLIPHAUNT_WASM_PROFILE_LDFLAGS="${OLIPHAUNT_WASM_WASIX_LOPT:-}"
     ;;
   release)
-    OLIPHAUNT_WASM_PROFILE_CFLAGS="${OLIPHAUNT_WASM_WASIX_COPT:--O2 -g0}"
-    OLIPHAUNT_WASM_PROFILE_LDFLAGS="${OLIPHAUNT_WASM_WASIX_LOPT:-}"
+    OLIPHAUNT_WASM_PROFILE_CFLAGS="${OLIPHAUNT_WASM_WASIX_COPT:--O2 -g0 -flto=thin}"
+    OLIPHAUNT_WASM_PROFILE_LDFLAGS="${OLIPHAUNT_WASM_WASIX_LOPT:--flto=thin}"
     ;;
   release-o3)
     OLIPHAUNT_WASM_PROFILE_CFLAGS="${OLIPHAUNT_WASM_WASIX_COPT:--O3 -g0 -flto=thin}"
@@ -31,7 +31,6 @@ esac
 
 OLIPHAUNT_WASM_WASIX_CONFIGURE_WASM_OPT="${OLIPHAUNT_WASM_WASIX_CONFIGURE_WASM_OPT:-no}"
 OLIPHAUNT_WASM_WASIX_BUILD_WASM_OPT="${OLIPHAUNT_WASM_WASIX_BUILD_WASM_OPT:-yes}"
-OLIPHAUNT_WASM_WASIX_BACKEND_TIMING="${OLIPHAUNT_WASM_WASIX_BACKEND_TIMING:-0}"
 if [ -z "${OLIPHAUNT_WASM_WASM_OPT_FLAGS:-}" ]; then
   case "$oliphaunt_wasix_wasix_profile" in
     release*)
@@ -104,7 +103,6 @@ oliphaunt_wasix_wasix_profile_signature() {
   printf 'wasm_opt_preserve_unoptimized=%s\n' "${OLIPHAUNT_WASM_WASM_OPT_PRESERVE_UNOPTIMIZED:-}"
   printf 'compiler_flags=%s\n' "${OLIPHAUNT_WASM_WASIX_COMPILER_FLAGS:-}"
   printf 'linker_flags=%s\n' "${OLIPHAUNT_WASM_WASIX_LINKER_FLAGS:-}"
-  printf 'backend_timing=%s\n' "$OLIPHAUNT_WASM_WASIX_BACKEND_TIMING"
   if [ -f ./src/runtimes/liboliphaunt/wasix/assets/build/configure_wasix_dl.sh ]; then
     printf 'configure_postgres_wasix_dl_sha256=%s\n' "$(sha256sum ./src/runtimes/liboliphaunt/wasix/assets/build/configure_wasix_dl.sh | awk '{print $1}')"
   fi

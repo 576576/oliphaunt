@@ -22,7 +22,7 @@ pub(super) enum CopyMode {
     ByteCopy,
 }
 
-pub(super) fn pgdata_template_copy_mode() -> CopyMode {
+pub(super) fn cluster_seed_copy_mode() -> CopyMode {
     match std::env::var(ENV_PGDATA_COPY_MODE) {
         Ok(value) if matches!(value.as_str(), "clone" | "prefer-clone" | "prefer_clone") => {
             CopyMode::PreferClone
@@ -112,6 +112,69 @@ pub(super) fn copy_directory_tree(source: &Path, destination: &Path, mode: CopyM
             copy_symlink(&source_path, &target_path)?;
         }
     }
+    Ok(())
+}
+
+/// Flush a newly materialized directory tree before it is atomically published.
+///
+/// PostgreSQL's files are ordinary files at this point: no server has opened the
+/// directory yet. Sync files before their containing directories so a completed
+/// root descriptor never names an initialization that only existed in cache.
+pub(super) fn sync_directory_tree(path: &Path) -> Result<()> {
+    for entry in sorted_read_dir(path)? {
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|err| {
+            Error::Engine(format!(
+                "read file type for {} while syncing: {err}",
+                entry_path.display()
+            ))
+        })?;
+        if file_type.is_dir() {
+            sync_directory_tree(&entry_path)?;
+        } else if file_type.is_file() {
+            sync_file(&entry_path)?;
+        } else if file_type.is_symlink() {
+            return Err(Error::Engine(format!(
+                "native PGDATA publication contains a symbolic link: {}",
+                entry_path.display()
+            )));
+        } else {
+            return Err(Error::Engine(format!(
+                "native PGDATA publication contains a special file: {}",
+                entry_path.display()
+            )));
+        }
+    }
+    sync_directory(path)
+}
+
+#[cfg(windows)]
+pub(super) fn sync_file(path: &Path) -> Result<()> {
+    // FlushFileBuffers requires a write-capable handle on Windows.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| Error::Engine(format!("sync file {}: {err}", path.display())))
+}
+
+#[cfg(not(windows))]
+pub(super) fn sync_file(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| Error::Engine(format!("sync file {}: {err}", path.display())))
+}
+
+#[cfg(unix)]
+pub(super) fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| Error::Engine(format!("sync directory {}: {err}", path.display())))
+}
+
+#[cfg(not(unix))]
+pub(super) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

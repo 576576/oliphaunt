@@ -7,6 +7,12 @@
 #include <ReactCommon/CallInvoker.h>
 #include <jsi/jsi.h>
 #include <react/bridging/Function.h>
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <optional>
 #endif
 
 #include <cmath>
@@ -14,6 +20,104 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#ifdef RCT_NEW_ARCH_ENABLED
+class OliphauntChunkAcknowledgement final {
+ public:
+  void resolve()
+  {
+    finish(std::nullopt);
+  }
+
+  void reject(std::string message)
+  {
+    finish(std::move(message));
+  }
+
+  std::optional<std::string> wait()
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this]() { return complete_; });
+    return error_;
+  }
+
+ private:
+  void finish(std::optional<std::string> error)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (complete_) {
+        return;
+      }
+      error_ = std::move(error);
+      complete_ = true;
+    }
+    condition_.notify_one();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool complete_ = false;
+  std::optional<std::string> error_;
+};
+
+static std::mutex gOliphauntChunkAcknowledgementsMutex;
+static std::vector<std::weak_ptr<OliphauntChunkAcknowledgement>> gOliphauntChunkAcknowledgements;
+
+static void OliphauntRegisterChunkAcknowledgement(
+    const std::shared_ptr<OliphauntChunkAcknowledgement> &acknowledgement)
+{
+  std::lock_guard<std::mutex> lock(gOliphauntChunkAcknowledgementsMutex);
+  gOliphauntChunkAcknowledgements.erase(
+      std::remove_if(
+          gOliphauntChunkAcknowledgements.begin(),
+          gOliphauntChunkAcknowledgements.end(),
+          [](const auto &entry) { return entry.expired(); }),
+      gOliphauntChunkAcknowledgements.end());
+  gOliphauntChunkAcknowledgements.emplace_back(acknowledgement);
+}
+
+static void OliphauntUnregisterChunkAcknowledgement(
+    const std::shared_ptr<OliphauntChunkAcknowledgement> &acknowledgement)
+{
+  std::lock_guard<std::mutex> lock(gOliphauntChunkAcknowledgementsMutex);
+  gOliphauntChunkAcknowledgements.erase(
+      std::remove_if(
+          gOliphauntChunkAcknowledgements.begin(),
+          gOliphauntChunkAcknowledgements.end(),
+          [&acknowledgement](const auto &entry) {
+            auto current = entry.lock();
+            return current == nullptr || current == acknowledgement;
+          }),
+      gOliphauntChunkAcknowledgements.end());
+}
+
+static void OliphauntAbortChunkAcknowledgements(void)
+{
+  std::vector<std::shared_ptr<OliphauntChunkAcknowledgement>> acknowledgements;
+  {
+    std::lock_guard<std::mutex> lock(gOliphauntChunkAcknowledgementsMutex);
+    acknowledgements.reserve(gOliphauntChunkAcknowledgements.size());
+    for (const auto &entry : gOliphauntChunkAcknowledgements) {
+      if (auto acknowledgement = entry.lock()) {
+        acknowledgements.push_back(std::move(acknowledgement));
+      }
+    }
+    gOliphauntChunkAcknowledgements.clear();
+  }
+  for (const auto &acknowledgement : acknowledgements) {
+    acknowledgement->reject("React Native Oliphaunt module has been invalidated");
+  }
+}
+
+static NSError *OliphauntProtocolStreamCallbackError(const std::string &message)
+{
+  NSString *description = [NSString stringWithUTF8String:message.c_str()];
+  return [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
+                             code:1
+                         userInfo:@{NSLocalizedDescriptionKey: description ?: @"protocol stream callback failed"}];
+}
+#endif
 
 static void OliphauntReject(
     RCTPromiseRejectBlock reject,
@@ -24,6 +128,196 @@ static void OliphauntReject(
   reject(code, error.localizedDescription ?: fallback, error);
 }
 
+static constexpr double kOliphauntMaxSafeIntegerHandle = 9007199254740991.0;
+
+static BOOL OliphauntIsValidHandle(double handle)
+{
+  return std::isfinite(handle) &&
+      handle > 0 &&
+      std::trunc(handle) == handle &&
+      handle <= kOliphauntMaxSafeIntegerHandle;
+}
+
+static NSNumber *_Nullable OliphauntHandleKey(double handle)
+{
+  if (!OliphauntIsValidHandle(handle)) {
+    return nil;
+  }
+  return @(static_cast<uint64_t>(handle));
+}
+
+typedef NS_ENUM(NSInteger, OliphauntNativeDirectCleanupAdmission) {
+  OliphauntNativeDirectCleanupStarted,
+  OliphauntNativeDirectCleanupAlreadyInFlight,
+  OliphauntNativeDirectCleanupRejected,
+};
+
+static NSObject *OliphauntNativeDirectOwnerLock(void)
+{
+  static NSObject *lock;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    lock = [NSObject new];
+  });
+  return lock;
+}
+
+static uint64_t OliphauntNativeDirectGeneration = 0;
+static uint64_t OliphauntNativeDirectClaim = 0;
+static OliphauntAdapterDatabase *_Nullable OliphauntRetainedNativeDirectDatabase = nil;
+static BOOL OliphauntNativeDirectCleanupInFlight = NO;
+
+static NSError *OliphauntNativeDirectOwnerError(
+    NSString *message,
+    NSError *_Nullable underlying)
+{
+  NSMutableDictionary *userInfo = [@{NSLocalizedDescriptionKey: message} mutableCopy];
+  if (underlying != nil) {
+    userInfo[NSUnderlyingErrorKey] = underlying;
+  }
+  return [NSError errorWithDomain:@"dev.oliphaunt.reactnative.nativeDirect"
+                             code:1
+                         userInfo:userInfo];
+}
+
+static uint64_t OliphauntNextNativeDirectClaim(void)
+{
+  OliphauntNativeDirectGeneration += 1;
+  if (OliphauntNativeDirectGeneration == 0) {
+    OliphauntNativeDirectGeneration = 1;
+  }
+  return OliphauntNativeDirectGeneration;
+}
+
+static void OliphauntAcquireNativeDirect(
+    void (^completion)(uint64_t claim, NSError *_Nullable error))
+{
+  __block uint64_t claim = 0;
+  __block uint64_t retainedClaim = 0;
+  __block OliphauntAdapterDatabase *retainedDatabase = nil;
+  __block NSError *admissionError = nil;
+  @synchronized (OliphauntNativeDirectOwnerLock()) {
+    if (OliphauntNativeDirectCleanupInFlight) {
+      admissionError = OliphauntNativeDirectOwnerError(
+          @"React Native nativeDirect cleanup is already in progress",
+          nil);
+    } else if (OliphauntRetainedNativeDirectDatabase != nil) {
+      retainedClaim = OliphauntNativeDirectClaim;
+      retainedDatabase = OliphauntRetainedNativeDirectDatabase;
+      OliphauntNativeDirectCleanupInFlight = YES;
+    } else if (OliphauntNativeDirectClaim != 0) {
+      admissionError = OliphauntNativeDirectOwnerError(
+          @"React Native nativeDirect already has an active or pending open; close the active instance before opening another",
+          nil);
+    } else {
+      claim = OliphauntNextNativeDirectClaim();
+      OliphauntNativeDirectClaim = claim;
+    }
+  }
+
+  if (admissionError != nil) {
+    completion(0, admissionError);
+    return;
+  }
+  if (retainedDatabase == nil) {
+    completion(claim, nil);
+    return;
+  }
+
+  [retainedDatabase closeWithCompletion:^(NSError *_Nullable closeError) {
+    __block uint64_t recoveredClaim = 0;
+    __block NSError *recoveryError = nil;
+    @synchronized (OliphauntNativeDirectOwnerLock()) {
+      OliphauntNativeDirectCleanupInFlight = NO;
+      if (closeError != nil) {
+        recoveryError = OliphauntNativeDirectOwnerError(
+            @"React Native nativeDirect could not recover the previously retained instance",
+            closeError);
+      } else if (
+          OliphauntNativeDirectClaim != retainedClaim ||
+          OliphauntRetainedNativeDirectDatabase != retainedDatabase) {
+        recoveryError = OliphauntNativeDirectOwnerError(
+            @"React Native nativeDirect ownership changed during retained cleanup",
+            nil);
+      } else {
+        OliphauntRetainedNativeDirectDatabase = nil;
+        recoveredClaim = OliphauntNextNativeDirectClaim();
+        OliphauntNativeDirectClaim = recoveredClaim;
+      }
+    }
+    completion(recoveredClaim, recoveryError);
+  }];
+}
+
+static void OliphauntReleaseNativeDirect(uint64_t claim)
+{
+  @synchronized (OliphauntNativeDirectOwnerLock()) {
+    if (
+        OliphauntNativeDirectClaim == claim &&
+        OliphauntRetainedNativeDirectDatabase == nil) {
+      OliphauntNativeDirectClaim = 0;
+    }
+  }
+}
+
+static OliphauntNativeDirectCleanupAdmission OliphauntBeginNativeDirectCleanup(
+    uint64_t claim,
+    OliphauntAdapterDatabase *database,
+    NSError *_Nullable *_Nullable error)
+{
+  @synchronized (OliphauntNativeDirectOwnerLock()) {
+    if (OliphauntNativeDirectClaim != claim || claim == 0) {
+      if (error != nullptr) {
+        *error = OliphauntNativeDirectOwnerError(
+            @"React Native nativeDirect ownership changed before cleanup",
+            nil);
+      }
+      return OliphauntNativeDirectCleanupRejected;
+    }
+    if (
+        OliphauntRetainedNativeDirectDatabase != nil &&
+        OliphauntRetainedNativeDirectDatabase != database) {
+      if (error != nullptr) {
+        *error = OliphauntNativeDirectOwnerError(
+            @"React Native nativeDirect already retains a different database",
+            nil);
+      }
+      return OliphauntNativeDirectCleanupRejected;
+    }
+    OliphauntRetainedNativeDirectDatabase = database;
+    if (OliphauntNativeDirectCleanupInFlight) {
+      return OliphauntNativeDirectCleanupAlreadyInFlight;
+    }
+    OliphauntNativeDirectCleanupInFlight = YES;
+    return OliphauntNativeDirectCleanupStarted;
+  }
+}
+
+static void OliphauntFinishNativeDirectCleanup(
+    uint64_t claim,
+    OliphauntAdapterDatabase *database,
+    NSError *_Nullable error,
+    BOOL retainOnFailure)
+{
+  @synchronized (OliphauntNativeDirectOwnerLock()) {
+    if (
+        OliphauntNativeDirectClaim != claim ||
+        OliphauntRetainedNativeDirectDatabase != database) {
+      return;
+    }
+    OliphauntNativeDirectCleanupInFlight = NO;
+    if (error == nil) {
+      OliphauntRetainedNativeDirectDatabase = nil;
+      OliphauntNativeDirectClaim = 0;
+    } else if (!retainOnFailure) {
+      // The live module still owns this failed close and can retry it. Process-
+      // wide retention is reserved for teardown, where that module owner goes
+      // away and the next module must recover the exact database first.
+      OliphauntRetainedNativeDirectDatabase = nil;
+    }
+  }
+}
+
 #ifdef RCT_NEW_ARCH_ENABLED
 static void OliphauntSetIfPresent(NSMutableDictionary *dictionary, NSString *key, id value)
 {
@@ -32,32 +326,17 @@ static void OliphauntSetIfPresent(NSMutableDictionary *dictionary, NSString *key
   }
 }
 
-static NSDictionary *OliphauntNativeResourceConfigToDictionary(
-    JS::NativeOliphaunt::NativeResourceConfig &config)
-{
-  NSMutableDictionary *dictionary = [NSMutableDictionary new];
-  OliphauntSetIfPresent(dictionary, @"resourceRoot", config.resourceRoot());
-  return dictionary;
-}
-
 static NSDictionary *OliphauntNativeOpenConfigToDictionary(
     JS::NativeOliphaunt::NativeOpenConfig &config)
 {
   NSMutableDictionary *dictionary = [NSMutableDictionary new];
-  OliphauntSetIfPresent(dictionary, @"engine", config.engine());
-  OliphauntSetIfPresent(dictionary, @"root", config.root());
-  if (auto temporary = config.temporary()) {
-    dictionary[@"temporary"] = @(*temporary);
-  }
-  OliphauntSetIfPresent(dictionary, @"durability", config.durability());
-  OliphauntSetIfPresent(dictionary, @"runtimeFootprint", config.runtimeFootprint());
+  dictionary[@"storageKind"] = config.storageKind();
+  OliphauntSetIfPresent(dictionary, @"storagePath", config.storagePath());
+  OliphauntSetIfPresent(dictionary, @"storageName", config.storageName());
   OliphauntSetIfPresent(dictionary, @"startupGUCs", RCTConvertOptionalVecToArray(config.startupGUCs()));
   OliphauntSetIfPresent(dictionary, @"username", config.username());
   OliphauntSetIfPresent(dictionary, @"database", config.database());
   OliphauntSetIfPresent(dictionary, @"extensions", RCTConvertOptionalVecToArray(config.extensions()));
-  OliphauntSetIfPresent(dictionary, @"libraryPath", config.libraryPath());
-  OliphauntSetIfPresent(dictionary, @"runtimeDirectory", config.runtimeDirectory());
-  OliphauntSetIfPresent(dictionary, @"resourceRoot", config.resourceRoot());
   return dictionary;
 }
 
@@ -121,15 +400,11 @@ static double OliphauntCopyHandleArgument(
     facebook::jsi::Runtime &runtime,
     const facebook::jsi::Value &value)
 {
-  constexpr double kMaxSafeInteger = 9007199254740991.0;
   if (!value.isNumber()) {
     throw facebook::jsi::JSError(runtime, "liboliphaunt JSI handle must be a number");
   }
   double handle = value.asNumber();
-  if (!std::isfinite(handle) ||
-      handle <= 0 ||
-      std::trunc(handle) != handle ||
-      handle > kMaxSafeInteger) {
+  if (!OliphauntIsValidHandle(handle)) {
     throw facebook::jsi::JSError(runtime, "liboliphaunt JSI handle must be a positive safe integer");
   }
   return handle;
@@ -218,16 +493,11 @@ static facebook::jsi::Value OliphauntCreateError(
 }
 #endif
 
-static NSString *OliphauntStringConfigValue(id value, NSString *defaultValue)
-{
-  return [value isKindOfClass:[NSString class]] ? (NSString *)value : defaultValue;
-}
-
 @implementation Oliphaunt {
   NSMutableDictionary<NSNumber *, OliphauntAdapterDatabase *> *_sessions;
-  NSMutableDictionary<NSNumber *, NSString *> *_sessionKeys;
   dispatch_queue_t _methodQueue;
-  NSString *_pendingSessionKey;
+  uint64_t _nativeDirectClaim;
+  BOOL _invalidated;
   uint64_t _nextHandle;
 }
 
@@ -242,7 +512,6 @@ RCT_EXPORT_MODULE(Oliphaunt)
 {
   if (self = [super init]) {
     _sessions = [NSMutableDictionary new];
-    _sessionKeys = [NSMutableDictionary new];
     _methodQueue = dispatch_queue_create("dev.oliphaunt.reactnative.ios.module", DISPATCH_QUEUE_SERIAL);
     _nextHandle = 1;
   }
@@ -275,117 +544,119 @@ RCT_EXPORT_MODULE(Oliphaunt)
                           reject:(RCTPromiseRejectBlock)reject
 {
   NSDictionary *configCopy = [config copy] ?: @{};
-  NSString *sessionKey = [self sessionKeyForConfigDictionary:configCopy];
+  __block NSNumber *handle = nil;
   @synchronized (self) {
-    NSNumber *existingHandle = [self existingHandleForSessionKey:sessionKey];
-    if (existingHandle != nil) {
-      resolve(existingHandle);
-      return;
-    }
-    if (_pendingSessionKey != nil) {
+    if (_invalidated) {
       reject(
-          @"liboliphaunt_open_in_progress",
-          @"React Native nativeDirect already has an open in progress",
+          @"liboliphaunt_invalidated",
+          @"React Native Oliphaunt module has been invalidated",
           nil);
       return;
     }
-    if (_sessions.count > 0) {
+    if (_nextHandle > static_cast<uint64_t>(kOliphauntMaxSafeIntegerHandle)) {
       reject(
           @"liboliphaunt_open_failed",
-          @"React Native nativeDirect already has an active database; close it before opening another root",
+          @"React Native Oliphaunt handle space is exhausted",
           nil);
       return;
     }
-    _pendingSessionKey = sessionKey;
+    handle = @(_nextHandle++);
   }
-  [OliphauntAdapterDatabase openWithConfig:configCopy completion:^(
-      OliphauntAdapterDatabase *_Nullable database,
-      NSError *_Nullable error) {
-    if (database == nil) {
-      @synchronized (self) {
-        self->_pendingSessionKey = nil;
-      }
-      OliphauntReject(reject, @"liboliphaunt_open_failed", @"failed to open liboliphaunt", error);
+  OliphauntAcquireNativeDirect(^(uint64_t claim, NSError *_Nullable admissionError) {
+    if (admissionError != nil) {
+      OliphauntReject(
+          reject,
+          @"liboliphaunt_open_failed",
+          @"failed to acquire React Native nativeDirect ownership",
+          admissionError);
       return;
     }
 
-    NSNumber *handle = nil;
+    __block BOOL invalidatedBeforeOpen = NO;
     @synchronized (self) {
-      handle = @(self->_nextHandle++);
-      self->_sessions[handle] = database;
-      self->_sessionKeys[handle] = sessionKey;
-      self->_pendingSessionKey = nil;
+      invalidatedBeforeOpen = self->_invalidated;
+      if (!invalidatedBeforeOpen) {
+        self->_nativeDirectClaim = claim;
+      }
     }
-    resolve(handle);
-  }];
-}
-
-- (void)supportedModes:(RCTPromiseResolveBlock)resolve
-                reject:(RCTPromiseRejectBlock)reject
-{
-  [OliphauntAdapterDatabase supportedModesWithCompletion:^(
-      NSArray *_Nullable modes,
-      NSError *_Nullable error) {
-    if (error != nil) {
-      OliphauntReject(reject, @"liboliphaunt_supported_modes_failed", @"liboliphaunt supportedModes failed", error);
+    if (invalidatedBeforeOpen) {
+      OliphauntReleaseNativeDirect(claim);
+      reject(
+          @"liboliphaunt_invalidated",
+          @"React Native Oliphaunt module was invalidated before opening nativeDirect",
+          nil);
       return;
     }
-    resolve(modes ?: @[]);
-  }];
-}
 
-- (void)packageSizeReportWithConfigDictionary:(NSDictionary *)config
-                                      resolve:(RCTPromiseResolveBlock)resolve
-                                       reject:(RCTPromiseRejectBlock)reject
-{
-  NSDictionary *configCopy = [config copy] ?: @{};
-  [OliphauntAdapterDatabase packageSizeReportWithConfig:configCopy completion:^(
-      NSDictionary *_Nullable report,
-      NSError *_Nullable error) {
-    if (error != nil) {
-      OliphauntReject(reject, @"liboliphaunt_package_size_failed", @"liboliphaunt packageSizeReport failed", error);
-      return;
-    }
-    resolve(report ?: [NSNull null]);
-  }];
-}
+    [OliphauntAdapterDatabase openWithConfig:configCopy completion:^(
+        OliphauntAdapterDatabase *_Nullable database,
+        NSError *_Nullable error) {
+      if (database == nil) {
+        @synchronized (self) {
+          if (self->_nativeDirectClaim == claim) {
+            self->_nativeDirectClaim = 0;
+          }
+        }
+        OliphauntReleaseNativeDirect(claim);
+        OliphauntReject(reject, @"liboliphaunt_open_failed", @"failed to open liboliphaunt", error);
+        return;
+      }
 
-- (void)processMemory:(RCTPromiseResolveBlock)resolve
-               reject:(RCTPromiseRejectBlock)reject
-{
-  [OliphauntAdapterDatabase processMemoryWithCompletion:^(
-      NSDictionary *_Nullable report,
-      NSError *_Nullable error) {
-    if (error != nil) {
-      OliphauntReject(reject, @"liboliphaunt_process_memory_failed", @"liboliphaunt processMemory failed", error);
-      return;
-    }
-    resolve(report ?: @{});
-  }];
+      BOOL invalidated = NO;
+      @synchronized (self) {
+        invalidated = self->_invalidated;
+        if (invalidated) {
+          if (self->_nativeDirectClaim == claim) {
+            self->_nativeDirectClaim = 0;
+          }
+        } else {
+          self->_sessions[handle] = database;
+        }
+      }
+      if (invalidated) {
+        NSError *cleanupAdmissionError = nil;
+        OliphauntNativeDirectCleanupAdmission cleanupAdmission =
+            OliphauntBeginNativeDirectCleanup(claim, database, &cleanupAdmissionError);
+        if (cleanupAdmission != OliphauntNativeDirectCleanupStarted) {
+          OliphauntReject(
+              reject,
+              @"liboliphaunt_close_failed",
+              @"failed to retain nativeDirect after module invalidation",
+              cleanupAdmissionError);
+          return;
+        }
+        [database closeWithCompletion:^(NSError *_Nullable closeError) {
+          OliphauntFinishNativeDirectCleanup(claim, database, closeError, YES);
+          if (closeError != nil) {
+            OliphauntReject(
+                reject,
+                @"liboliphaunt_close_failed",
+                @"React Native Oliphaunt module was invalidated while opening nativeDirect; cleanup is retained for the next open",
+                closeError);
+            return;
+          }
+          reject(
+              @"liboliphaunt_invalidated",
+              @"React Native Oliphaunt module was invalidated while opening nativeDirect",
+              nil);
+        }];
+        return;
+      }
+      resolve(handle);
+    }];
+  });
 }
-
-#ifdef RCT_NEW_ARCH_ENABLED
-- (void)packageSizeReport:(JS::NativeOliphaunt::NativeResourceConfig &)config
-                  resolve:(RCTPromiseResolveBlock)resolve
-                   reject:(RCTPromiseRejectBlock)reject
-{
-  [self packageSizeReportWithConfigDictionary:OliphauntNativeResourceConfigToDictionary(config)
-                                      resolve:resolve
-                                       reject:reject];
-}
-#else
-- (void)packageSizeReport:(NSDictionary *)config
-                  resolve:(RCTPromiseResolveBlock)resolve
-                   reject:(RCTPromiseRejectBlock)reject
-{
-  [self packageSizeReportWithConfigDictionary:config resolve:resolve reject:reject];
-}
-#endif
 
 - (void)execProtocolRawDataForJsi:(double)handle
                           request:(NSData *)request
                        completion:(OliphauntDataCompletion)completion
 {
+  if (!OliphauntIsValidHandle(handle)) {
+    completion(nil, [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
+                                        code:400
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Oliphaunt handle must be a finite positive safe integer"}]);
+    return;
+  }
   OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
   if (database == nil) {
     completion(nil, [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
@@ -401,6 +672,12 @@ RCT_EXPORT_MODULE(Oliphaunt)
                               onChunk:(OliphauntStreamChunk)onChunk
                            completion:(OliphauntVoidCompletion)completion
 {
+  if (!OliphauntIsValidHandle(handle)) {
+    completion([NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
+                                   code:400
+                               userInfo:@{NSLocalizedDescriptionKey: @"Oliphaunt handle must be a finite positive safe integer"}]);
+    return;
+  }
   OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
   if (database == nil) {
     completion([NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
@@ -411,10 +688,14 @@ RCT_EXPORT_MODULE(Oliphaunt)
   [database execProtocolStreamData:request onChunk:onChunk completion:completion];
 }
 
-- (void)backupDataForJsi:(double)handle
-                  format:(NSString *)format
-              completion:(OliphauntDataCompletion)completion
+- (void)backupDataForJsi:(double)handle completion:(OliphauntDataCompletion)completion
 {
+  if (!OliphauntIsValidHandle(handle)) {
+    completion(nil, [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
+                                        code:400
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Oliphaunt handle must be a finite positive safe integer"}]);
+    return;
+  }
   OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
   if (database == nil) {
     completion(nil, [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
@@ -422,22 +703,20 @@ RCT_EXPORT_MODULE(Oliphaunt)
                                     userInfo:@{NSLocalizedDescriptionKey: @"unknown Oliphaunt handle"}]);
     return;
   }
-  [database backupDataWithFormat:format completion:completion];
+  [database backupDataWithCompletion:completion];
 }
 
-- (void)restoreDataForJsi:(NSString *)root
-                   format:(NSString *)format
-             artifactData:(NSData *)artifactData
-          replaceExisting:(BOOL)replaceExisting
-              libraryPath:(NSString *_Nullable)libraryPath
-               completion:(OliphauntStringCompletion)completion
+- (void)restoreDataForJsi:(NSString *)storageKind
+                storagePath:(NSString *_Nullable)storagePath
+                storageName:(NSString *_Nullable)storageName
+               backupData:(NSData *)backupData
+               completion:(OliphauntVoidCompletion)completion
 {
-  [OliphauntAdapterDatabase restoreWithRoot:root
-                                   format:format
-                             artifactData:artifactData
-                          replaceExisting:replaceExisting
-                              libraryPath:libraryPath
-                               completion:completion];
+  [OliphauntAdapterDatabase restoreWithStorageKind:storageKind
+                                        storagePath:storagePath
+                                        storageName:storageName
+                                        backupData:backupData
+                                        completion:completion];
 }
 
 #ifdef RCT_NEW_ARCH_ENABLED
@@ -453,7 +732,7 @@ RCT_EXPORT_MODULE(Oliphaunt)
       facebook::jsi::Function::createFromHostFunction(
           runtime,
           facebook::jsi::PropNameID::forAscii(runtime, "liboliphauntExecProtocolRaw"),
-          2,
+          1,
           [weakSelf, callInvoker](
               facebook::jsi::Runtime &runtime,
               const facebook::jsi::Value &,
@@ -571,6 +850,7 @@ RCT_EXPORT_MODULE(Oliphaunt)
                       runtime,
                       promiseArgs[1].asObject(runtime).getFunction(runtime),
                       callInvoker);
+                  auto settled = std::make_shared<std::atomic<bool>>(false);
                   Oliphaunt *strongSelf = weakSelf;
                   if (strongSelf == nil) {
                     reject->call([](facebook::jsi::Runtime &runtime, facebook::jsi::Function &rejectFunction) {
@@ -582,14 +862,87 @@ RCT_EXPORT_MODULE(Oliphaunt)
                   [strongSelf execProtocolStreamDataForJsi:handle
                                                    request:requestData
                                                    onChunk:^(NSData *chunk) {
+                    @synchronized (strongSelf) {
+                      if (strongSelf->_invalidated) {
+                        return [NSError errorWithDomain:@"dev.oliphaunt.reactnative.ios"
+                                                   code:1
+                                               userInfo:@{NSLocalizedDescriptionKey: @"React Native Oliphaunt module has been invalidated"}];
+                      }
+                    }
                     std::vector<uint8_t> bytes = OliphauntBytesFromNSData(chunk);
-                    chunkCallback->call([bytes = std::move(bytes)](
-                                            facebook::jsi::Runtime &runtime,
-                                            facebook::jsi::Function &chunkFunction) mutable {
-                      chunkFunction.call(runtime, OliphauntArrayBufferFromBytes(runtime, std::move(bytes)));
-                    });
+                    auto acknowledgement = std::make_shared<OliphauntChunkAcknowledgement>();
+                    OliphauntRegisterChunkAcknowledgement(acknowledgement);
+                    try {
+                      chunkCallback->call([strongSelf, bytes = std::move(bytes), acknowledgement, reject, settled](
+                                              facebook::jsi::Runtime &runtime,
+                                              facebook::jsi::Function &chunkFunction) mutable {
+                        @synchronized (strongSelf) {
+                          if (strongSelf->_invalidated) {
+                            acknowledgement->reject("React Native Oliphaunt module has been invalidated");
+                            return;
+                          }
+                        }
+                        try {
+                          auto result = chunkFunction.call(
+                              runtime,
+                              OliphauntArrayBufferFromBytes(runtime, std::move(bytes)));
+                          if (result.isObject()) {
+                            auto resultObject = result.asObject(runtime);
+                            auto failureMarker = resultObject.getProperty(
+                                runtime,
+                                "__oliphauntProtocolChunkFailure");
+                            if (failureMarker.isBool() && failureMarker.getBool()) {
+                              auto failure = std::make_shared<facebook::jsi::Value>(
+                                  runtime,
+                                  resultObject.getProperty(runtime, "error"));
+                              if (!settled->exchange(true)) {
+                                reject->call([failure](
+                                                 facebook::jsi::Runtime &runtime,
+                                                 facebook::jsi::Function &rejectFunction) {
+                                  rejectFunction.call(
+                                      runtime,
+                                      facebook::jsi::Value(runtime, *failure));
+                                });
+                              }
+                              acknowledgement->reject("protocol stream callback failed");
+                              return;
+                            }
+                          }
+                          acknowledgement->resolve();
+                        } catch (const facebook::jsi::JSError &error) {
+                          if (!settled->exchange(true)) {
+                            auto value = std::make_shared<facebook::jsi::Value>(runtime, error.value());
+                            reject->call([value](
+                                             facebook::jsi::Runtime &runtime,
+                                             facebook::jsi::Function &rejectFunction) {
+                              rejectFunction.call(runtime, facebook::jsi::Value(runtime, *value));
+                            });
+                          }
+                          acknowledgement->reject(error.what());
+                        } catch (const std::exception &error) {
+                          acknowledgement->reject(error.what());
+                        } catch (...) {
+                          acknowledgement->reject("protocol stream callback failed");
+                        }
+                      });
+                    } catch (const std::exception &error) {
+                      acknowledgement->reject(error.what());
+                    } catch (...) {
+                      acknowledgement->reject("failed to schedule protocol stream callback");
+                    }
+                    auto error = acknowledgement->wait();
+                    OliphauntUnregisterChunkAcknowledgement(acknowledgement);
+                    return error ? OliphauntProtocolStreamCallbackError(*error) : nil;
                   }
                                                 completion:^(NSError *_Nullable error) {
+                    @synchronized (strongSelf) {
+                      if (strongSelf->_invalidated) {
+                        return;
+                      }
+                    }
+                    if (settled->exchange(true)) {
+                      return;
+                    }
                     if (error != nil) {
                       const char *errorMessage = error.localizedDescription.UTF8String;
                       std::string message = errorMessage != nullptr ? errorMessage : "liboliphaunt stream failed";
@@ -618,19 +971,17 @@ RCT_EXPORT_MODULE(Oliphaunt)
               const facebook::jsi::Value &,
               const facebook::jsi::Value *args,
               size_t count) -> facebook::jsi::Value {
-            if (count != 2) {
-              throw facebook::jsi::JSError(runtime, "liboliphaunt JSI backup expects handle and format");
+            if (count != 1) {
+              throw facebook::jsi::JSError(runtime, "liboliphaunt JSI backup expects a handle");
             }
 
             double handle = OliphauntCopyHandleArgument(runtime, args[0]);
-            NSString *format = OliphauntNSStringFromString(
-                OliphauntCopyStringArgument(runtime, args[1], "backup format"));
             auto promiseConstructor = runtime.global().getPropertyAsFunction(runtime, "Promise");
             auto executor = facebook::jsi::Function::createFromHostFunction(
                 runtime,
                 facebook::jsi::PropNameID::forAscii(runtime, "liboliphauntBackupExecutor"),
                 2,
-                [weakSelf, callInvoker, handle, format](
+                [weakSelf, callInvoker, handle](
                     facebook::jsi::Runtime &runtime,
                     const facebook::jsi::Value &,
                     const facebook::jsi::Value *promiseArgs,
@@ -660,7 +1011,6 @@ RCT_EXPORT_MODULE(Oliphaunt)
                   }
 
                   [strongSelf backupDataForJsi:handle
-                                        format:format
                                     completion:^(NSData *_Nullable response, NSError *_Nullable error) {
                     if (error != nil) {
                       const char *errorMessage = error.localizedDescription.UTF8String;
@@ -687,30 +1037,41 @@ RCT_EXPORT_MODULE(Oliphaunt)
       facebook::jsi::Function::createFromHostFunction(
           runtime,
           facebook::jsi::PropNameID::forAscii(runtime, "liboliphauntRestore"),
-          5,
+          2,
           [weakSelf, callInvoker](
               facebook::jsi::Runtime &runtime,
               const facebook::jsi::Value &,
               const facebook::jsi::Value *args,
               size_t count) -> facebook::jsi::Value {
-            if (count != 5 || !args[3].isBool()) {
-              throw facebook::jsi::JSError(runtime, "liboliphaunt JSI restore expects root, format, artifact, replaceExisting, and libraryPath");
+            if (count != 2) {
+              throw facebook::jsi::JSError(runtime, "liboliphaunt JSI restore expects destination and backup bytes");
             }
 
-            NSString *root = OliphauntNSStringFromString(
-                OliphauntCopyStringArgument(runtime, args[0], "restore root"));
-            NSString *format = OliphauntNSStringFromString(
-                OliphauntCopyStringArgument(runtime, args[1], "restore format"));
-            std::vector<uint8_t> artifact = OliphauntCopyBinaryArgument(runtime, args[2]);
+            if (!args[0].isObject()) {
+              throw facebook::jsi::JSError(runtime, "liboliphaunt JSI restore destination must be an object");
+            }
+            auto destination = args[0].asObject(runtime);
+            NSString *storageKind = OliphauntNSStringFromString(
+                OliphauntCopyStringArgument(
+                    runtime,
+                    destination.getProperty(runtime, "storageKind"),
+                    "restore storageKind"));
+            NSString *storagePath = OliphauntCopyOptionalNSStringArgument(
+                runtime,
+                destination.getProperty(runtime, "storagePath"),
+                "restore storagePath");
+            NSString *storageName = OliphauntCopyOptionalNSStringArgument(
+                runtime,
+                destination.getProperty(runtime, "storageName"),
+                "restore storageName");
+            std::vector<uint8_t> artifact = OliphauntCopyBinaryArgument(runtime, args[1]);
             auto artifactData = [NSData dataWithBytes:artifact.data() length:artifact.size()];
-            BOOL replaceExisting = args[3].getBool();
-            NSString *libraryPath = OliphauntCopyOptionalNSStringArgument(runtime, args[4], "restore libraryPath");
             auto promiseConstructor = runtime.global().getPropertyAsFunction(runtime, "Promise");
             auto executor = facebook::jsi::Function::createFromHostFunction(
                 runtime,
                 facebook::jsi::PropNameID::forAscii(runtime, "liboliphauntRestoreExecutor"),
                 2,
-                [weakSelf, callInvoker, root, format, artifactData, replaceExisting, libraryPath](
+                [weakSelf, callInvoker, storageKind, storagePath, storageName, artifactData](
                     facebook::jsi::Runtime &runtime,
                     const facebook::jsi::Value &,
                     const facebook::jsi::Value *promiseArgs,
@@ -739,12 +1100,11 @@ RCT_EXPORT_MODULE(Oliphaunt)
                     return facebook::jsi::Value::undefined();
                   }
 
-                  [strongSelf restoreDataForJsi:root
-                                         format:format
-                                   artifactData:artifactData
-                                replaceExisting:replaceExisting
-                                    libraryPath:libraryPath
-                                     completion:^(NSString *_Nullable restoredRoot, NSError *_Nullable error) {
+                  [strongSelf restoreDataForJsi:storageKind
+                                      storagePath:storagePath
+                                      storageName:storageName
+                                      backupData:artifactData
+                                      completion:^(NSError *_Nullable error) {
                     if (error != nil) {
                       const char *errorMessage = error.localizedDescription.UTF8String;
                       std::string message = errorMessage != nullptr ? errorMessage : "liboliphaunt restore failed";
@@ -753,9 +1113,8 @@ RCT_EXPORT_MODULE(Oliphaunt)
                       });
                       return;
                     }
-                    std::string restored = restoredRoot.UTF8String != nullptr ? restoredRoot.UTF8String : "";
-                    resolve->call([restored](facebook::jsi::Runtime &runtime, facebook::jsi::Function &resolveFunction) {
-                      resolveFunction.call(runtime, facebook::jsi::String::createFromUtf8(runtime, restored));
+                    resolve->call([](facebook::jsi::Runtime &runtime, facebook::jsi::Function &resolveFunction) {
+                      resolveFunction.call(runtime, facebook::jsi::Value::undefined());
                     });
                   }];
                   return facebook::jsi::Value::undefined();
@@ -770,15 +1129,53 @@ RCT_EXPORT_MODULE(Oliphaunt)
       resolve:(RCTPromiseResolveBlock)resolve
        reject:(RCTPromiseRejectBlock)reject
 {
-  OliphauntAdapterDatabase *database = [self removeSessionForHandle:handle];
+  NSNumber *key = OliphauntHandleKey(handle);
+  if (key == nil) {
+    reject(
+        @"liboliphaunt_invalid_handle",
+        @"Oliphaunt handle must be a finite positive safe integer",
+        nil);
+    return;
+  }
+  OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
   if (database == nil) {
     resolve(nil);
     return;
   }
+  __block uint64_t claim = 0;
+  @synchronized (self) {
+    claim = _nativeDirectClaim;
+  }
+  NSError *cleanupAdmissionError = nil;
+  OliphauntNativeDirectCleanupAdmission cleanupAdmission =
+      OliphauntBeginNativeDirectCleanup(claim, database, &cleanupAdmissionError);
+  if (cleanupAdmission != OliphauntNativeDirectCleanupStarted) {
+    OliphauntReject(
+        reject,
+        @"liboliphaunt_close_failed",
+        cleanupAdmission == OliphauntNativeDirectCleanupAlreadyInFlight
+            ? @"liboliphaunt close is already in progress"
+            : @"liboliphaunt could not retain nativeDirect ownership for close",
+        cleanupAdmissionError);
+    return;
+  }
   [database closeWithCompletion:^(NSError *_Nullable error) {
+    __block BOOL retainOnFailure = NO;
+    @synchronized (self) {
+      retainOnFailure = self->_invalidated;
+    }
+    OliphauntFinishNativeDirectCleanup(claim, database, error, retainOnFailure);
     if (error != nil) {
       OliphauntReject(reject, @"liboliphaunt_close_failed", @"liboliphaunt close failed", error);
       return;
+    }
+    @synchronized (self) {
+      if (self->_sessions[key] == database) {
+        [self->_sessions removeObjectForKey:key];
+        if (self->_nativeDirectClaim == claim) {
+          self->_nativeDirectClaim = 0;
+        }
+      }
     }
     resolve(nil);
   }];
@@ -788,6 +1185,13 @@ RCT_EXPORT_MODULE(Oliphaunt)
        resolve:(RCTPromiseResolveBlock)resolve
         reject:(RCTPromiseRejectBlock)reject
 {
+  if (!OliphauntIsValidHandle(handle)) {
+    reject(
+        @"liboliphaunt_invalid_handle",
+        @"Oliphaunt handle must be a finite positive safe integer",
+        nil);
+    return;
+  }
   OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
   if (database == nil) {
     reject(@"liboliphaunt_unknown_handle", @"unknown Oliphaunt handle", nil);
@@ -802,109 +1206,56 @@ RCT_EXPORT_MODULE(Oliphaunt)
   }];
 }
 
-- (void)capabilities:(double)handle
-             resolve:(RCTPromiseResolveBlock)resolve
-              reject:(RCTPromiseRejectBlock)reject
-{
-  OliphauntAdapterDatabase *database = [self sessionForHandle:handle];
-  if (database == nil) {
-    reject(@"liboliphaunt_unknown_handle", @"unknown Oliphaunt handle", nil);
-    return;
-  }
-  [database capabilitiesWithCompletion:^(NSDictionary *_Nullable capabilities, NSError *_Nullable error) {
-    if (error != nil) {
-      OliphauntReject(reject, @"liboliphaunt_capabilities_failed", @"liboliphaunt capabilities failed", error);
-      return;
-    }
-    resolve(capabilities ?: @{});
-  }];
-}
-
 - (OliphauntAdapterDatabase *)sessionForHandle:(double)handle
 {
-  NSNumber *key = @((uint64_t)handle);
+  NSNumber *key = OliphauntHandleKey(handle);
+  if (key == nil) {
+    return nil;
+  }
   @synchronized (self) {
     return _sessions[key];
   }
 }
 
-- (OliphauntAdapterDatabase *)removeSessionForHandle:(double)handle
-{
-  NSNumber *key = @((uint64_t)handle);
-  @synchronized (self) {
-    OliphauntAdapterDatabase *database = _sessions[key];
-    [_sessions removeObjectForKey:key];
-    [_sessionKeys removeObjectForKey:key];
-    return database;
-  }
-}
-
-- (NSNumber *)existingHandleForSessionKey:(NSString *)sessionKey
-{
-  for (NSNumber *handle in _sessionKeys) {
-    if ([_sessionKeys[handle] isEqualToString:sessionKey] && _sessions[handle] != nil) {
-      return handle;
-    }
-  }
-  return nil;
-}
-
-- (NSString *)sessionKeyForConfigDictionary:(NSDictionary *)config
-{
-  NSMutableArray<NSString *> *extensions = [NSMutableArray new];
-  NSMutableArray<NSString *> *startupGUCs = [NSMutableArray new];
-  id rawExtensions = config[@"extensions"];
-  if ([rawExtensions isKindOfClass:[NSArray class]]) {
-    for (id extension in (NSArray *)rawExtensions) {
-      if ([extension isKindOfClass:[NSString class]]) {
-        [extensions addObject:(NSString *)extension];
-      }
-    }
-  }
-  id rawStartupGUCs = config[@"startupGUCs"];
-  if ([rawStartupGUCs isKindOfClass:[NSArray class]]) {
-    for (id guc in (NSArray *)rawStartupGUCs) {
-      if ([guc isKindOfClass:[NSString class]]) {
-        [startupGUCs addObject:(NSString *)guc];
-      }
-    }
-  }
-  NSString *separator = [NSString stringWithFormat:@"%C", (unichar)0x001F];
-  return [@[
-    OliphauntStringConfigValue(config[@"engine"], @"nativeDirect"),
-    OliphauntStringConfigValue(config[@"root"], @""),
-    OliphauntStringConfigValue(config[@"durability"], @"balanced"),
-    OliphauntStringConfigValue(config[@"runtimeFootprint"], @"balancedMobile"),
-    [startupGUCs componentsJoinedByString:@","],
-    OliphauntStringConfigValue(config[@"username"], @"postgres"),
-    OliphauntStringConfigValue(config[@"database"], @"postgres"),
-    [extensions componentsJoinedByString:@","],
-    OliphauntStringConfigValue(config[@"libraryPath"], @""),
-    OliphauntStringConfigValue(config[@"runtimeDirectory"], @""),
-    OliphauntStringConfigValue(config[@"resourceRoot"], @""),
-  ] componentsJoinedByString:separator];
-}
-
 - (void)invalidate
 {
-  NSArray<OliphauntAdapterDatabase *> *sessionsToClose = nil;
+  NSDictionary<NSNumber *, OliphauntAdapterDatabase *> *sessionsToClose = nil;
+  __block uint64_t claim = 0;
   @synchronized (self) {
-    sessionsToClose = _sessions.allValues;
-    [_sessions removeAllObjects];
-    [_sessionKeys removeAllObjects];
-    _pendingSessionKey = nil;
+    _invalidated = YES;
+    sessionsToClose = [_sessions copy];
+    claim = _nativeDirectClaim;
+    _nativeDirectClaim = 0;
   }
-  if (sessionsToClose.count == 0) {
-    return;
-  }
-  dispatch_group_t group = dispatch_group_create();
-  for (OliphauntAdapterDatabase *database in sessionsToClose) {
-    dispatch_group_enter(group);
-    [database closeWithCompletion:^(__unused NSError *_Nullable error) {
-      dispatch_group_leave(group);
+#ifdef RCT_NEW_ARCH_ENABLED
+  OliphauntAbortChunkAcknowledgements();
+#endif
+  [sessionsToClose enumerateKeysAndObjectsUsingBlock:^(
+      NSNumber *key,
+      OliphauntAdapterDatabase *database,
+      __unused BOOL *stop) {
+    OliphauntNativeDirectCleanupAdmission cleanupAdmission =
+        OliphauntBeginNativeDirectCleanup(claim, database, nullptr);
+    if (cleanupAdmission == OliphauntNativeDirectCleanupRejected) {
+      // This indicates an internal ownership invariant violation. Keep the module's
+      // reference rather than pretending the native engine was detached.
+      @synchronized (self) {
+        self->_nativeDirectClaim = claim;
+      }
+      return;
+    }
+    @synchronized (self) {
+      if (self->_sessions[key] == database) {
+        [self->_sessions removeObjectForKey:key];
+      }
+    }
+    if (cleanupAdmission == OliphauntNativeDirectCleanupAlreadyInFlight) {
+      return;
+    }
+    [database closeWithCompletion:^(NSError *_Nullable error) {
+      OliphauntFinishNativeDirectCleanup(claim, database, error, YES);
     }];
-  }
-  dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  }];
 }
 
 #ifdef RCT_NEW_ARCH_ENABLED

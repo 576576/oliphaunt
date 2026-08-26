@@ -90,6 +90,11 @@
           "jsonpath": "$.version"
         },
         {
+          "type": "json",
+          "path": "tools-npm/package.json",
+          "jsonpath": "$.version"
+        },
+        {
           "type": "toml",
           "path": "crates/tools/Cargo.toml",
           "jsonpath": "$.package.version"
@@ -230,14 +235,7 @@
       "release-type": "node",
       "component": "oliphaunt-js",
       "package-name": "@oliphaunt/ts",
-      "changelog-path": "CHANGELOG.md",
-      "extra-files": [
-        {
-          "type": "json",
-          "path": "jsr.json",
-          "jsonpath": "$.version"
-        }
-      ]
+      "changelog-path": "CHANGELOG.md"
     },
     "src/extensions/external/pg_hashids": {
       "release-type": "simple",
@@ -344,13 +342,31 @@
           "type": "toml",
           "path": "crates/tools-aot/x86_64-unknown-linux-gnu/Cargo.toml",
           "jsonpath": "$.package.version"
+        },
+        {
+          "type": "json",
+          "path": "tools-npm/package.json",
+          "jsonpath": "$.version"
         }
       ]
+    },
+    "src/runtimes/liboliphaunt/wasix-postmaster": {
+      "release-type": "simple",
+      "component": "liboliphaunt-wasix-postmaster",
+      "package-name": "liboliphaunt-wasix-postmaster",
+      "version-file": "VERSION",
+      "changelog-path": "CHANGELOG.md"
     },
     "src/bindings/wasix-rust/crates/oliphaunt-wasix": {
       "release-type": "rust",
       "component": "oliphaunt-wasix-rust",
       "package-name": "oliphaunt-wasix",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "src/bindings/wasix-ts": {
+      "release-type": "node",
+      "component": "oliphaunt-wasix-ts",
+      "package-name": "@oliphaunt/wasix-ts",
       "changelog-path": "CHANGELOG.md"
     }
   }

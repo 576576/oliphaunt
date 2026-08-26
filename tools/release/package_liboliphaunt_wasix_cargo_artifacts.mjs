@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants as zlibConstants, zstdCompressSync } from "node:zlib";
 import {
   chmodSync,
   copyFileSync,
@@ -30,6 +29,7 @@ import {
   portableMemberName,
   readPortableArchiveEntries,
   readPortableTarZstdBufferEntries,
+  releaseZstdCompressSync,
 } from "./portable-archive.mjs";
 import { compareText } from "./release-graph.mjs";
 import {
@@ -229,11 +229,7 @@ function writeTarZstdArchive(sourceRoot, output, archiveRoot) {
   mkdirSync(path.dirname(output), { recursive: true });
   rmSync(output, { force: true });
   const tar = createDeterministicTar(sourceRoot, archiveRoot, { fail });
-  writeFileSync(output, zstdCompressSync(tar, {
-    params: {
-      [zlibConstants.ZSTD_c_compressionLevel]: 19,
-    },
-  }));
+  writeFileSync(output, releaseZstdCompressSync(tar));
 }
 
 function payloadFiles(sourceRoot) {
@@ -314,8 +310,10 @@ export function validateRuntimePayload(root) {
   for (const required of [
     "oliphaunt.wasix.tar.zst",
     "bin/initdb.wasix.wasm",
-    "prepopulated/pgdata-template.tar.zst",
-    "prepopulated/pgdata-template.json",
+    "cluster-seeds/standard.tar.zst",
+    "cluster-seeds/standard.json",
+    "cluster-seeds/icu.tar.zst",
+    "cluster-seeds/icu.json",
   ]) {
     if (!isFile(path.join(root, required))) {
       fail(`WASIX runtime Cargo payload is missing ${required}`);
@@ -651,7 +649,7 @@ function patchToolsAotTemplate(crateDir, target) {
 }
 
 function noticeProfileForSpec(spec) {
-  if (spec.kind === "icu-data") return "wasix-icu-data";
+  if (spec.kind === "icu-data") return "wasix-icu-data-crate";
   if (spec.kind === "wasix-runtime") return "wasix-runtime";
   if (spec.kind === "wasix-tools") return "wasix-tools";
   if (spec.kind === "wasix-aot" || spec.kind === "wasix-tools-aot") return "wasix-aot";

@@ -70,14 +70,14 @@ build_consumer() {
   OLIPHAUNT_CARGO_METADATA="$metadata" tools/dev/bun.sh -e '
     const metadata = await Bun.file(process.env.OLIPHAUNT_CARGO_METADATA).json();
     for (const dependency of metadata.packages[0].dependencies) {
-      if (dependency.name === "oliphaunt-tools" || dependency.name.startsWith("liboliphaunt-native-") || dependency.name.startsWith("oliphaunt-broker-")) {
+      if (dependency.name.startsWith("liboliphaunt-native-") || dependency.name.startsWith("oliphaunt-broker-")) {
         const version = dependency.req.match(/^=([0-9A-Za-z.+-]+)$/)?.[1];
         if (!version) throw new Error(`artifact dependency ${dependency.name} must use an exact version`);
         console.log(`${dependency.name}\t${version}`);
       }
     }
   ' | sort -u >"$dependency_rows"
-  for pattern in '^liboliphaunt-native-' '^oliphaunt-broker-' '^oliphaunt-tools\t'; do
+  for pattern in '^liboliphaunt-native-' '^oliphaunt-broker-'; do
     rg -q "$pattern" "$dependency_rows" || fail "packed crate is missing artifact dependency $pattern"
   done
 
@@ -123,7 +123,7 @@ run_consumer() {
   install_dir="$scratch/native/runtime"
   tools_dir="$scratch/tools/runtime"
   for file in "$install_dir/bin/postgres" "$install_dir/bin/initdb" "$install_dir/bin/pg_ctl" \
-    "$tools_dir/bin/pg_dump" "$tools_dir/bin/psql"; do
+    "$tools_dir/bin/pg_basebackup" "$tools_dir/bin/pg_dump" "$tools_dir/bin/psql"; do
     require_file "$file"
   done
 

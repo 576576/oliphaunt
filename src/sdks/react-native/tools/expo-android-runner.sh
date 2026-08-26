@@ -17,7 +17,7 @@ cd "$root"
 . "$root/src/sdks/react-native/tools/expo-runner-runtime-resources.sh"
 . "$root/src/sdks/react-native/tools/expo-runner-android-device.sh"
 
-source_example_dir="$root/src/sdks/react-native/examples/expo"
+source_example_dir="$root/examples/react-native-expo"
 rn_dir="$root/src/sdks/react-native"
 mobile_platform="android"
 scratch_workspace_name="oliphaunt-react-native-expo-android-workspace"
@@ -40,10 +40,10 @@ elif [ "$runner" = "crash" ]; then
   failure_tag="OLIPHAUNT_EXPO_CRASH_RECOVERY_FAIL"
 fi
 scratch_root="${OLIPHAUNT_EXPO_ANDROID_SCRATCH:-$root/target/oliphaunt-expo-android-$runner}"
-example_dir="${OLIPHAUNT_EXPO_ANDROID_EXAMPLE_DIR:-$scratch_root/src/sdks/react-native/examples/expo}"
+example_dir="${OLIPHAUNT_EXPO_ANDROID_EXAMPLE_DIR:-$scratch_root/examples/react-native-expo}"
 package_work="$scratch_root/src/sdks/react-native"
-crash_root_suffix="$(printf '%s' "$(basename "$scratch_root")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
-[ -n "$crash_root_suffix" ] || crash_root_suffix="run"
+crash_storage_suffix="$(printf '%s' "$(basename "$scratch_root")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
+[ -n "$crash_storage_suffix" ] || crash_storage_suffix="run"
 pack_dir="$root/target/oliphaunt-rn-expo-pack/android"
 tarball="$pack_dir/$(react_native_package_tarball_name "$rn_dir")"
 local_maven_repo="$scratch_root/maven-local"
@@ -101,26 +101,26 @@ elif [ "${OLIPHAUNT_EXPO_MOBILE_EXTENSIONS+x}" = "x" ]; then
 else
   mobile_extensions_raw="vector"
 fi
-runtime_footprint="${OLIPHAUNT_EXPO_ANDROID_RUNTIME_FOOTPRINT:-${OLIPHAUNT_EXPO_MOBILE_RUNTIME_FOOTPRINT:-balancedMobile}}"
-default_durability_profile=balanced
-[ "$runner" = "crash" ] && default_durability_profile=safe
-durability_profile="${OLIPHAUNT_EXPO_ANDROID_DURABILITY:-${OLIPHAUNT_EXPO_MOBILE_DURABILITY:-$default_durability_profile}}"
 startup_gucs="${OLIPHAUNT_EXPO_ANDROID_STARTUP_GUCS:-${OLIPHAUNT_EXPO_MOBILE_STARTUP_GUCS:-}}"
-wal_segsize_mb="${OLIPHAUNT_EXPO_ANDROID_WAL_SEGSIZE_MB:-${OLIPHAUNT_EXPO_MOBILE_WAL_SEGSIZE_MB:-16}}"
 benchmark_preset="${OLIPHAUNT_EXPO_ANDROID_BENCHMARK_PRESET:-${OLIPHAUNT_EXPO_MOBILE_BENCHMARK_PRESET:-full}}"
-crash_root_override="${OLIPHAUNT_EXPO_ANDROID_CRASH_ROOT:-}"
-crash_root="${crash_root_override:-/data/data/$app_id/files/oliphaunt-crash-recovery-root-$crash_root_suffix}"
-mobile_template_initdb="${OLIPHAUNT_EXPO_ANDROID_INITDB:-}"
+crash_storage_override="${OLIPHAUNT_EXPO_ANDROID_CRASH_STORAGE:-}"
+crash_storage="${crash_storage_override:-/data/data/$app_id/files/oliphaunt-crash-recovery-storage-$crash_storage_suffix}"
+mobile_packaging_initdb="${OLIPHAUNT_EXPO_ANDROID_INITDB:-}"
 case "${OLIPHAUNT_EXPO_ANDROID_ICU:-0}" in
   1|true|TRUE|yes|YES|on|ON) android_icu_enabled=1 ;;
   0|false|FALSE|no|NO|off|OFF) android_icu_enabled=0 ;;
   *) fail "OLIPHAUNT_EXPO_ANDROID_ICU must be a boolean value" ;;
 esac
+if [ "$android_icu_enabled" = "1" ]; then
+  configure_mobile_catalog_profile_probe icu
+else
+  configure_mobile_catalog_profile_probe standard
+fi
 android_icu_data_dir="${OLIPHAUNT_EXPO_ANDROID_ICU_DATA_DIR:-}"
 react_native_package_extra_excludes=(--exclude ios/vendor)
 metro_pid=""
 metro_bundle_runner=""
-metro_bundle_root=""
+metro_bundle_storage=""
 
 android_ndk_root() {
   local configured="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
@@ -175,7 +175,6 @@ android_liboliphaunt_has_current_abi() {
   symbols="$("$toolchain_bin/llvm-nm" -D --defined-only "$library" 2>/dev/null || true)"
   for symbol in \
     oliphaunt_init \
-    oliphaunt_init_ex \
     oliphaunt_exec_protocol \
     oliphaunt_exec_protocol_stream \
     oliphaunt_backup \
@@ -187,7 +186,6 @@ android_liboliphaunt_has_current_abi() {
     oliphaunt_close \
     oliphaunt_last_error \
     oliphaunt_version \
-    oliphaunt_capabilities \
     oliphaunt_free_response
   do
     case "$symbols" in
@@ -261,23 +259,13 @@ pack_react_native_sdk_if_needed() {
   need_cmd pnpm
   mkdir -p "$pack_dir"
 
+  local package_stamp="$pack_dir/.android-package-inputs.sha256"
+  local package_fingerprint
+  package_fingerprint="$(react_native_source_package_fingerprint)"
   local needs_pack=0
-  if [ ! -f "$tarball" ]; then
-    needs_pack=1
-  elif [ -n "$(
-    find \
-      "$rn_dir/src" \
-      "$rn_dir/android" \
-      "$rn_dir/ios" \
-      "$rn_dir/package.json" \
-      "$rn_dir/tsconfig.build.json" \
-      "$source_example_dir/package.json" \
-      -path "$rn_dir/android/.gradle" -prune -o \
-      -path "$rn_dir/android/.cxx" -prune -o \
-      -path "$rn_dir/android/build" -prune -o \
-      -path "$rn_dir/lib" -prune -o \
-      -type f -newer "$tarball" -print -quit
-  )" ]; then
+  if [ ! -f "$tarball" ] ||
+    [ ! -f "$package_stamp" ] ||
+    [ "$(tr -d '\r\n' <"$package_stamp")" != "$package_fingerprint" ]; then
     needs_pack=1
   fi
 
@@ -290,8 +278,9 @@ pack_react_native_sdk_if_needed() {
       cd "$package_work"
       pnpm pack --pack-destination "$pack_dir"
     )
+    printf '%s\n' "$package_fingerprint" >"$package_stamp"
   else
-    echo "React Native SDK tarball is current: $tarball"
+    echo "React Native SDK tarball matches source content: $tarball"
   fi
 
   patch_expo_example_react_native_dependency "file:$tarball"
@@ -311,7 +300,6 @@ install_react_native_sdk_tarball() {
 
 ensure_android_project() {
   if [ -x "$example_dir/android/gradlew" ]; then
-    ensure_android_local_kotlin_sdk_repository
     return
   fi
 
@@ -320,58 +308,6 @@ ensure_android_project() {
     cd "$example_dir"
     CI=1 EXPO_NO_TELEMETRY=1 pnpm exec expo prebuild --platform android
   )
-  ensure_android_local_kotlin_sdk_repository
-}
-
-ensure_android_local_kotlin_sdk_repository() {
-  local settings="$example_dir/android/settings.gradle"
-  local root_build="$example_dir/android/build.gradle"
-  local gradle_properties="$example_dir/android/gradle.properties"
-  [ -f "$settings" ] || fail "generated Android settings.gradle is missing: $settings"
-  [ -f "$root_build" ] || fail "generated Android build.gradle is missing: $root_build"
-  [ -f "$gradle_properties" ] || fail "generated Android gradle.properties is missing: $gradle_properties"
-  if rg -q "liboliphaunt local Kotlin SDK smoke include" "$settings"; then
-    local tmp_settings="$settings.liboliphaunt"
-    awk '/\/\/ liboliphaunt local Kotlin SDK smoke include/ { exit } { print }' "$settings" > "$tmp_settings"
-    mv "$tmp_settings" "$settings"
-  fi
-  cat >>"$settings" <<SETTINGS
-
-// liboliphaunt local Kotlin SDK smoke include
-dependencyResolutionManagement {
-  repositories {
-    maven {
-      url = uri('$local_maven_repo')
-    }
-  }
-}
-SETTINGS
-  if ! rg -q "liboliphaunt local Kotlin SDK smoke repository" "$root_build"; then
-    local tmp_root_build="$root_build.liboliphaunt"
-    node - "$root_build" "$local_maven_repo" "$tmp_root_build" <<'NODE'
-const fs = require('node:fs');
-const [file, repo, out] = process.argv.slice(2);
-const input = fs.readFileSync(file, 'utf8');
-const marker = 'maven { url';
-const replacement = `// liboliphaunt local Kotlin SDK smoke repository\n    maven { url '${repo.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}' }\n    ${marker}`;
-if (!input.includes(marker)) {
-  throw new Error(`could not find Gradle repositories block marker in ${file}`);
-}
-fs.writeFileSync(out, input.replace(marker, replacement));
-NODE
-    mv "$tmp_root_build" "$root_build"
-  fi
-  node - "$gradle_properties" "$android_abi" <<'NODE'
-const fs = require('node:fs');
-const [file, abi] = process.argv.slice(2);
-const input = fs.readFileSync(file, 'utf8');
-const line = `reactNativeArchitectures=${abi}`;
-if (/^reactNativeArchitectures=/m.test(input)) {
-  fs.writeFileSync(file, input.replace(/^reactNativeArchitectures=.*$/m, line));
-} else {
-  fs.appendFileSync(file, `\n${line}\n`);
-}
-NODE
 }
 
 find_android_liboliphaunt_so() {
@@ -485,15 +421,14 @@ prepare_runtime_resources() {
   [ -f "$runtime_source/share/postgresql/postgres.bki" ] ||
     fail "runtime assets are missing postgres.bki: $runtime_source"
   ensure_mobile_runtime_tool_permissions "$runtime_source"
-  ensure_mobile_tool_executable "$mobile_template_initdb"
+  ensure_mobile_tool_executable "$mobile_packaging_initdb"
 
-  local template_source
-  template_source="$(
-    find_latest_mobile_pgdata \
+  local seed_closure
+  seed_closure="$(
+    require_mobile_runtime_seed_closure \
       Android \
-      "${OLIPHAUNT_EXPO_ANDROID_TEMPLATE_PGDATA_DIR:-}" \
-      OLIPHAUNT_EXPO_ANDROID_TEMPLATE_PGDATA_DIR \
-      OLIPHAUNT_EXPO_ANDROID_INITDB
+      "${OLIPHAUNT_EXPO_ANDROID_SEED_CLOSURE_DIR:-}" \
+      OLIPHAUNT_EXPO_ANDROID_SEED_CLOSURE_DIR
   )"
   local selected_extensions
   selected_extensions="$(normalize_mobile_extensions)"
@@ -508,11 +443,13 @@ prepare_runtime_resources() {
   if prepared_package="$(oliphaunt_dev_prepare_prebuilt_mobile_runtime_resource_package \
     Android \
     "$runtime_source" \
-    "$mobile_template_initdb" \
+    "$mobile_packaging_initdb" \
     "$selected_extensions" \
     "$package_root" \
     "$android_icu_enabled" \
     "$android_icu_data_dir")"; then
+    install_mobile_runtime_seed_closure "$prepared_package" "$seed_closure"
+    bind_mobile_runtime_manifest_to_seed_closure "$prepared_package" "$seed_closure"
     assert_android_icu_payload \
       "$prepared_package/oliphaunt/runtime/manifest.properties" \
       "$prepared_package/oliphaunt/runtime/files/share/icu" \
@@ -526,7 +463,7 @@ prepare_runtime_resources() {
   prepared_package="$(prepare_mobile_runtime_resource_package \
     Android \
     "$runtime_source" \
-    "$template_source" \
+    "$seed_closure" \
     "$static_registry_source" \
     "$selected_extensions" \
     "${OLIPHAUNT_EXPO_ANDROID_REPACKAGE_ASSETS:-0}" \
@@ -557,7 +494,7 @@ install_kotlin_sdk_maven_artifacts_if_required() {
   return 0
 }
 
-kotlin_sdk_dependency_from_maven_repo() {
+kotlin_sdk_aar_from_maven_repo() {
   local package_root="$local_maven_repo/dev/oliphaunt/oliphaunt-android"
   [ -d "$package_root" ] ||
     fail "Kotlin SDK Maven repository is missing oliphaunt-android coordinates: $package_root"
@@ -571,9 +508,10 @@ kotlin_sdk_dependency_from_maven_repo() {
     fail "Kotlin SDK Maven repository contains $count oliphaunt-android versions; expected exactly one"
   local version
   version="$(printf '%s\n' "$versions")"
-  [ -f "$package_root/$version/oliphaunt-android-$version.aar" ] ||
-    fail "Kotlin SDK Maven repository is missing oliphaunt-android-$version.aar"
-  printf 'dev.oliphaunt:oliphaunt-android:%s\n' "$version"
+  local aar="$package_root/$version/oliphaunt-android-$version.aar"
+  [ -f "$aar" ] ||
+    fail "Kotlin SDK Maven repository is missing candidate AAR: $aar"
+  printf '%s\n' "$aar"
 }
 
 publish_local_kotlin_sdk() {
@@ -620,16 +558,17 @@ build_apk() {
     gradle_jvmargs="$(oliphaunt_android_gradle_jvmargs)"
     gradle_max_workers="$(oliphaunt_android_gradle_max_workers)"
     node_binary="$(node -p 'process.execPath')"
-    local selected_extensions extension_archives_root kotlin_sdk_dependency android_link_evidence module_stems
+    local selected_extensions extension_archives_root kotlin_sdk_aar android_link_evidence module_stems
     selected_extensions="$(normalize_mobile_extensions)"
     module_stems="$(oliphaunt_dev_mobile_module_stems_for_selection "$selected_extensions")"
-    kotlin_sdk_dependency="$(kotlin_sdk_dependency_from_maven_repo)"
+    kotlin_sdk_aar="$(kotlin_sdk_aar_from_maven_repo)"
     extension_archives_root="$runtime_resources/oliphaunt/static-registry/archives"
     if [ ! -d "$extension_archives_root" ]; then
       extension_archives_root="$(android_build_root_for_abi)/out"
     fi
     android_link_evidence="$scratch_root/android-static-extension-link-$android_abi.tsv"
-    rm -f "$android_link_evidence"
+    # CMake writes this receipt while configuring native inputs. Preserve it when
+    # Gradle is up to date; a native reconfiguration overwrites it when needed.
     local gradle_build_tasks=(":app:assemble$build_type_capitalized")
     if [ "$build_type" = "release" ]; then
       gradle_build_tasks+=("-x" ":app:lintVitalRelease")
@@ -643,8 +582,7 @@ build_apk() {
       OLIPHAUNT_REACT_NATIVE_ANDROID_EXTENSION_ARCHIVES_DIR="$extension_archives_root" \
       OLIPHAUNT_REACT_NATIVE_ANDROID_EXTENSIONS="$selected_extensions" \
       OLIPHAUNT_REACT_NATIVE_ANDROID_LINK_EVIDENCE_FILE="$android_link_evidence" \
-      OLIPHAUNT_REACT_NATIVE_KOTLIN_SDK_MAVEN_REPOSITORY="$local_maven_repo" \
-      OLIPHAUNT_REACT_NATIVE_KOTLIN_SDK_DEPENDENCY="$kotlin_sdk_dependency" \
+      OLIPHAUNT_REACT_NATIVE_KOTLIN_SDK_AAR="$kotlin_sdk_aar" \
       "$example_dir/android/gradlew" \
       --project-dir "$example_dir/android" \
       "-Dorg.gradle.jvmargs=$gradle_jvmargs" \
@@ -652,8 +590,7 @@ build_apk() {
       "${gradle_build_tasks[@]}" \
       "-PoliphauntAndroidAbiFilters=$android_abi" \
       "-PreactNativeArchitectures=$android_abi" \
-      "-PoliphauntKotlinSdkMavenRepository=$local_maven_repo" \
-      "-PliboliphauntKotlinSdkDependency=$kotlin_sdk_dependency" \
+      "-PliboliphauntKotlinSdkAar=$kotlin_sdk_aar" \
       "-PoliphauntReactNativePackageRuntime=true" \
       "-PoliphauntRuntimeResourcesDir=$runtime_resources" \
       "-PoliphauntAndroidJniLibsDir=$jni_libs" \
@@ -667,6 +604,14 @@ build_apk() {
     if [ -n "$module_stems" ] && [ ! -s "$android_link_evidence" ]; then
       fail "Android build did not emit static extension link evidence: $android_link_evidence"
     fi
+    if [ -n "$module_stems" ]; then
+      run node "$root/src/sdks/react-native/tools/validate-android-link-evidence.mjs" \
+        --evidence "$android_link_evidence" \
+        --abi "$android_abi" \
+        --module-stems "$module_stems" \
+        --static-registry "$runtime_resources/oliphaunt/static-registry/manifest.properties" \
+        --target "android-$android_abi"
+    fi
   fi
 
   run "$root/src/sdks/react-native/tools/verify-android-apk.sh" "$apk"
@@ -677,7 +622,7 @@ build_apk() {
     fail "APK is missing lib/$android_abi/liboliphaunt.so"
   grep -Fxq "assets/oliphaunt/runtime/manifest.properties" "$apk_files" ||
     fail "APK is missing Oliphaunt runtime manifest"
-  grep -Fxq "assets/oliphaunt/template-pgdata/manifest.properties" "$apk_files" ||
+  grep -Fxq "assets/oliphaunt/cluster-seed/manifest.properties" "$apk_files" ||
     fail "APK is missing liboliphaunt template manifest"
   grep -Fxq "assets/oliphaunt/package-size.tsv" "$apk_files" ||
     fail "APK is missing Oliphaunt package-size report"
@@ -701,14 +646,14 @@ build_apk() {
 
 start_metro_if_needed() {
   local bundle_runner="${1:-$runner}"
-  local bundle_root="${2:-}"
+  local bundle_storage="${2:-}"
   if [ "$build_type" = "release" ]; then
     return
   fi
 
   mkdir -p "$scratch_root"
   if [ -n "${metro_pid:-}" ] && kill -0 "$metro_pid" >/dev/null 2>&1; then
-    if [ "$metro_bundle_runner" = "$bundle_runner" ] && [ "$metro_bundle_root" = "$bundle_root" ]; then
+    if [ "$metro_bundle_runner" = "$bundle_runner" ] && [ "$metro_bundle_storage" = "$bundle_storage" ]; then
       return 0
     fi
     stop_owned_metro
@@ -728,18 +673,15 @@ start_metro_if_needed() {
     CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_MCP_SERVER=1 \
       EXPO_PUBLIC_OLIPHAUNT_RUNNER="$bundle_runner" \
       EXPO_PUBLIC_OLIPHAUNT_LIFECYCLE_SMOKE="$lifecycle_smoke" \
-      EXPO_PUBLIC_OLIPHAUNT_DURABILITY="$durability_profile" \
-      EXPO_PUBLIC_OLIPHAUNT_RUNTIME_FOOTPRINT="$runtime_footprint" \
       EXPO_PUBLIC_OLIPHAUNT_BENCHMARK_PRESET="$benchmark_preset" \
       EXPO_PUBLIC_OLIPHAUNT_STARTUP_GUCS="$startup_gucs" \
-      EXPO_PUBLIC_OLIPHAUNT_WAL_SEGSIZE_MB="$wal_segsize_mb" \
-      EXPO_PUBLIC_OLIPHAUNT_ROOT="$bundle_root" \
+      EXPO_PUBLIC_OLIPHAUNT_STORAGE_DIRECTORY="$bundle_storage" \
       pnpm exec expo start --dev-client --port "$metro_port" --clear \
       >"$scratch_root/metro.log" 2>&1
   ) &
   metro_pid="$!"
   metro_bundle_runner="$bundle_runner"
-  metro_bundle_root="$bundle_root"
+  metro_bundle_storage="$bundle_storage"
 
   for _ in $(seq 1 60); do
     if port_is_listening; then
@@ -762,10 +704,14 @@ write_android_package_metrics() {
 
 write_android_build_artifact_report() {
   local selected_extensions="$1"
-  local apk_bytes rn_package_bytes apk_copy report android_link_evidence
+  local apk_bytes rn_package_bytes apk_copy report android_link_evidence android_link_evidence_sha256
   mkdir -p "$build_artifact_dir" "$scratch_root/reports"
   apk_copy="$build_artifact_dir/app-$build_type-$android_abi.apk"
   android_link_evidence="$scratch_root/android-static-extension-link-$android_abi.tsv"
+  android_link_evidence_sha256=""
+  if [ -f "$android_link_evidence" ]; then
+    android_link_evidence_sha256="$(shasum -a 256 "$android_link_evidence" | awk '{print $1}')"
+  fi
   cp "$apk" "$apk_copy"
   apk_bytes="$(wc -c <"$apk" | tr -d '[:space:]')"
   rn_package_bytes="$(wc -c <"$tarball" | tr -d '[:space:]')"
@@ -782,7 +728,8 @@ write_android_build_artifact_report() {
     buildType "$build_type" \
     abi "$android_abi" \
     icu "$android_icu_enabled" \
-    androidLinkEvidence "$android_link_evidence"
+    androidLinkEvidence "$android_link_evidence" \
+    androidLinkEvidenceSha256 "$android_link_evidence_sha256"
   cp "$report" "$scratch_root/reports/build-report.json"
   echo "Android mobile build artifact: $apk_copy"
   echo "Android mobile build report: $report"

@@ -20,7 +20,7 @@ project:
     packagePath: "src/runtimes/liboliphaunt/native"
     artifactTargets:
       preset: "liboliphaunt-native"
-      publishedTargets:
+      targets:
         - "android-arm64-v8a"
         - "android-x86_64"
         - "ios-xcframework"
@@ -28,9 +28,6 @@ project:
         - "linux-x64-gnu"
         - "macos-arm64"
         - "windows-x64-msvc"
-      plannedTargets:
-        macos-x64:
-          unsupportedReason: "macOS x64 native runtime is planned but not published until CI, release asset packaging, and SDK resolver smoke coverage exist."
 
 owners:
   defaultOwner: "@oliphaunt/core"
@@ -49,6 +46,7 @@ tasks:
       - "liboliphaunt-native:postgis-reproducible-time-test"
       - "liboliphaunt-native:static-extension-registry-test"
       - "liboliphaunt-native:symbol-scope-test"
+      - "liboliphaunt-native:tools-test"
     inputs:
       - "/src/runtimes/liboliphaunt/native/**/*"
       - "/src/postgres/versions/18/**/*"
@@ -60,6 +58,19 @@ tasks:
       - "/.release-please-manifest.json"
       - "/src/**/release.toml"
       - "/src/**/targets/**/*.toml"
+    options:
+      cache: true
+      runFromWorkspaceRoot: true
+  tools-test:
+    tags: ["quality", "unit", "ci-rust"]
+    command: "cargo test -p oliphaunt-tools --locked"
+    env:
+      CARGO_TARGET_DIR: "target/moon/liboliphaunt-native/tools-test"
+    inputs:
+      - "/Cargo.lock"
+      - "/Cargo.toml"
+      - "/rust-toolchain.toml"
+      - "/src/runtimes/liboliphaunt/native/crates/tools/**/*"
     options:
       cache: true
       runFromWorkspaceRoot: true
@@ -79,6 +90,7 @@ tasks:
       - "/src/runtimes/liboliphaunt/native/include/oliphaunt.h"
       - "/src/runtimes/liboliphaunt/native/src/liboliphaunt_internal.h"
       - "/src/runtimes/liboliphaunt/native/src/liboliphaunt_platform.h"
+      - "/src/runtimes/liboliphaunt/native/src/liboliphaunt_backup_state.c"
       - "/src/runtimes/liboliphaunt/native/src/liboliphaunt_process.c"
       - "/src/runtimes/liboliphaunt/native/smoke/liboliphaunt_generation_lifecycle.c"
       - "/src/runtimes/liboliphaunt/native/tools/test-generation-lifecycle.sh"
@@ -178,6 +190,8 @@ tasks:
       - "/src/sources/third-party/shared/**/*"
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
+      - "/src/shared/fixtures/storage/physical-archive-native-v1.properties"
+      - "/src/shared/fixtures/storage/physical-backup-wal-range-v1.properties"
       - "/tools/runtime/**/*"
     options:
       cache: false
@@ -191,6 +205,8 @@ tasks:
       - "/src/sources/third-party/shared/**/*"
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
+      - "/src/shared/fixtures/storage/physical-archive-native-v1.properties"
+      - "/src/shared/fixtures/storage/physical-backup-wal-range-v1.properties"
       - "/src/runtimes/liboliphaunt/native/**/*"
       - "/src/sdks/rust/**/*"
       - "/tools/xtask/**/*"
@@ -215,6 +231,7 @@ tasks:
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
       - "/src/runtimes/liboliphaunt/native/**/*"
+      - "/tools/native-packaging/**/*"
       - "/tools/release/check-linux-consumer-baseline.sh"
       - "/tools/release/linux-abi-baseline.test.mjs"
       - "/tools/release/package-liboliphaunt-icu-data.sh"
@@ -250,6 +267,7 @@ tasks:
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
       - "/src/runtimes/liboliphaunt/native/**/*"
+      - "/tools/native-packaging/**/*"
       - "/tools/release/check-linux-consumer-baseline.sh"
       - "/tools/release/linux-abi-baseline.test.mjs"
       - "/tools/release/package-liboliphaunt-icu-data.sh"
@@ -291,6 +309,7 @@ tasks:
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
       - "/src/runtimes/liboliphaunt/native/**/*"
+      - "/tools/native-packaging/**/*"
       - "/tools/release/release-notices.mjs"
       - "/tools/xtask/**/*"
       - "/Cargo.lock"
@@ -305,7 +324,7 @@ tasks:
     inputs:
       - "/.release-please-manifest.json"
       - "/release-please-config.json"
-      - "/src/extensions/generated/sdk/rust.json"
+      - "/src/extensions/generated/sdk/extensions.json"
       - "/src/runtimes/liboliphaunt/native/moon.yml"
       - "/tools/release/portable-archive.mjs"
       - "/tools/release/check-liboliphaunt-release-assets.mjs"
@@ -314,6 +333,8 @@ tasks:
       - "/tools/release/platform-compatibility-policy.test.mjs"
       - "/tools/release/platform-binary-contract.mjs"
       - "/tools/release/platform-binary-contract.test.mjs"
+      - "/tools/release/extension-target-profiles.mjs"
+      - "/tools/release/extension-target-profiles.toml"
       - "/tools/release/release-artifact-targets.mjs"
       - "/tools/release/release-graph.mjs"
       - "/tools/release/release_graph_query.mjs"
@@ -355,6 +376,8 @@ tasks:
       - "/src/sources/third-party/shared/**/*"
       - "/src/sources/third-party/native/**/*"
       - "/src/shared/extension-runtime-contract/**/*"
+      - "/src/shared/fixtures/storage/physical-archive-native-v1.properties"
+      - "/src/shared/fixtures/storage/physical-backup-wal-range-v1.properties"
       - "/tools/xtask/**/*"
       - "/rust-toolchain.toml"
     options:

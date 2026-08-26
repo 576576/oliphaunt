@@ -64,7 +64,6 @@ fi
   -e OLIPHAUNT_WASM_WASM_OPT_PRESERVE_UNOPTIMIZED="${OLIPHAUNT_WASM_WASM_OPT_PRESERVE_UNOPTIMIZED-}" \
   -e OLIPHAUNT_WASM_WASIX_COMPILER_FLAGS="${OLIPHAUNT_WASM_WASIX_COMPILER_FLAGS:-}" \
   -e OLIPHAUNT_WASM_WASIX_LINKER_FLAGS="${OLIPHAUNT_WASM_WASIX_LINKER_FLAGS:-}" \
-  -e OLIPHAUNT_WASM_WASIX_BACKEND_TIMING="${OLIPHAUNT_WASM_WASIX_BACKEND_TIMING:-0}" \
   -e WASIX_HOME=/opt/wasixcc-home/.wasixcc \
   -v "$REPO_ROOT:/work" \
   -w /work \
@@ -74,10 +73,7 @@ fi
     . ./src/runtimes/liboliphaunt/wasix/assets/build/docker_wasix_env.sh
     . ./src/runtimes/liboliphaunt/wasix/assets/build/profile_flags.sh
     . ./src/runtimes/liboliphaunt/wasix/assets/build/source_lane.sh
-    . ./src/runtimes/liboliphaunt/wasix/assets/build/wasix_icu_link.sh
-    icu_prefix="$(./src/runtimes/liboliphaunt/wasix/assets/build/build_wasix_icu.sh)"
-    ICU_CFLAGS="$(oliphaunt_wasix_icu_cflags "$icu_prefix")"
-    ICU_LIBS="$(oliphaunt_wasix_icu_libs "$icu_prefix")"
+    . ./src/runtimes/liboliphaunt/wasix/assets/build/wasix_frontend_tools.sh
     oliphaunt_wasix_apply_wasix_profile build
     export AR=wasixar
     export RANLIB=wasixranlib
@@ -89,22 +85,18 @@ fi
     sha256sum -c "$BUILD_DIR/.oliphaunt-wasix-bridge-sha256" >/dev/null
     test "$(oliphaunt_wasix_wasix_profile_signature)" = "$(cat "$BUILD_DIR/.oliphaunt-wasix-build-profile")"
 
-    # initdb uses tool-specific symbol rewrites. Rebuild shared frontend
-    # archives with the generic bridge before linking standalone psql.
-    make -s -C "$BUILD_DIR/src/interfaces/libpq" clean
-    make -s -C "$BUILD_DIR/src/fe_utils" clean
-    make -s -C "$BUILD_DIR/src/port" clean
-    make -s -C "$BUILD_DIR/src/common" clean
-    make -s -C "$BUILD_DIR/src/port" all
-    make -s -C "$BUILD_DIR/src/common" all
-    make -s -C "$BUILD_DIR/src/interfaces/libpq" all
-    make -s -C "$BUILD_DIR/src/fe_utils" all
-    make -s -C "$BUILD_DIR/src/bin/psql" clean
-    make -s -C "$BUILD_DIR/src/bin/psql" psql \
-      libpq="$BUILD_DIR/src/interfaces/libpq/libpq.a" \
-      LIBS="$BUILD_DIR/src/common/libpgcommon_shlib.a $BUILD_DIR/src/common/libpgcommon_excluded_shlib.a $BUILD_DIR/src/port/libpgport_shlib.a $ICU_LIBS -lm"
-    test -f "$BUILD_DIR/src/bin/psql/psql"
-    if wasixnm -u "$BUILD_DIR/src/bin/psql/psql" | grep -E " PQ[A-Za-z0-9_]+$"; then
+    runtime_build_dir="$BUILD_DIR"
+
+    # The shared frontend closure stays outside the hot backend and disables
+    # ThinLTO because WASIX LLVM can fail on the large libpq/ICU link.
+    oliphaunt_wasix_prepare_frontend_tools
+    make -s -C "$OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/bin/psql" psql \
+      libpq="$OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/interfaces/libpq/libpq.a" \
+      LIBS="$OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/common/libpgcommon_shlib.a $OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/common/libpgcommon_excluded_shlib.a $OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/port/libpgport_shlib.a $OLIPHAUNT_WASIX_FRONTEND_ICU_LIBS -lm"
+    install -m 0755 \
+      "$OLIPHAUNT_WASIX_FRONTEND_BUILD_DIR/src/bin/psql/psql" \
+      "$runtime_build_dir/src/bin/psql/psql"
+    if wasixnm -u "$runtime_build_dir/src/bin/psql/psql" | grep -E " PQ[A-Za-z0-9_]+$"; then
       echo "psql still imports libpq symbols; expected standalone WASIX psql" >&2
       exit 1
     fi

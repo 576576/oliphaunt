@@ -36,7 +36,16 @@ source lives under `src/<product>/`.
 - `src/sdks/swift/`, `src/sdks/kotlin/`,
   `src/sdks/react-native/`, and `src/sdks/js/` own platform and
   runtime SDKs.
-- `src/bindings/wasix-rust/` owns the first-class WASM/WASIX product lane.
+- `src/bindings/wasix-rust/` owns the released Rust WASIX binding.
+- `src/bindings/wasix-ts/` owns the public browser, Node, Bun, and Deno WASIX TypeScript
+  binding and its optional `tools-package/` `pg_dump`/`psql` facade. It is a
+  peer binding, not part of the native TypeScript SDK; portable program bytes
+  remain owned by `liboliphaunt-wasix`.
+- `src/runtimes/liboliphaunt/wasix-postmaster/` owns the released concurrent
+  PostgreSQL postmaster runtime and its sealed WASIX backend carrier. It reuses
+  canonical source and toolchain inputs where semantics agree, while owning
+  its concurrency-specific patches, carrier, release metadata, and support
+  claims.
 - `src/*/moon.yml` is the canonical product graph. `tools/policy/sdk-manifest.toml`
   is a small SDK parity ownership registry and must agree with Moon metadata.
 - Tooling lives under `tools/`.
@@ -53,6 +62,10 @@ source lives under `src/<product>/`.
   toolchain pins, extension-owned source pins, and generated extension catalogs
   live under `src/postgres/versions/18`, `src/sources/third-party`,
   `src/sources/toolchains`, and `src/extensions`.
+- Postmaster-specific Wasmer and wasix-libc pins live under
+  `src/sources/third-party/wasix-postmaster/`. The default `production-all`
+  source scope includes every released product input; the focused
+  `wasix-postmaster-runtime` scope acquires only this product's runtime inputs.
 
 There should be no tracked product source under retired roots such as
 `crates/`, `sdks/`, root `liboliphaunt/`, or root product examples.
@@ -65,21 +78,20 @@ synthetic root:
   `src/sdks/kotlin/oliphaunt/src/*Test/`,
   `src/sdks/react-native/src/__tests__/`,
   `src/sdks/js/src/__tests__/`, and
-  `src/bindings/wasix-rust/crates/oliphaunt-wasix/tests/`.
-- Rust SDK release-shape tests are split by contract: config and mode
-  capability contracts stay in `src/sdks/rust/tests/sdk_config_modes.rs`,
-  handle lifecycle behavior stays in `src/sdks/rust/tests/sdk_shape.rs`,
-  native-environment smokes stay in
-  `src/sdks/rust/tests/sdk_native_smoke.rs`, extension catalog and
-  release-ready extension selection stays in
-  `src/sdks/rust/tests/sdk_extensions.rs`, and shared backend protocol
-  fixtures stay in `src/sdks/rust/tests/protocol_query_fixtures.rs`.
+  `src/bindings/wasix-rust/crates/oliphaunt-wasix/tests/`, plus
+  `src/bindings/wasix-ts/src/__tests__/` for the WASIX TypeScript binding, and
+  `src/bindings/wasix-ts/tools-package/src/__tests__/` for its optional tools facade.
+- Rust SDK tests are split by contract: deliberate public vocabulary stays in
+  `src/sdks/rust/tests/public_api.rs`, native-environment smokes stay in
+  `src/sdks/rust/tests/native_smoke.rs`, and extension coverage stays in
+  `src/sdks/rust/tests/native_extensions.rs` and
+  `src/sdks/rust/tests/sdk_extensions.rs`.
 - Product-private fixtures stay beside those tests. Shared fixtures move to
   `src/shared/fixtures/` only when the contract is consumed by multiple
   products, or when a product-specific boundary fixture needs central policy
   enforcement. `src/shared/fixtures/protocol/query-response-cases.json` is the
   current shared PostgreSQL backend-response corpus consumed from product-native
-  Rust, Swift, Kotlin, TypeScript, React Native, and WASM parser tests.
+  Rust, Swift, Kotlin, TypeScript, React Native, and WASIX query-decoding tests.
 - Benchmark plans, datasets, and published reports live in `benchmarks/`.
   Executable benchmark harnesses live in `tools/perf/` unless the harness is a
   deliberate product API.
@@ -97,45 +109,60 @@ synthetic root:
   release lane and comparison target. It should not expose native engine
   selection or link/load `liboliphaunt`; native Rust work belongs in
   `src/sdks/rust`.
+- `src/bindings/wasix-ts` is the public browser, Node, Bun, and Deno binding over the same
+  portable WASIX runtime. It owns module-Worker and worker-thread orchestration,
+  archive-to-memory mounts, the patched package-relative Wasmer host, and the
+  direct guest-memory pgwire client. It must not depend on `src/sdks/js`, native runtime
+  carriers, Node direct, or the broker. Ordinary opens consume the generated
+  host-neutral `@oliphaunt/liboliphaunt-wasix` carrier; conditional exports
+  select the host adapter without changing the public package identity.
+- `src/runtimes/liboliphaunt/wasix-postmaster` is a peer release product, not an
+  implementation directory of `liboliphaunt-wasix`. It owns a distinct Moon
+  release component and sealed carrier because its concurrent process and
+  shared-memory semantics differ from the single-backend runtime. Generated
+  checkouts, builds, carriers, caches, and reports stay under
+  `target/oliphaunt-wasix-postmaster/`.
 - `src/runtimes/liboliphaunt/wasix/assets/build` is source-only: scripts, patches,
   Docker inputs, and shims. Generated WASIX build and work trees live under
   `target/oliphaunt-wasix/wasix-build`.
 - `src/sdks/swift` is a normal Swift package for iOS and macOS apps. It owns
   `Oliphaunt`, a C header target, and Swift tests.
-- `src/sdks/kotlin` is a Gradle multi-project Kotlin Multiplatform development
-  build for the Android SDK. It owns the common suspend API, host-native
-  conformance targets, Android wrapper, and Kotlin tests; only its Android
-  AAR/plugin/ABI surfaces are published.
+- `src/sdks/kotlin` is a Gradle multi-project build for the Android SDK. It owns
+  the common suspend implementation, JVM contract tests, Android wrapper, and
+  Android runtime tests; only its Android AAR/plugin/ABI surfaces are published.
 - `src/sdks/react-native` is a React Native New Architecture package. It owns the
   TypeScript DX layer and TurboModule Codegen spec. Platform runtime behavior
   belongs to the Swift and Kotlin SDKs; React Native native code should be
   adapter glue, not a parallel PostgreSQL lifecycle implementation.
 - `src/sdks/js` is the SDK for Node.js, Bun, and Deno. Tauri apps currently
-  use the Rust SDK behind narrow app-owned commands; direct JavaScript/webview
-  integration is planned. The TypeScript SDK owns JavaScript runtime FFI adapters, npm/JSR package metadata, and
+  use the Rust SDK behind narrow app-owned commands. The TypeScript SDK owns
+  JavaScript runtime FFI adapters, npm package metadata, and
   broker/server client orchestration. Its broker implementation depends on the
   published `oliphaunt-broker` runtime and the shared `PGOB` protocol,
   so that dependency must remain modeled in Moon and product-local release
   metadata.
 
-All SDKs are product peers over the same native PostgreSQL boundary. They should
-have parity wherever the target platform can support the behavior honestly; any
-gap must be represented as an explicit unsupported error and justified in
+Native SDKs are product peers over the native `liboliphaunt` PostgreSQL
+boundary. Rust WASIX and WASIX TypeScript are peers over the separate portable
+WASIX runtime boundary. All should have parity wherever their target can
+support behavior honestly; gaps must be explicit and justified in
 `docs/maintainers/sdk-parity-policy.md`.
 
 ## Internal Organization Rules
 
-- Product crates own their own runtime code. `oliphaunt-wasix` may depend on the
-  WASIX asset crates; `oliphaunt` may load `liboliphaunt`; neither crate
-  should call into the other's private modules.
-- `tools/policy/check-native-boundaries.sh` enforces the native/legacy split:
+- Product bindings own their own host code. Rust WASIX may consume Cargo WASIX
+  asset crates and WASIX TypeScript may consume the generated host-neutral
+  portable runtime carrier plus separately selected WASIX extension npm leaves;
+  `oliphaunt` may load `liboliphaunt`. None should call another public
+  product's private modules.
+- `tools/policy/check-native-boundaries.sh` enforces the native/WASIX split:
   the Rust-native SDK and Swift/Kotlin/React Native package manifests must not
   depend on `oliphaunt-wasix`, WASIX AOT payload crates, or Wasmer runtime
   packages.
 - `tools/xtask` is shared repo automation for WASIX assets, release staging,
   and optional performance diagnostics. Its default feature set is intentionally
-  empty; legacy WASIX runtime controls, perf harnesses, template running, and
-  AOT serializers must be enabled with explicit feature flags.
+  empty; template running and AOT serializers must be enabled with explicit
+  feature flags.
 - `tools/xtask/src/main.rs` is the command router plus shared helpers. WASIX
   asset build, packaging, generated manifest, AOT packaging, and staged metadata
   orchestration lives in `tools/xtask/src/asset_pipeline.rs`. Source-controlled
@@ -150,12 +177,11 @@ gap must be represented as an explicit unsupported error and justified in
   release workspace assembly lives in `tools/xtask/src/release_workspace.rs`,
   source-pin and source-spine handling lives in
   `tools/xtask/src/source_spine.rs`, PostgreSQL source/patch-surface guards
-  live in `tools/xtask/src/postgres_guard.rs`, template execution lives in
-  `tools/xtask/src/template_runner.rs`, and AOT serialization lives in
+  live in `tools/xtask/src/postgres_guard.rs`, cluster-seed execution lives in
+  `tools/xtask/src/cluster_seed_runner.rs`, and AOT serialization lives in
   `tools/xtask/src/aot_serializer.rs`. Performance benchmark workload/result
-  construction lives in `tools/perf/runner/src/benchmarks.rs`, report DTOs live
-  in `tools/perf/runner/src/report.rs`, and legacy WASIX cold/warm probes live
-  in `tools/perf/runner/src/legacy_wasix.rs`. Native liboliphaunt execution,
+  construction lives in `tools/perf/runner/src/benchmarks.rs`, and report DTOs
+  live in `tools/perf/runner/src/report.rs`. Native liboliphaunt execution,
   child-process entrypoints, and SDK-backed diagnostics live in
   `tools/perf/runner/src/native_liboliphaunt.rs`. Native PostgreSQL process,
   protocol, and backup/restore controls live in
@@ -168,35 +194,38 @@ gap must be represented as an explicit unsupported error and justified in
   rendering.
 - Native C ABI concerns are split by layer:
   - `src/runtimes/liboliphaunt/native/` for C, PostgreSQL patches, and platform build scripts.
-  - `src/sdks/rust/src/runtimes/liboliphaunt/native/ffi.rs` for Rust symbol loading and
+  - `src/sdks/rust/src/liboliphaunt/ffi.rs` for Rust symbol loading and
     ABI structs.
-  - `src/sdks/rust/src/runtimes/liboliphaunt/native/root.rs` for native root locking,
+  - `src/sdks/rust/src/liboliphaunt/root.rs` for native root locking,
     runtime materialization, and opt-in extension asset copying.
-  - `src/sdks/rust/src/runtimes/liboliphaunt/native/mod.rs` for the Rust runtime/session
+  - `src/sdks/rust/src/liboliphaunt/root/runtime/` for runtime installation and
+    discovery.
+  - `src/sdks/rust/src/liboliphaunt/mod.rs` for the Rust runtime/session
     implementation.
-- Native runtime-resource packaging is split by release artifact concern:
-  - `src/sdks/rust/src/runtime_resources.rs` for the public resource
-    package API and selected extension resolution.
-  - `src/sdks/rust/src/runtime_resources/manifest.rs` for portable
+- Native runtime-resource packaging is maintainer-only and split by release
+  artifact concern under the unpublished `oliphaunt-native-packaging` tool:
+  - `tools/native-packaging/src/lib.rs` for resource package orchestration and
+    selected extension resolution.
+  - `tools/native-packaging/src/manifest.rs` for portable
     manifest parsing, identifier validation, and runtime artifact path rules.
-  - `src/sdks/rust/src/runtime_resources/package.rs` for resource-tree
+  - `tools/native-packaging/src/package.rs` for resource-tree
     writing, portable tree copying, package manifests, and size reports.
-  - `src/sdks/rust/src/runtime_resources/extension_artifact.rs` for exact
+  - `tools/native-packaging/src/extension_artifact.rs` for exact
     prebuilt extension artifact creation, archive extraction, and artifact
     manifest writing.
-  - `src/sdks/rust/src/runtime_resources/extension_index.rs` for external
+  - `tools/native-packaging/src/extension_index.rs` for external
     extension artifact index creation, resolution, signing, download, and
     checksum verification.
-  - `src/sdks/rust/src/runtime_resources/static_registry.rs` for iOS and
+  - `tools/native-packaging/src/static_registry.rs` for iOS and
     Android static extension registry metadata, generated C source, and mobile
     static archive staging.
-- WASM/WASIX runtime internals should keep VM orchestration separate from
+- WASIX runtime internals should keep VM orchestration separate from
   reusable host adapters:
   - `src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/base.rs` for
     install/root preparation, runtime layout selection, archive validation, and
-    PGDATA template orchestration.
-  - `src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/base/template_clone.rs`
-    for PGDATA template copy/clone mechanics, runtime-state exclusion, reflink
+    cluster-seed orchestration.
+  - `src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/base/cluster_seed_clone.rs`
+    for cluster-seed copy/clone mechanics, runtime-state exclusion, reflink
     fallback, and symlink handling.
   - `src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/postgres_mod.rs`
     for PostgreSQL WASIX module lifecycle, exported function wiring, startup
@@ -205,8 +234,9 @@ gap must be represented as an explicit unsupported error and justified in
     for WASIX virtual stdio adapters, protocol stream attachment, and bounded
     process-output capture.
   - `src/bindings/wasix-rust/crates/oliphaunt-wasix/src/oliphaunt/postgres_mod/wasix_fs.rs`
-    for host filesystem wrapping, `/dev` mounting, eager-copy PGDATA overlays,
-    and optional filesystem tracing.
+    for host filesystem wrapping and `/dev` mounting. Persistent PGDATA is a
+    standalone managed directory; only immutable runtime files may be shared
+    through the runtime cache.
 - Public runtime and build controls should use `OLIPHAUNT_*`. Use
   `LIBOLIPHAUNT_PATH` only for the literal native C library artifact path.
 - Large files should have a reason. Once a module mixes lifecycle, packaging,

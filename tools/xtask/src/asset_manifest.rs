@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use wasmparser::{Dylink0Subsection, ExternalKind, KnownCustom, Parser, Payload, TypeRef};
+
+pub(super) const ASSET_MANIFEST_FORMAT_VERSION: u32 = 2;
+pub(super) const AOT_MANIFEST_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SourcesManifest {
@@ -196,7 +200,6 @@ pub(super) struct ExtensionArtifact<'a> {
     pub(super) module_path: Option<&'a Path>,
     pub(super) native_module: Option<&'a str>,
     pub(super) native_modules: &'a [OwnedExtensionNativeModule],
-    pub(super) stable: bool,
 }
 
 pub(super) struct OwnedExtensionArtifact {
@@ -207,7 +210,6 @@ pub(super) struct OwnedExtensionArtifact {
     pub(super) module_path: Option<PathBuf>,
     pub(super) native_module: Option<String>,
     pub(super) native_modules: Vec<OwnedExtensionNativeModule>,
-    pub(super) stable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -263,8 +265,8 @@ pub(super) struct AssetManifestOut {
     pub(super) psql: Option<BinaryAssetOut>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) initdb: Option<BinaryAssetOut>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) pgdata_template: Option<PgDataTemplateAssetOut>,
+    #[serde(default)]
+    pub(super) cluster_seeds: BTreeMap<String, ClusterSeedAssetOut>,
     pub(super) extensions: Vec<ExtensionAssetOut>,
     pub(super) sources: Vec<SourcePin>,
 }
@@ -293,7 +295,9 @@ pub(super) struct BinaryAssetOut {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub(super) struct PgDataTemplateAssetOut {
+pub(super) struct ClusterSeedAssetOut {
+    pub(super) artifact_role: String,
+    pub(super) catalog_profile: String,
     pub(super) archive: String,
     pub(super) manifest: String,
     pub(super) sha256: String,
@@ -309,6 +313,10 @@ pub(super) struct PgDataTemplateAssetOut {
     pub(super) catalog_version: String,
     pub(super) init_profile: String,
     pub(super) wasmer_version: String,
+    pub(super) physical_format: String,
+    pub(super) compatibility_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) icu_data_tree_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -325,17 +333,14 @@ pub(super) struct ExtensionAssetOut {
     #[serde(default)]
     pub(super) native_modules: Vec<BinaryAssetOut>,
     pub(super) size: u64,
-    pub(super) stable: bool,
     pub(super) control_files: Vec<String>,
     pub(super) dependencies: Vec<String>,
-    pub(super) native_dependencies: Vec<String>,
     pub(super) load_order: Vec<String>,
     pub(super) lifecycle: ExtensionLifecycleOut,
     pub(super) extension_imports: Vec<WasmImportOut>,
     pub(super) core_exports_required: Vec<String>,
     pub(super) unresolved_imports: Vec<WasmImportOut>,
     pub(super) installed_files: Vec<String>,
-    pub(super) smoke_status: ExtensionSmokeStatusOut,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) link: Option<WasmLinkMetadataOut>,
 }
@@ -351,16 +356,6 @@ pub(super) struct ExtensionLifecycleOut {
     pub(super) preload_required: bool,
     pub(super) restart_required: bool,
     pub(super) shared_memory_required: bool,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub(super) struct ExtensionSmokeStatusOut {
-    pub(super) promoted: bool,
-    pub(super) direct: String,
-    pub(super) server: String,
-    pub(super) restart: String,
-    pub(super) dump_restore: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]

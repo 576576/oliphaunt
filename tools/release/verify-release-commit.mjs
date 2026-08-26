@@ -6,6 +6,7 @@ import { electronReleaseDependencies } from "../../examples/tools/example-releas
 import { captureCommandOutput } from "../dev/capture-command-output.mjs";
 import { exampleCargoReleaseVersionBindings } from "./example-cargo-policy.mjs";
 import {
+  nativeToolsOptionalPackageProducts,
   registryPackageRows,
   typescriptOptionalRuntimePackageProducts,
 } from "./release-artifact-targets.mjs";
@@ -231,6 +232,29 @@ function derivedVersionRules() {
     );
   }
 
+  for (const { packageName, product } of nativeToolsOptionalPackageProducts(TOOL)) {
+    addStructured(
+      "json",
+      "src/runtimes/liboliphaunt/native/tools-npm/package.json",
+      ["optionalDependencies", packageName],
+      product,
+      true,
+    );
+    addStructured(
+      "yaml",
+      "pnpm-lock.yaml",
+      [
+        "importers",
+        "src/runtimes/liboliphaunt/native/tools-npm",
+        "optionalDependencies",
+        packageName,
+        "specifier",
+      ],
+      product,
+      true,
+    );
+  }
+
   for (const { packageName } of electronReleaseDependencies(ROOT)) {
     const owners = Object.keys(products)
       .flatMap((product) => registryPackageRows({ product, packageKind: "npm" }, TOOL))
@@ -374,7 +398,7 @@ function authorizedDerivedStructuredChange(context, rules) {
 
 function structuredType(file) {
   const basename = path.posix.basename(file);
-  if (file === "release-please-config.json" || basename === "package.json" || basename === "jsr.json") return "json";
+  if (file === "release-please-config.json" || basename === "package.json") return "json";
   if (basename === "pnpm-lock.yaml") return "yaml";
   if (basename === "Cargo.toml" || basename === "Cargo.lock" || file.endsWith(".toml")) return "toml";
   return undefined;
