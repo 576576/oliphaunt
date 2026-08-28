@@ -18,11 +18,11 @@ test('normalizes only the public database and server configuration', () => {
     {},
     { instanceDirectory: '/temporary/root', temporaryDirectory: true },
   );
-  assert.equal(direct.execution, 'direct');
+  assert.equal(direct.topology, 'direct');
 
   const broker = normalizeOpenConfig(
     {
-      execution: 'broker',
+      topology: 'broker',
       storage: { kind: 'directory', path: '/app/root' },
       brokerExecutable: '/opt/oliphaunt-broker',
       startupGUCs: { work_mem: '16MB' },
@@ -32,7 +32,7 @@ test('normalizes only the public database and server configuration', () => {
     },
     { instanceDirectory: '/app/root', temporaryDirectory: false },
   );
-  assert.equal(broker.execution, 'broker');
+  assert.equal(broker.topology, 'broker');
   assert.equal(broker.pgdata, '/app/root/pgdata');
   assert.equal(broker.brokerExecutable, '/opt/oliphaunt-broker');
   assert.deepEqual(broker.extensions, ['vector', 'hstore']);
@@ -40,19 +40,19 @@ test('normalizes only the public database and server configuration', () => {
 
   const server = normalizeOpenConfig(
     {
-      execution: 'server',
+      topology: 'server',
       serverExecutable: '/opt/postgres',
       listen: { transport: 'tcp', port: 15432 },
     },
     { instanceDirectory: '/server/root', temporaryDirectory: true },
   );
-  assert.equal(server.execution, 'server');
+  assert.equal(server.topology, 'server');
   assert.equal(server.serverExecutable, '/opt/postgres');
   assert.deepEqual(server.serverListen, { transport: 'tcp', port: 15432 });
 
   const unixServer = normalizeOpenConfig(
     {
-      execution: 'server',
+      topology: 'server',
       listen: { transport: 'unix', directory: '/tmp/oliphaunt sockets' },
     },
     { instanceDirectory: '/server/root', temporaryDirectory: true },
@@ -84,6 +84,10 @@ test('validates the small public configuration vocabulary', () => {
     assert.throws(() => validateStartupGUCs({ [name]: '1' }), /each dot-separated component/);
   }
   assert.deepEqual(validateStartupGUCs({ search_path: '' }), ['search_path=']);
+  assert.deepEqual(
+    validateStartupGUCs({ WORK_MEM: '8MB', search_path: 'public', work_mem: '16MB' }),
+    ['search_path=public', 'work_mem=16MB'],
+  );
   assert.throws(() => validateStartupGUCs({ good: 'bad\0value' }), /must not contain NUL/);
   assert.deepEqual(validateExtensionIds([' earthdistance ', '', 'cube']), [
     'earthdistance',
@@ -117,4 +121,49 @@ test('builds PostgreSQL startup arguments without SDK-specific profiles', () => 
     extensions: ['hstore'],
   });
   assert.deepEqual(args, ['-c', 'app.setting=enabled']);
+});
+
+test('merges caller and extension preload libraries into one deduplicated assignment', () => {
+  const args = buildStartupArgs({
+    startupGUCs: {
+      work_mem: '16MB',
+      SHARED_PRELOAD_LIBRARIES: 'auto_explain, pg_textsearch, auto_explain',
+    },
+    extensions: ['pg_textsearch', 'pg_textsearch'],
+  });
+
+  assert.deepEqual(args, [
+    '-c',
+    'work_mem=16MB',
+    '-c',
+    'shared_preload_libraries=auto_explain,pg_textsearch',
+  ]);
+});
+
+test('rejects PostgreSQL startup GUCs owned by native server topology', () => {
+  for (const name of ['LISTEN_ADDRESSES', 'port', 'unix_socket_directories']) {
+    assert.throws(
+      () =>
+        normalizeOpenConfig(
+          { topology: 'server', startupGUCs: { [name]: 'override' } },
+          { instanceDirectory: '/server/root', temporaryDirectory: false },
+        ),
+      /native server owns PostgreSQL startup GUC.*Oliphaunt\.openServer\(\)/,
+    );
+  }
+});
+
+test('rejects PostgreSQL startup GUCs owned by Oliphaunt storage', () => {
+  for (const topology of ['direct', 'broker', 'server'] as const) {
+    for (const name of ['CONFIG_FILE', 'data_directory']) {
+      assert.throws(
+        () =>
+          normalizeOpenConfig(
+            { topology, startupGUCs: { [name]: 'override' } },
+            { instanceDirectory: '/database/root', temporaryDirectory: false },
+          ),
+        /Oliphaunt owns PostgreSQL startup GUC.*configure database storage/,
+      );
+    }
+  }
 });

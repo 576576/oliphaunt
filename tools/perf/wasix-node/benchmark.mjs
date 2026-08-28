@@ -84,16 +84,19 @@ async function runMeasuredBenchmark(planSource, options) {
     const comparison = await comparisonProvenance(planSource.plan);
     const sequence = [];
     const runs = {
-      candidate: [],
-      'candidate-main-thread': [],
-      comparison: [],
-      'comparison-main-thread': [],
+      'candidate-direct': [],
+      'candidate-worker': [],
+      'comparison-direct': [],
+      'comparison-worker': [],
     };
     const pids = new Set();
     await mkdir(resolve(scratch, 'runs'));
 
     for (let repeat = 0; repeat < planSource.plan.measurement.pairedRepeats; repeat += 1) {
-      const order = repeat % 2 === 0 ? ['candidate', 'comparison'] : ['comparison', 'candidate'];
+      const order =
+        repeat % 2 === 0
+          ? ['candidate-worker', 'comparison-worker']
+          : ['comparison-worker', 'candidate-worker'];
       for (const engine of order) {
         const result = await runEngine({
           engine,
@@ -115,8 +118,8 @@ async function runMeasuredBenchmark(planSource, options) {
     for (let repeat = 0; repeat < planSource.plan.measurement.pairedRepeats; repeat += 1) {
       const order =
         repeat % 2 === 0
-          ? ['candidate-main-thread', 'comparison-main-thread']
-          : ['comparison-main-thread', 'candidate-main-thread'];
+          ? ['candidate-direct', 'comparison-direct']
+          : ['comparison-direct', 'candidate-direct'];
       for (const engine of order) {
         const result = await runEngine({
           engine,
@@ -137,7 +140,7 @@ async function runMeasuredBenchmark(planSource, options) {
 
     const summary = summarizeRuns(planSource.plan, runs);
     const report = {
-      schema: 'oliphaunt-wasix-node-benchmark-report-v1',
+      schema: 'oliphaunt-wasix-node-benchmark-report-v2',
       createdAt: new Date().toISOString(),
       plan: planSummary(planSource.plan, planSource),
       provenance: {
@@ -164,8 +167,8 @@ async function runMeasuredBenchmark(planSource, options) {
     await writeFile(resolve(output, 'report.md'), markdownReport(report), { flag: 'wx' });
     console.log(
       `wasix-node benchmark: ${summary.gate.passed ? 'PASS' : 'FAIL'} ` +
-        `worker=${summary.placements.worker.geomeanRatio.toFixed(4)} ` +
-        `direct=${summary.placements.direct.geomeanRatio.toFixed(4)} ` +
+        `worker=${summary.comparisons.worker.geomeanRatio.toFixed(4)} ` +
+        `direct=${summary.comparisons.direct.geomeanRatio.toFixed(4)} ` +
         `gate<=${summary.gate.maxGeomeanRatio.toFixed(2)} ` +
         `report=${relative(repositoryRoot, output)}`,
     );
@@ -215,7 +218,7 @@ async function runEngine({ engine, repeat, planSource, candidateRoot, scratch })
 
 function validateEngineReport(report, engine, repeat, planSource) {
   if (
-    report.schema !== 'oliphaunt-wasix-node-engine-run-v1' ||
+    report.schema !== 'oliphaunt-wasix-node-engine-run-v2' ||
     report.plan?.id !== planSource.plan.id ||
     report.plan?.sha256 !== planSource.sha256 ||
     report.engine?.kind !== engine ||
@@ -225,25 +228,30 @@ function validateEngineReport(report, engine, repeat, planSource) {
     throw new Error(`${engine} repeat ${repeat} returned an invalid engine report`);
   }
   const candidate = engine.startsWith('candidate');
-  const expected = candidate
+  const expectedEngine = candidate
     ? planSource.plan.engines.candidate
     : planSource.plan.engines.comparison;
-  const direct = engine.endsWith('main-thread');
-  const executionBoundary = direct ? expected.directExecutionBoundary : expected.executionBoundary;
-  const isolationImplementation = direct
-    ? expected.directIsolationImplementation
-    : expected.isolationImplementation;
-  const timingBoundary = direct ? expected.directTimingBoundary : expected.timingBoundary;
+  const surface =
+    engine === 'candidate-direct'
+      ? expectedEngine.surfaces.direct
+      : engine === 'candidate-worker'
+        ? expectedEngine.surfaces.worker
+        : engine === 'comparison-worker'
+          ? expectedEngine.surfaces.worker
+          : expectedEngine.surfaces.callerRealm;
   if (
-    report.engine.package !== expected.package ||
-    report.engine.storage !== expected.storage ||
-    report.engine.executionBoundary !== executionBoundary ||
-    report.engine.isolationImplementation !== isolationImplementation ||
-    report.engine.timingBoundary !== timingBoundary
+    report.engine.package !== expectedEngine.package ||
+    report.engine.storage !== expectedEngine.storage ||
+    report.engine.entrypoint !== surface.entrypoint ||
+    report.engine.callingContract !== surface.callingContract ||
+    report.engine.executionOwner !== surface.executionOwner ||
+    report.engine.executionBoundary !== surface.executionBoundary ||
+    report.engine.isolationImplementation !== surface.isolationImplementation ||
+    report.engine.timingBoundary !== surface.timingBoundary
   ) {
     throw new Error(`${engine} repeat ${repeat} used an unexpected engine identity`);
   }
-  if (!candidate && report.engine.version !== expected.version) {
+  if (!candidate && report.engine.version !== expectedEngine.version) {
     throw new Error(`${engine} repeat ${repeat} used version ${report.engine.version}`);
   }
 }
@@ -252,28 +260,28 @@ function summarizeRuns(plan, runs) {
   const correctness = summarizeCorrectness(runs, plan);
   const worker = summarizePlacement(
     plan,
-    runs.candidate,
-    'candidate',
-    runs.comparison,
-    'comparison',
+    runs['candidate-worker'],
+    'candidate-worker',
+    runs['comparison-worker'],
+    'comparison-worker',
     correctness.passed,
   );
   const direct = summarizePlacement(
     plan,
-    runs['candidate-main-thread'],
-    'candidate-main-thread',
-    runs['comparison-main-thread'],
-    'comparison-main-thread',
+    runs['candidate-direct'],
+    'candidate-direct',
+    runs['comparison-direct'],
+    'comparison-direct',
     correctness.passed,
   );
   return {
     correctness,
-    placements: { worker, direct },
+    comparisons: { direct, worker },
     gate: {
       passed: worker.gate.passed && direct.gate.passed,
       correctnessPassed: correctness.passed,
       maxGeomeanRatio: plan.gate.maxGeomeanRatio,
-      placements: {
+      comparisons: {
         worker: worker.gate.passed,
         direct: direct.gate.passed,
       },
@@ -609,23 +617,23 @@ function stripTemporaryPaths(packages) {
 }
 
 function markdownReport(report) {
-  const placementSections = Object.entries(report.summary.placements)
-    .map(([placement, summary]) => placementMarkdown(placement, summary))
+  const comparisonSections = Object.entries(report.summary.comparisons)
+    .map(([comparison, summary]) => comparisonMarkdown(comparison, summary))
     .join('\n\n');
   return `# WASIX Node benchmark report
 
 - Plan: \`${report.plan.id}\`
-- Candidate: \`${report.plan.engines.candidate.package}\` (matched worker and direct placement)
+- Candidate: \`${report.plan.engines.candidate.package}\` (caller-owned root Promise API and explicit package-owned \`/worker\` entrypoint)
 - Candidate runtime build: \`${report.provenance.candidate.packages.runtime.build.configuration.profile}\` with \`${report.provenance.candidate.packages.runtime.build.configuration.cflags}\` (signature \`${report.provenance.candidate.packages.runtime.build.buildProfile.sha256}\`)
 - Candidate host build: Wasmer JS \`${report.provenance.candidate.closure.hostBuild.wasmerJsCommit}\`, wasmer-wasix \`${report.provenance.candidate.closure.hostBuild.wasmerWasixVersion}\`, Cargo \`${report.provenance.candidate.closure.hostBuild.optimization.cargoProfile}\`, Rust \`opt-level=${report.provenance.candidate.closure.hostBuild.optimization.rustOptLevel}\` with LTO, wasm-opt \`${report.provenance.candidate.closure.hostBuild.optimization.wasmOpt.join(' ')}\`, guest concurrency \`${report.provenance.candidate.closure.hostBuild.guestConcurrency}\` (inputs \`${report.provenance.candidate.closure.hostBuild.inputsSha256}\`)
-- Comparison: \`${report.plan.engines.comparison.package}@${report.plan.engines.comparison.version}\` (matched worker and direct placement)
+- Comparison: \`${report.plan.engines.comparison.package}@${report.plan.engines.comparison.version}\` (harness-owned Worker and caller-realm API)
 - Correctness: **${report.summary.correctness.passed ? 'PASS' : 'FAIL'}**
 - PostgreSQL settings parity: **${report.summary.correctness.postgresSettings.passed ? 'PASS' : 'FAIL'}**
-- Comfortable-win gate: **${report.summary.gate.passed ? 'PASS' : 'FAIL'}** (worker ${report.summary.placements.worker.geomeanRatio.toFixed(4)}, direct ${report.summary.placements.direct.geomeanRatio.toFixed(4)}, each required <= ${report.summary.gate.maxGeomeanRatio.toFixed(2)})
+- Comfortable-win gate: **${report.summary.gate.passed ? 'PASS' : 'FAIL'}** (worker ${report.summary.comparisons.worker.geomeanRatio.toFixed(4)}, direct comparison ${report.summary.comparisons.direct.geomeanRatio.toFixed(4)}, each required <= ${report.summary.gate.maxGeomeanRatio.toFixed(2)})
 
-${placementSections}
+${comparisonSections}
 
-Each placement ran in ${report.plan.measurement.pairedRepeats} same-repeat pairs against fresh in-memory databases. Launch order alternated evenly within each placement, and each paired candidate/PGlite ratio was computed before taking the per-metric median. Worker calls are timed end-to-end around one public RPC; direct calls are timed around the public API in the caller process. The cold-to-first-result metric combines public open and the immediate first user query so moving lazy work between those phases cannot change its weight.
+Each comparison ran in ${report.plan.measurement.pairedRepeats} same-repeat pairs against fresh in-memory databases. Launch order alternated evenly within each comparison, and each paired candidate/PGlite ratio was computed before taking the per-metric median. Worker calls are timed end-to-end around one public RPC. The direct comparison times both Promise-shaped caller-realm APIs; Oliphaunt performs guest work in the calling realm while the promise is pending. The cold-to-first-result metric combines public open and the immediate first user query so moving lazy work between those phases cannot change its weight.
 
 Bulk operations use each package's public \`execProtocolRaw\` with identical PostgreSQL Simple Query bytes. Outside the timed call, the harness decodes that exact response and requires its command tags and result rows before validating database state. Both placement gates are eligible only after canonical response streams and all recorded PostgreSQL settings agree.
 
@@ -633,8 +641,8 @@ PGlite's official worker wrapper targets browser Worker and Web Locks APIs, so t
 `;
 }
 
-function placementMarkdown(placement, summary) {
-  const title = placement === 'worker' ? 'Worker placement' : 'Direct placement';
+function comparisonMarkdown(comparison, summary) {
+  const title = comparison === 'worker' ? 'Worker comparison' : 'Direct comparison';
   const rows = summary.metrics
     .map(
       (metric) =>

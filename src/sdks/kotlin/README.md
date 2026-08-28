@@ -40,7 +40,7 @@ opening that root as them.
 val db = Oliphaunt.open(
     context = applicationContext,
     config = OliphauntConfig(
-        storage = DatabaseStorage.Directory(filesDir.resolve("database").path),
+        storage = DatabaseStorage.Directory(filesDir.resolve("database")),
         startupGucs = listOf(PostgresStartupGuc("application_name", "my-app")),
         extensions = listOf("vector"),
     ),
@@ -48,10 +48,10 @@ val db = Oliphaunt.open(
 
 db.execute(
     "INSERT INTO widgets(name) VALUES ($1)",
-    listOf(QueryParam.Text("ready")),
+    listOf(QueryParam.string("ready")),
 )
 val rows = db.query("SELECT name FROM widgets")
-println(rows.getText(row = 0, column = "name"))
+println(rows.rows.first().value("name", PostgresDecoders.string))
 
 val bytes = db.backup()
 db.close()
@@ -64,20 +64,74 @@ Oliphaunt.restore(
 
 ## API contract
 
-`execute` returns `CommandResult`; `query` returns `QueryResult` fields and rows.
-Both expose the PostgreSQL command tag and nullable row count reported by
-PostgreSQL. Parameters are explicit `QueryParam` values. SQL failures expose
-structured `PostgresError` through `PostgresException`.
+`query` executes one statement and returns ordered nullable bytes, complete
+field metadata, command metadata, and typed access through a local
+`PostgresDecoder<T>`. `execute` is the stricter one-statement, no-rows
+assertion. `exec` returns ordered command-or-rows results for simple-query SQL,
+and `describe` resolves parameter OIDs and optional result fields without
+executing. Results preserve ordered notices; SQL failures expose the same
+structured diagnostics and notices through `PostgresException`.
 
-The database also provides callback `transaction`, `checkpoint`, out-of-band
-`cancel`, buffered `execProtocolRaw`, callback `execProtocolStream`, byte
-`backup`, and idempotent `close`. The stream contains raw PostgreSQL backend
-frames; there is no separate public protocol parser.
+Every `QueryParam` carries an optional `PostgresOid`, `ValueFormat`, and nullable
+owned bytes. Prefer factories such as `string`, `boolean`, `int`, `long`,
+`bytes`, and `uuid`; use `typedNull(PostgresOid.uuid)` for an ambiguous null or
+explicit text/binary bytes plus a custom OID for an extension type. Built-in
+decoders validate both OID and wire format. `QueryRow.raw` remains the lossless
+fallback, and name-based typed access rejects duplicate column names.
 
-Transactions pin the single physical session. Callback failure rolls back; a
-failed rollback poisons the handle. COMMIT uncertainty is never followed by a
-misleading ROLLBACK. PostgreSQL's explicit `COMMIT` → `ROLLBACK` command tag is
-the known idle-session exception.
+The database also provides callback `transaction`, out-of-band `cancel`,
+buffered `execProtocolRaw`, callback `execProtocolRawStream`, byte
+`backup`, a read-only `isClosed`, and idempotent `close`. The stream contains raw
+PostgreSQL backend bytes; callback chunks are transport-dependent and are not a
+separate public protocol parser. The callback is a synchronous backpressure
+boundary: while it is running, the database rejects all same-database and
+transaction work, including work launched onto another coroutine dispatcher;
+`cancel()` is the sole out-of-band exception.
+Callback failures are surfaced only after the native runtime confirms protocol
+recovery, so the session remains reusable. A buffered or streaming transport or
+recovery failure is authoritative and poisons the database; close it instead of
+assuming a later operation can recover the physical session.
+
+Suspending calls never execute embedded PostgreSQL or storage preparation on
+the Android UI thread. One single-thread owner dispatcher performs open,
+protocol calls, backup, and close in admission order. A transaction or close
+establishes an atomic cutoff: operations admitted before it drain first, while
+later incompatible calls are rejected. `cancel()` uses a separate control
+dispatcher so it can interrupt the active owner call. It remains available
+while an admitted close drains earlier FIFO work and
+becomes unavailable when native teardown starts. Once JNI work is admitted
+it completes its handle ownership transition, and `close()` finishes in a
+non-cancellable context; coroutine cancellation alone is not a PostgreSQL
+interrupt. Applications must still call `close()` explicitly. A phantom-reference
+cleaner is a best-effort forgotten-handle safety net and only schedules close on
+the native owner; it never blocks the garbage collector thread.
+
+Transactions pin the single physical session and expose `query`, `execute`,
+`exec`, and `describe`; raw protocol execution stays on the database because it
+owns transaction lifecycle explicitly. One-shot `rollback()` closes the
+transaction and lets its callback return without committing; returning normally
+commits. Do not issue outer-lifecycle SQL such as `BEGIN`/`START TRANSACTION`,
+`COMMIT`/`END`, a full `ROLLBACK`/`ABORT` (with or without `AND [NO] CHAIN`), or
+`PREPARE TRANSACTION` inside a managed callback. Use
+`SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO SAVEPOINT` for nested work.
+PostgreSQL reports both `ROLLBACK TO` and `ROLLBACK AND CHAIN` as `ROLLBACK`
+with `ReadyForQuery=T`, so the SDK rejects `ROLLBACK`/`ABORT ... AND CHAIN`
+before dispatch and still validates every actual protocol boundary. A detected
+lifecycle command, escaped idle session, failed rollback, or uncertain COMMIT
+makes the database close-only; no second control command claims recovery. If a
+callback catches such a poisoning database or rollback error and returns, the
+transaction still fails with the stored original error. After a successful
+automatic rollback, the original callback exception is rethrown.
+When the callback and rollback both fail, `OliphauntTransactionRollbackException`
+exposes `callbackError` and `rollbackError`, uses the callback as its cause, and
+adds the rollback as a suppressed exception. If an earlier independent database
+or protocol failure has already poisoned or expired transaction ownership and
+the callback then throws a different exception,
+`OliphauntTransactionDatabaseException` exposes `callbackError` and
+`databaseError`, uses the callback as its cause, and adds the database error as a
+suppressed exception; the database is close-only. An ordinary PostgreSQL
+statement error that remains safely rollbackable is not automatically wrapped
+in either composite exception.
 
 Backup has one representation: PostgreSQL physical initialization bytes.
 Restore requires an absent or empty destination and never replaces an existing

@@ -157,15 +157,14 @@ selected exact extensions plus mandatory manifest dependencies.
 ```rust,no_run
 use oliphaunt::{Extension, Oliphaunt};
 
-# async fn demo() -> oliphaunt::Result<()> {
-let db = Oliphaunt::builder()
+# fn demo() -> oliphaunt::Result<()> {
+let mut db = Oliphaunt::builder()
     .direct()
-    .extension(Extension::Vector)
-    .open()
-    .await?;
+    .extension(Extension::VECTOR)
+    .open()?;
 
-db.execute("CREATE EXTENSION vector").await?;
-db.close().await?;
+db.execute("CREATE EXTENSION vector")?;
+db.close()?;
 # Ok(())
 # }
 ```
@@ -553,7 +552,7 @@ not a public target-support declaration. Each row records:
 - mobile static-link status;
 - first-party or external artifact policy.
 
-`Extension::ALL_PG18_SUPPORTED` is the public exact-extension catalog used by
+`Extension::ALL` is the public exact-extension catalog used by
 application code. The native-packaging tools consume the same generated
 metadata for artifact ownership and target support; vendor-provided
 artifact-index rows remain a separate runtime input. Desktop native, mobile,

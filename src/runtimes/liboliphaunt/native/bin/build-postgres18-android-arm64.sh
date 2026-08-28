@@ -58,6 +58,7 @@ icu_libs="$icu_static_libs $icu_cpp_libs"
 
 liboliphaunt_sources=(
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_native.c"
+  "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_error.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_runtime.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_protocol.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_config.c"
@@ -317,16 +318,23 @@ artifact_ready() {
     oliphaunt_init \
     oliphaunt_exec_protocol \
     oliphaunt_exec_simple_query \
-    oliphaunt_exec_protocol_stream \
+    oliphaunt_exec_protocol_raw_stream \
     oliphaunt_backup \
     oliphaunt_restore \
+    oliphaunt_init_with_error \
+    oliphaunt_exec_protocol_with_error \
+    oliphaunt_exec_simple_query_with_error \
+    oliphaunt_exec_protocol_raw_stream_with_error \
+    oliphaunt_backup_with_error \
+    oliphaunt_restore_with_error \
+    oliphaunt_detach_with_error \
     oliphaunt_cancel \
     oliphaunt_detach \
     oliphaunt_logical_generation \
     oliphaunt_close_if_generation \
     oliphaunt_close \
     oliphaunt_register_static_extensions \
-    oliphaunt_last_error \
+    oliphaunt_copy_last_error \
     oliphaunt_version \
     oliphaunt_free_response \
     oliphaunt_embedded_kill \

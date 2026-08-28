@@ -9,9 +9,10 @@ The TypeScript SDK targets Node.js, Bun, and Deno. It is the desktop
 JavaScript SDK for the native runtime, native helpers, broker/server flows, and
 runtime asset resolution.
 
-It is separate from [`@oliphaunt/wasix-ts`](/docs/sdk/wasix-typescript),
-which hosts the portable runtime directly or in a Worker in browsers and
-Node.js. Neither package selects or falls back to the other.
+It is separate from [`@oliphaunt/wasix-ts`](/docs/sdk/wasix-typescript), whose
+root runs portable guest work in the importing realm and whose explicit
+`/worker` entrypoint owns a Worker. Neither package selects or falls back to the
+other.
 
 Use this SDK for supported desktop JavaScript runtimes. Tauri apps currently
 keep the database in Rust state and expose narrow app-owned commands to the
@@ -52,8 +53,11 @@ await db.close();
 ## Runtime Shape
 
 The SDK detects Node.js, Bun, or Deno and selects its native direct adapter by
-default. Broker mode adds process isolation and crash recovery. Server mode is
-for PostgreSQL-compatible tools and independent clients.
+default. Broker mode adds process isolation. If its helper fails, close that
+database object and open a new one on the same persistent storage; PostgreSQL
+then performs WAL recovery. Oliphaunt never substitutes a new session under the
+same object. Server mode is for PostgreSQL-compatible tools and independent
+clients.
 
 The SDK resolves local helper binaries and runtime assets for the selected
 platform. App code keeps using TypeScript promises and typed result helpers while
@@ -68,6 +72,10 @@ semantics.
   independent sessions.
 - Use SDK backup and restore APIs for export/import flows.
 - Choose direct, broker, or server from the documented runtime support matrix.
+- Await `close()` (or use `await using`) instead of relying on nondeterministic
+  garbage-collection cleanup. Direct, broker, and server finalizers are
+  generation/exact-handle leak guards only; their asynchronous outcome is not
+  observable.
 
 ## First Query
 

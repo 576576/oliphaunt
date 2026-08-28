@@ -1,7 +1,9 @@
 # Browser WASIX
 
-This example runs the WASIX TypeScript binding directly in a browser or in a
-Web Worker and demonstrates IndexedDB and OPFS persistence.
+This example exercises both public execution surfaces: the direct caller-realm
+root entrypoint and the explicit package-owned `/worker` entrypoint. It also
+demonstrates IndexedDB and OPFS persistence and verifies that the root
+constructs no hidden Worker.
 
 Build the WASIX runtime assets, then run:
 

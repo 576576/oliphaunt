@@ -12,54 +12,155 @@ can support them. It does not mean identical signatures, configuration records,
 or host implementations. Each SDK uses its language's normal errors, async
 model, byte buffers, paths, and resource-lifetime conventions.
 
+The normative query, row, description, notice, lifecycle, and transaction
+semantics are in the
+[stable public database API decision](../architecture/stable-database-api.md).
+PGlite is migration evidence for the JavaScript shape, not the source of this
+cross-language contract.
+
 ## Stable semantic core
 
-Every app-facing SDK exposes the concepts below unless the table records a
-deliberate runtime-specific limit. The C ABI is the lower-level native binding
-boundary: it supplies handles, protocol bytes, backup/restore, cancellation,
-and lifecycle; typed queries and callback transactions belong in language SDKs.
+Every app-facing SDK exposes the database and callback-transaction concepts
+below. The spelling and host types are language-native; the behavior is shared.
+The C ABI remains the lower-level native binding boundary: it supplies handles,
+protocol bytes, backup/restore, cancellation, and lifecycle. OID codecs,
+structured results, descriptions, notices, and callback transactions belong in
+language SDKs and do not expand that ABI.
+
+| Concept | Stable behavior | Deliberate language shaping |
+| --- | --- | --- |
+| Open, close, and closed state | `open` waits for readiness; close rejects new work and is idempotent after success; every database exposes read-only closed state | `closed`, `isClosed`, or `is_closed`; no separate `ready`/`waitReady` requirement |
+| Encoded parameters | Optional PostgreSQL type OID, text/binary format for non-null bytes, and null; typed null retains its OID and canonicalizes its unobservable format to text; untyped null/text/binary remain | Common values use constructors, conversions, or builders. JavaScript may infer safe encoders through one owned Parse/Describe/Bind cycle and also accepts explicit wrappers and immutable per-query OID encoders |
+| Raw row contract | Ordered fields with complete wire metadata and ordered nullable byte cells; duplicate field names remain representable | Rust, Swift, and Kotlin retain this as their ordinary row and add typed access. JavaScript exposes it explicitly as `queryRaw` |
+| Typed or decoded rows | Decoding is selected and validated by field OID; typed name lookup rejects duplicates; raw bytes and metadata remain available | Rust uses `FromSql`, Swift `OliphauntPostgresDecodable`, Kotlin `PostgresDecoder<T>`; JavaScript `query` defaults to decoded objects and supports array rows, text mode, and immutable per-query OID decoders |
+| `execute` | One extended-query statement that must return no rows; command tag is authoritative and affected-row count is optional | Retained as an Oliphaunt command-only convenience in every language |
+| `exec` | Simple-query SQL with zero or more statements and ordered structured command-or-row results; no bind parameters; all structured executing operations reject top-level COPY before buffered dispatch | JavaScript applies its selected row/value mode; native languages use enums, sealed values, or equivalent |
+| `describe` | `Parse` + `Describe` + `Sync`, without execution; returns parameter OIDs, optional result fields, and notices | May accept caller parameter OIDs through options, a builder, or an overload; it does not return mutable codec objects |
+| Query-scoped notices | Structured PostgreSQL notices stay ordered with the `query`, `queryRaw`, `execute`, `exec`, or `describe` operation that received them | No global parser registry, notice bus, or idle notification pump is implied |
+| Callback transaction | Exclusive physical-session ownership; mirrors structured query, execute, exec, and describe; exposes closed state; has no raw-protocol bypass | Explicit rollback is one-shot, expires the handle, skips outer commit, and lets a normally returning callback return its value |
+| PostgreSQL errors | Preserve SQLSTATE, available `ErrorResponse` fields, and unknown raw fields; remain distinct from lifecycle, transport, storage, codec, and unsupported-operation errors | Language-native error classes, enums, or exceptions |
+| Transaction-status ownership | Structured database operations do not silently leave `ReadyForQuery` in an open or failed transaction for the next borrower; callback operations inspect every exact wire command tag and the one terminal readiness status before high-level parsing | Raw protocol is a database/root-only explicit bypass; managed transactions settle by callback return or rollback, allow savepoint SQL, and make uncertain or escaped ownership close-only without a follow-up SDK control |
+
+The runtime/product capabilities around that common database API are:
 
 | Concept | Native SDK family | Rust WASIX | WASIX TypeScript |
 | --- | --- | --- | --- |
-| Open and close | yes | yes | yes; `AsyncDisposable` also closes |
 | Default storage | SDK-owned temporary directory | true WASIX memory filesystem | true WASIX memory filesystem |
 | Persistent storage | managed filesystem root | managed filesystem root | IndexedDB or OPFS in browsers; managed filesystem root on Node, Bun, and Deno |
-| Query and command helpers | yes | yes | yes |
-| Raw PostgreSQL protocol | yes | yes | yes, owned byte response |
-| Callback transaction | yes | yes | yes |
-| Checkpoint | PostgreSQL `CHECKPOINT` | PostgreSQL `CHECKPOINT` / storage sync | PostgreSQL `CHECKPOINT` followed by provider publication |
-| Exact extension selection | yes | yes | yes |
+| Raw PostgreSQL protocol on database/root handles | yes | yes | yes, owned byte response |
+| Exact extension artifact selection | yes | yes | yes |
 | Physical backup | direct and broker; mobile direct | yes | yes |
 | Physical restore | new or empty destination | static restore into a new or empty directory | static restore into new or empty persistent storage |
 | Listening server | Rust and desktop TypeScript | yes | Node, Bun, and Deno through explicit server subpaths; no browser socket API |
-| PostgreSQL tools | optional endpoint-oriented Rust and desktop TypeScript products; no core SDK dependency | `tools` feature: open-database `pg_dump` and non-interactive `psql` | optional `@oliphaunt/wasix-tools`: `pgDump` in direct or worker placement; non-interactive `psql` in worker placement |
+| PostgreSQL tools | optional endpoint-oriented Rust and desktop TypeScript products; no core SDK dependency | `tools` feature: fluent open-database `pg_dump` and non-interactive `psql` methods on sync or async handles | optional `@oliphaunt/wasix-tools`: `pgDump` with direct or Worker handles; non-interactive `psql` with a Worker handle |
 | Cancellation | native C and language SDKs | no public direct cancellation contract | no |
-| Protocol/COPY response streaming | callback raw-protocol streaming in every native SDK, backed by the native C callback ABI | callback raw-protocol streaming; COPY uses the guest stream pump | buffered and callback raw-protocol streaming with bounded backpressure |
+| Protocol/COPY response streaming | canonical `execProtocolRawStream`/`exec_protocol_raw_stream`, backed by `oliphaunt_exec_protocol_raw_stream` | `exec_protocol_raw_stream`; COPY uses the guest stream pump | `execProtocolRawStream` with bounded backpressure |
+
+There is no public checkpoint method. PostgreSQL `CHECKPOINT` is ordinary SQL
+and is available through `execute("CHECKPOINT")` or the language-equivalent
+call. WASIX storage publication after successful work, including the separate
+full-publication boundary for a newly initialized persistent direct-OPFS root,
+is runtime-owned and does not become a database method or option.
 
 These are language-native deltas, not parity failures:
 
-- Rust uses builders, enums, futures, and owned byte buffers.
-- Swift uses actors, `URL`, and `Data`.
-- Kotlin uses coroutines, sealed storage types, and `ByteArray`.
+- Both Rust products expose the same fluent `Sql` statement builder with typed
+  binds and `query`, `execute`, or `describe` terminals. Root `Oliphaunt` types
+  are synchronous and exclusive; root `AsyncOliphaunt` types retain the
+  cloneable asynchronous contract and use dedicated owner threads. Native Rust
+  synchronous calls block their caller without an SDK queue hop, while native
+  direct PostgreSQL itself runs on `liboliphaunt`'s internal backend pthread.
+  Rust WASIX direct guest work truly executes on the caller thread, and its
+  server lifecycle calls remain synchronous while the listener owns its backend
+  thread.
+- Native blocking `Oliphaunt` is `Send` but not `Sync`; WASIX blocking
+  `Oliphaunt` is neither `Send` nor `Sync`. Blocking server handles in both
+  products are `Send` but not `Sync`. The cloneable async database and server
+  handles are `Send + Sync`; an async transaction is `Send` but not `Sync` and
+  its operations require exclusive mutable access. These differences describe
+  real owner placement rather than different SQL semantics.
+- Both Rust products keep database and server construction separate:
+  `OliphauntBuilder` / `AsyncOliphauntBuilder` end in `open`, while dedicated
+  `OliphauntServerBuilder` / `AsyncOliphauntServerBuilder` end in `start`.
+- Both Rust products root-export an opaque, cloneable `Error` and a
+  `#[non_exhaustive] ErrorKind` with `InvalidConfiguration`, `Lifecycle`,
+  `TransactionActive`, `Postgres`, and `Other`; `Error::kind()` is the stable
+  category boundary. PostgreSQL and composite transaction detail remains
+  available through dedicated accessors without exposing runtime-specific
+  causes as public enum variants.
+- Both Rust products use an opaque root `Extension` with uppercase associated
+  constants, `Extension::ALL`, `Extension::by_sql_name`, and `sql_name`.
+  Native `ALL` is the packaged PostgreSQL 18 catalog; WASIX exposes only
+  Cargo-feature-enabled extensions and gates the type and builder methods on
+  its `extensions` feature. Free/module constants and PascalCase aliases are
+  not public compatibility surfaces.
+- Swift uses actors, `URL`, `Data`, and `OliphauntPostgresDecodable`.
+- Kotlin uses coroutines, sealed storage types, `ByteArray`, and
+  `PostgresDecoder<T>`.
 - React Native delegates runtime behavior to Swift or Kotlin and owns the
-  TypeScript/TurboModule boundary.
-- TypeScript uses promises, opaque storage values, `Uint8Array`, selective
-  package subpaths, and `Symbol.asyncDispose` where appropriate.
+  TypeScript/TurboModule boundary. It transfers complete results and performs
+  JavaScript row decoding above the bridge.
+- TypeScript uses promises, opaque storage values, decoded object or array
+  rows, explicit raw rows, immutable per-query OID decoders, `Uint8Array`,
+  selective package subpaths, and `Symbol.asyncDispose` where appropriate.
 - Rust WASIX and WASIX TypeScript expose the same lightweight single-backend
   endpoint where the host has local sockets. TypeScript keeps the server absent
   in browsers and exports it only from the Node, Bun, and Deno server subpaths.
 - WASIX tools run against an open embedded database in both bindings. Their
   optional carriers stay outside the core SDK packages. TypeScript `pgDump`
-  supports direct and worker database placement; TypeScript `psql` requires
-  worker placement and uses a bounded internal pgwire bridge between workers.
+  supports root-direct and explicit Worker database handles; TypeScript `psql`
+  requires a Worker handle and uses a bounded internal pgwire bridge between
+  workers.
   Neither needs a browser socket.
+- `@oliphaunt/wasix-ts/internal/tools` is a version-locked cross-package bridge
+  owned solely by `@oliphaunt/wasix-tools`. Its export-map visibility does not
+  make it an app-facing or stable database API. The JavaScript SDKs expose
+  codec helpers and result types from their roots and deliberately do not
+  publish implementation-heavy `query` or `protocol` subpaths.
+- Swift's `OliphauntExtensionSupport` product is a version-locked carrier seam
+  owned by generated Swift extension products. Ordinary applications select
+  extensions by SQL name through `Oliphaunt`; they should not import this
+  support product directly. It may evolve only in lockstep with the carrier
+  products that consume it. The public `COliphaunt` product is governed by the
+  documented C ABI contract rather than the Swift application API.
+- Native Rust's non-default `__internal-broker-helper` feature similarly exposes
+  `oliphaunt::__private` only to the exact-version, unpublished
+  `oliphaunt-broker` executable. It is absent from normal builds, is inventoried
+  separately, and is not part of the stable application contract.
 - Native tools are endpoint-oriented optional products. `oliphaunt-tools` and
   `@oliphaunt/tools` accept a PostgreSQL connection string and do not become
   dependencies or methods of the embedded database SDKs.
-- Native Rust server mode owns an SDK pgwire client, so its database handle
-  retains the ordinary session helpers. Rust WASIX dedicates its one embedded
-  backend to the listener; its server handle therefore owns only the endpoint
-  and lifecycle, and applications use an ordinary PostgreSQL client for SQL.
+- Server handles in native/WASIX Rust, desktop TypeScript, and WASIX TypeScript
+  own only the process/listener, connection string, and lifecycle. Applications
+  use an ordinary PostgreSQL ORM, driver, or tool for SQL and cancellation; a
+  server handle never controls independent client connections.
+- Native cancellation targets the runtime's active operation and recovers it
+  through PostgreSQL readiness. It is not query-scoped cancellation, and WASIX
+  exposes no cancellation method until it has a guest interrupt contract.
+- WASIX TypeScript persistence settles a logical operation only after provider
+  publication. A callback transaction publishes once after confirmed commit or
+  rollback; publication failures preserve their storage and commit-state error.
+- WASIX TypeScript close is one terminal memoized attempt once teardown starts.
+  A failed or timed-out attempt still retires its Worker/guest owner, reports
+  `closed`, rejects later work, and returns the same failure on repeated close;
+  a pre-teardown active-transaction rejection remains retryable.
+- Native TypeScript classifies close at the private runtime boundary. A direct
+  logical-detach error is retryable only before deactivation; broker/server
+  errors after their destructive cutoff retire the facade, set `closed`, and
+  replay the same terminal attempt. Error strings are never lifecycle state.
+- Native broker helpers are one generation per public database handle in both
+  Rust and TypeScript. Helper or IPC loss fails the handle permanently; callers
+  explicitly close and open a new handle. Neither SDK transparently replaces
+  session state or replays uncertain work.
+- Native response streaming starts with complete frontend input. Stronger
+  WASIX guest stream machinery does not raise that portable guarantee.
+
+Selecting an extension means making its exact runtime artifact, dependencies,
+and required pre-start preload/GUC configuration available. It never executes
+`CREATE EXTENSION`, `ALTER EXTENSION`, `LOAD`, schema setup, or post-create SQL.
+Applications and ORM migrations own database-local installation and upgrades;
+reopening a catalog that uses an extension requires selecting its runtime code
+again.
 
 ## Storage and physical data
 
@@ -107,22 +208,27 @@ WASIX archives are not physically interchangeable; logical SQL is the bridge.
 
 Provider ownership remains binding-specific implementation:
 
-- Swift, Kotlin, React Native, desktop TypeScript direct mode, native Rust
-  direct/broker mode, and C restore use the C runtime's stable sibling lease;
-- native server modes rely on PostgreSQL's own live-cluster ownership after
-  bounded, atomic root initialization;
+- Swift, Kotlin, React Native, desktop TypeScript direct mode, and C restore
+  use the C runtime's stable sibling lease;
+- native Rust retains the byte-identical sibling lease in direct mode and
+  hands ownership into C explicitly; its broker child follows that direct path,
+  while native server mode retains the lease around the PostgreSQL process;
 - Rust WASIX uses its host-directory owner;
 - TypeScript uses Web Locks or a Node/Bun/Deno sibling owner as appropriate.
 
-Each mechanism prevents duplicate ownership within its provider. They do not
-coordinate simultaneous direct/broker/server mutation of one root, which is
-application error. Locks are provider-local state outside the managed root and
-backups. Cross-binding root use is not a supported or qualified workflow.
+The C and Rust native sibling leases use the same lock identity, so native
+direct, broker, server, and C-backed SDK owners reject overlapping use of one
+root even across those bindings. WASIX ownership remains provider-specific and
+does not establish a cross-runtime lock contract. Locks stay outside the
+managed root and backups. Cross-binding root use is not a supported or
+qualified workflow even where the native safety lock is shared.
 
-## Deferred work with decided current behavior
+## Registered deferred work
 
-These identifiers are the complete deferred list for this contract. They are
-not hidden modes or partly supported capabilities.
+These identifiers record existing repository-enforced deferrals. They are not
+an exhaustive roadmap. The deliberate omissions in the stable database API
+decision remain absent without requiring a placeholder identifier here; the
+rows below are likewise not hidden modes or partly supported capabilities.
 
 | ID | Current behavior | Evidence required before implementation |
 | --- | --- | --- |
@@ -138,6 +244,13 @@ not hidden modes or partly supported capabilities.
 - backward compatibility with removed capability, format, profile,
   initialization, background-preparation, or replace-policy APIs;
 - identical method names and configuration records across languages;
+- treating the PGlite interface as the universal Rust, Swift, or Kotlin API;
+- a mutable global parser/serializer registry or silent coercion between
+  incompatible PostgreSQL OIDs;
+- `ready`/`waitReady`, manual transaction commit, model mapping, a public
+  session-reservation primitive, or an ORM-owned pool in the database core;
+- idle `LISTEN`/`NOTIFY`, named prepared-statement caching, typed COPY, or
+  pull-based row streaming before their runtime contracts exist;
 - runtime auto-selection or fallback between native and WASIX packages;
 - automatic adoption of descriptorless PGDATA or legacy archive envelopes;
 - physical interchange between native and WASIX builds;
@@ -149,9 +262,10 @@ not hidden modes or partly supported capabilities.
 
 A public SDK change is complete when all affected language surfaces, C/header
 copies, generated API inventory, docs route, package shape, and behavioral tests
-agree. A deliberate delta must appear above with current behavior; a future idea
-must use one of the exact deferred IDs above or be rejected until a concrete
-need exists.
+agree. A deliberate delta must appear above with current behavior. A new idea
+needs a concrete cross-runtime contract and executable evidence; only the
+repository-enforced deferrals listed above require one of their existing exact
+IDs.
 
 The lightweight contract checks are:
 

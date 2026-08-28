@@ -13,6 +13,36 @@
 #define OLIPHAUNT_EMBEDDED_MODULE_DIR_ENV "OLIPHAUNT_EMBEDDED_MODULE_DIR"
 #define OLIPHAUNT_ERROR_CAPACITY 1024
 
+/*
+ * Every fallible public C operation installs one of these stack-owned scopes.
+ * set_error records into the innermost scope as well as the shared handle (or
+ * global) slot. A failed nested operation is propagated to its parent when it
+ * returns; a successful nested operation cannot erase an outer error.
+ */
+typedef struct OliphauntErrorScope {
+    struct OliphauntErrorScope *parent;
+    OliphauntHandle *fallback_handle;
+    const char *operation;
+    char error[OLIPHAUNT_ERROR_CAPACITY];
+    bool has_error;
+} OliphauntErrorScope;
+
+void oliphaunt_error_scope_begin(
+    OliphauntErrorScope *scope,
+    OliphauntHandle *fallback_handle,
+    const char *operation);
+/* Promote a backend-thread error into the current thread's operation scope.
+ * The caller must keep fallback_handle alive and serialize the shared error
+ * producer through the operation's owning mutex while this snapshot is made. */
+void oliphaunt_error_scope_capture_shared(OliphauntHandle *fallback_handle);
+void oliphaunt_error_scope_end(OliphauntErrorScope *scope, bool failed);
+/* Shared runners pass NULL only for synchronous non-capture entry points; every public
+ * `_with_error` wrapper rejects a NULL capture before dispatching work. */
+void oliphaunt_error_capture_current(
+    OliphauntErrorCapture *capture,
+    OliphauntHandle *fallback_handle,
+    bool failed);
+
 typedef struct OliphauntEmbeddedIO {
     void *context;
     ssize_t (*read)(void *context, void *ptr, size_t len);
@@ -134,11 +164,14 @@ struct OliphauntHandle {
     int backend_status;
 
     pthread_mutex_t mutex;
+    pthread_mutex_t error_mutex;
     pthread_cond_t input_cond;
     pthread_cond_t output_cond;
     bool sync_initialized;
+    bool error_mutex_initialized;
     bool closing;
     bool logical_active;
+    bool external_root_lock;
     uint64_t logical_generation;
     unsigned char *input;
     size_t input_len;
@@ -205,6 +238,10 @@ void oliphaunt_static_extension_init(const OliphauntStaticExtension *extension);
 
 char *oliphaunt_dup_config_string(const char *value, const char *fallback);
 int oliphaunt_dup_startup_args(OliphauntHandle *handle, const OliphauntConfig *config);
+int oliphaunt_validate_startup_args(OliphauntHandle *handle, const OliphauntConfig *config);
+bool oliphaunt_config_matches_resident_runtime(
+    const OliphauntHandle *handle,
+    const OliphauntConfig *config);
 char *oliphaunt_resolve_postgres_argv0(const char *runtime_dir);
 
 int oliphaunt_build_backend_argv(OliphauntHandle *handle, OliphauntBackendArgv *out);
@@ -236,6 +273,23 @@ int oliphaunt_claim_global_instance_for_close(
     OliphauntHandle **claimed);
 int oliphaunt_claim_current_global_instance_for_close(OliphauntHandle **claimed);
 int32_t oliphaunt_close_claimed_global_instance(OliphauntHandle *handle);
+/*
+ * Pins the current published handle across one complete public C operation,
+ * including its error-scope teardown. Terminal close may make the registry
+ * reject new calls and interrupt the backend, but it cannot destroy the
+ * handle until every acquired call has ended.
+ */
+int oliphaunt_begin_handle_call(OliphauntHandle *handle);
+bool oliphaunt_try_begin_handle_call(OliphauntHandle *handle);
+void oliphaunt_end_handle_call(void);
+/*
+ * Serializes logical detach against public handle calls without holding the
+ * handle mutex across PostgreSQL reset work. A stream callback is rejected
+ * before waiting, so reentrant detach remains a prompt busy error.
+ */
+int oliphaunt_begin_handle_retirement(OliphauntHandle *handle);
+void oliphaunt_end_handle_retirement(void);
+void oliphaunt_wait_for_active_handle_calls(void);
 void oliphaunt_register_process_exit_shutdown(void);
 
 bool oliphaunt_trace_enabled(void);
@@ -250,6 +304,17 @@ int oliphaunt_set_input_locked(OliphauntHandle *handle, const void *buf, size_t 
 int oliphaunt_startup_timeout_ms(void);
 int oliphaunt_wait_for_ready_locked(OliphauntHandle *handle, int timeout_ms);
 void oliphaunt_clear_stream_chunks_locked(OliphauntHandle *handle);
+/* Returns -1 and sets the operation error when a raw stream owns the handle.
+ * The caller must hold handle->mutex. */
+static inline int oliphaunt_reject_if_streaming_locked(OliphauntHandle *handle) {
+    if (handle == NULL || !handle->streaming) {
+        return 0;
+    }
+    oliphaunt_set_error(
+        handle,
+        "native liboliphaunt handle is busy delivering a raw protocol stream");
+    return -1;
+}
 
 int oliphaunt_path_exists(const char *path);
 int oliphaunt_path_is_directory(const char *path);

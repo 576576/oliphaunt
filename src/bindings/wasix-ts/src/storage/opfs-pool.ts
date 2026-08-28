@@ -209,11 +209,7 @@ export class DirectOpfsPool {
         pool.#closeHandles(false);
       } catch (closeError) {
         const primary = error instanceof Error ? error : new Error(describeError(error));
-        throw composeWasixStorageFailure(
-          primary,
-          'direct OPFS handle cleanup also failed',
-          closeError,
-        );
+        throw composeWasixStorageFailure(primary, 'OPFS handle cleanup also failed', closeError);
       }
       throw error;
     }
@@ -221,11 +217,11 @@ export class DirectOpfsPool {
 
   async sync(boundary: WasixStorageSyncBoundary): Promise<void> {
     this.#assertOpen();
-    if (boundary === 'checkpoint' || boundary === 'close') this.#flushAll();
+    if (boundary === 'full' || boundary === 'close') this.#flushAll();
     else this.#flushWal();
 
     await this.#materializeStagedFiles();
-    const completesInitialization = !this.#initializationComplete && boundary === 'checkpoint';
+    const completesInitialization = !this.#initializationComplete && boundary === 'full';
     if (this.#namespaceDirty || completesInitialization) {
       // A namespace publication makes newly mapped bytes reachable. Reuse the
       // complete PostgreSQL order instead of depending on map insertion order.

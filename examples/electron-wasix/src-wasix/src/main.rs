@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread;
 
-use anyhow::{bail, Context, Result};
-use oliphaunt_wasix::{DatabaseStorage, OliphauntServer, extensions};
+use anyhow::{Context, Result, bail};
+use oliphaunt_wasix::{AsyncOliphauntServer, DatabaseStorage, Extension};
 #[cfg(test)]
 use oliphaunt_wasix::{Oliphaunt, tools};
 use serde_json::json;
@@ -15,8 +15,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("build WASIX sidecar Tokio runtime")?;
-    let _runtime_context = runtime.enter();
-    let server = start_server(directory)?;
+    let server = runtime.block_on(start_server(directory))?;
     println!("{}", json!({ "databaseUrl": server.connection_string() }));
     io::stdout().flush()?;
     let _server = server;
@@ -25,15 +24,16 @@ fn main() -> Result<()> {
     }
 }
 
-fn start_server(directory: PathBuf) -> Result<OliphauntServer> {
-    let server = OliphauntServer::builder()
+async fn start_server(directory: PathBuf) -> Result<AsyncOliphauntServer> {
+    let server = AsyncOliphauntServer::builder()
         .storage(DatabaseStorage::Directory(directory))
         .extensions([
-            extensions::HSTORE,
-            extensions::PG_TRGM,
-            extensions::UNACCENT,
+            Extension::HSTORE,
+            Extension::PG_TRGM,
+            Extension::UNACCENT,
         ])
         .start()
+        .await
         .context("start oliphaunt-wasix server")?;
     Ok(server)
 }
@@ -41,18 +41,12 @@ fn start_server(directory: PathBuf) -> Result<OliphauntServer> {
 #[cfg(test)]
 fn validate_wasix_tools() -> Result<()> {
     let mut database = Oliphaunt::open()?;
-    let dump = tools::pg_dump(
-        &mut database,
-        tools::PgDumpOptions::new().arg("--schema-only"),
-    )?;
+    let dump = database.pg_dump(tools::PgDumpOptions::new().arg("--schema-only"))?;
     anyhow::ensure!(
         dump.contains("PostgreSQL database dump"),
         "pg_dump SQL backup smoke did not look like a PostgreSQL dump"
     );
-    let psql = tools::psql(
-        &mut database,
-        tools::PsqlOptions::new().arg("-tA").command("SELECT 1"),
-    )?;
+    let psql = database.psql(tools::PsqlOptions::new().arg("-tA").command("SELECT 1"))?;
     anyhow::ensure!(
         psql.lines().any(|line| line.trim() == "1"),
         "psql smoke did not return SELECT 1 output"
@@ -87,9 +81,9 @@ mod tests {
             .enable_all()
             .build()
             .expect("build WASIX sidecar smoke runtime");
-        let _runtime_context = runtime.enter();
         validate_wasix_tools().expect("run explicit split WASIX tools smoke");
-        let server = start_server(directory.clone())
+        let server = runtime
+            .block_on(start_server(directory.clone()))
             .expect("start sidecar server after split WASIX tools smoke");
         drop(server);
         let _ = std::fs::remove_dir_all(directory);

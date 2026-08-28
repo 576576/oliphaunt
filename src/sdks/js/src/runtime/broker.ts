@@ -22,6 +22,7 @@ import {
 import type { ByteStream } from './byte-stream.js';
 import {
   connectEndpoint,
+  cleanupFailedManagedLaunch,
   createTempDir,
   parseReadyEndpoint,
   randomHexToken,
@@ -29,9 +30,13 @@ import {
   removeTree,
   spawnManagedChild,
   unixSocketPathsFit,
+  waitForManagedChild,
   type ManagedChild,
+  type FailedManagedLaunch,
 } from './node-adapter.js';
 import type { RuntimeBinding, RuntimeHandle } from './types.js';
+import { throwCollectedCloseFailures } from './close.js';
+import { createForgottenRuntimeHandleCleanup } from './forgotten-handle.js';
 import { resolveExactNativeRuntimeProfile } from '../native/runtime-profile.js';
 
 const READY_PREFIX = 'OLIPHAUNT_BROKER_READY ';
@@ -51,14 +56,12 @@ export type BrokerRuntimeBindingOptions = {
 export function createBrokerRuntimeBinding(
   options: BrokerRuntimeBindingOptions = {},
 ): RuntimeBinding {
+  const forgottenHandles = createForgottenRuntimeHandleCleanup<BrokerHandle>((handle) =>
+    handle.detach(),
+  );
   return {
     async open(config: NormalizedOpenConfig): Promise<BrokerHandle> {
-      const executable = await resolveBrokerExecutable(
-        config.brokerExecutable ?? options.executable,
-      );
-      const handle = new BrokerHandle(executable, config);
-      await handle.start();
-      return handle;
+      return openBrokerHandle(config.brokerExecutable ?? options.executable, config);
     },
     execProtocolRaw(handle: RuntimeHandle, request: Uint8Array): Promise<Uint8Array> {
       return asBrokerHandle(handle).requestOk({
@@ -82,35 +85,55 @@ export function createBrokerRuntimeBinding(
     cancel(handle: RuntimeHandle): Promise<void> {
       return asBrokerHandle(handle).cancel();
     },
-    detach(handle: RuntimeHandle): Promise<void> {
-      return asBrokerHandle(handle).detach();
+    async close(handle: RuntimeHandle) {
+      try {
+        await asBrokerHandle(handle).detach();
+        return { state: 'closed' };
+      } catch (error) {
+        // BrokerHandle.detach() crosses its destructive cutoff before any
+        // fallible teardown. The public owner must be retired even when later
+        // process or filesystem cleanup reports an error.
+        return { state: 'terminal', error };
+      }
+    },
+    registerForgottenHandleCleanup(
+      owner: object,
+      handle: RuntimeHandle,
+      _releaseOwnership: () => void,
+    ): void {
+      forgottenHandles.register(owner, asBrokerHandle(handle));
+    },
+    unregisterForgottenHandleCleanup(owner: object): void {
+      forgottenHandles.unregister(owner);
     },
   };
 }
 
-class BrokerHandle {
+/** @internal Runtime-owned handle; exported only for package-internal contract tests. */
+export class BrokerHandle {
   #child: ManagedChild | undefined;
   #stream: ByteStream | undefined;
   #cancelEndpoint: string | undefined;
   #ipcDir: string | undefined;
+  #temporaryInstanceDirectory: string | undefined;
   #authToken: string | undefined;
+  #failed = false;
+  #failure: unknown;
   #closed = false;
 
   constructor(
-    readonly executable: string,
     readonly config: NormalizedOpenConfig,
-  ) {}
-
-  async start(): Promise<void> {
-    if (this.#closed) {
-      throw new Error('native broker session is closed');
-    }
-    const authToken = randomHexToken();
-    const launch = await launchBroker(this.executable, this.config, authToken);
+    launch: BrokerLaunch,
+    authToken: string,
+    private readonly shutdownTimeoutMs = SHUTDOWN_TIMEOUT_MS,
+  ) {
     this.#child = launch.child;
     this.#stream = launch.stream;
     this.#cancelEndpoint = launch.cancelEndpoint;
     this.#ipcDir = launch.ipcDir;
+    this.#temporaryInstanceDirectory = config.temporaryDirectory
+      ? config.instanceDirectory
+      : undefined;
     this.#authToken = authToken;
   }
 
@@ -123,6 +146,10 @@ class BrokerHandle {
         throw new Error(response.message);
       case 'chunk':
         throw new Error('native broker returned a stream chunk for a buffered request');
+      case 'streamCallbackAborted':
+        throw new Error(
+          `native broker returned a stream callback-aborted frame for a buffered request: ${response.message}`,
+        );
     }
   }
 
@@ -131,6 +158,7 @@ class BrokerHandle {
     onChunk: (chunk: Uint8Array) => void,
   ): Promise<void> {
     const stream = await this.ensureStream();
+    let callbackFailed = false;
     let callbackError: unknown;
     try {
       await writeBrokerRequest(stream, {
@@ -138,7 +166,7 @@ class BrokerHandle {
         bytes: request,
       });
     } catch (error) {
-      await this.markFailed();
+      await this.markFailed(error);
       throw error;
     }
     for (;;) {
@@ -146,25 +174,27 @@ class BrokerHandle {
       try {
         response = await readBrokerResponse(stream);
       } catch (error) {
-        await this.markFailed();
+        await this.markFailed(error);
         throw error;
       }
       switch (response.kind) {
         case 'chunk':
-          if (callbackError === undefined) {
+          if (!callbackFailed) {
             try {
               onChunk(response.bytes);
             } catch (error) {
+              callbackFailed = true;
               callbackError = error;
             }
           }
           break;
         case 'ok':
-          if (callbackError !== undefined) throw callbackError;
+          resolveBrokerStreamCompletion(response, callbackFailed, callbackError);
           return;
         case 'error':
-          if (callbackError !== undefined) throw callbackError;
-          throw new Error(response.message);
+        case 'streamCallbackAborted':
+          resolveBrokerStreamCompletion(response, callbackFailed, callbackError);
+          return;
       }
     }
   }
@@ -179,49 +209,115 @@ class BrokerHandle {
       throw new Error('native broker auth token is unavailable');
     }
     const stream = await connectEndpoint(parseReadyEndpoint(endpoint));
-    try {
-      await authenticateBroker(stream, authToken);
-      await writeBrokerRequest(stream, { kind: 'cancel' });
-      const response = await readBrokerResponse(stream);
-      if (response.kind === 'error') {
-        throw new Error(`native broker cancel failed: ${response.message}`);
-      }
-      if (response.kind === 'chunk') {
-        throw new Error('native broker cancel endpoint returned a stream chunk');
-      }
-    } finally {
-      await stream.close();
-    }
+    await cancelBrokerStream(stream, authToken);
   }
 
   async detach(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
+    const firstAttempt = !this.#closed;
     this.#closed = true;
+    this.#cancelEndpoint = undefined;
+    this.#authToken = undefined;
+    const failures: unknown[] = [];
     const stream = this.#stream;
     if (stream !== undefined) {
+      if (firstAttempt && !this.#failed) {
+        try {
+          await writeBrokerRequest(stream, { kind: 'close' });
+          const response = await readBrokerResponse(stream);
+          if (response.kind === 'error') {
+            throw new Error(`native broker close failed: ${response.message}`);
+          }
+          if (response.kind === 'chunk') {
+            throw new Error('native broker close returned a stream chunk');
+          }
+          if (response.kind === 'streamCallbackAborted') {
+            throw new Error(
+              `native broker close returned a stream callback-aborted frame: ${response.message}`,
+            );
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
       try {
-        await writeBrokerRequest(stream, { kind: 'close' });
-        await readBrokerResponse(stream);
-      } catch {}
-      await stream.close();
-    }
-    this.#stream = undefined;
-    const child = this.#child;
-    this.#child = undefined;
-    if (child !== undefined) {
-      const exited = await waitForChild(child, SHUTDOWN_TIMEOUT_MS);
-      if (!exited) {
-        child.kill('SIGKILL');
-        await child.wait();
+        await stream.close();
+        if (this.#stream === stream) {
+          this.#stream = undefined;
+        }
+      } catch (error) {
+        // Retain the exact stream so a later internal cleanup attempt can
+        // retry releasing it. Public close still memoizes this first terminal
+        // result and never presents the handle as usable again.
+        failures.push(error);
       }
     }
-    await removeTree(this.#ipcDir);
-    this.#ipcDir = undefined;
-    if (this.config.temporaryDirectory) {
-      await removeTree(this.config.instanceDirectory);
+    const child = this.#child;
+    if (child !== undefined) {
+      try {
+        let exited = await waitForManagedChild(child, this.shutdownTimeoutMs);
+        if (!exited) {
+          failures.push(new Error(`native broker did not stop within ${this.shutdownTimeoutMs}ms`));
+          child.kill('SIGKILL');
+          exited = await waitForManagedChild(child, this.shutdownTimeoutMs);
+          if (!exited) {
+            failures.push(
+              new Error(
+                `native broker was not reaped within ${this.shutdownTimeoutMs}ms after SIGKILL`,
+              ),
+            );
+          }
+        }
+        if (exited && this.#child === child) {
+          this.#child = undefined;
+        }
+      } catch (error) {
+        // An unconfirmed reap remains owned by this terminal handle. Never
+        // discard the only child handle merely because wait/kill failed.
+        failures.push(error);
+      }
     }
+    // A process whose reap is unconfirmed may still have its IPC endpoint and
+    // PGDATA open. Never remove either tree underneath it; retain the exact
+    // paths until a later internal cleanup attempt confirms the reap.
+    if (this.#child === undefined) {
+      const ipcDir = this.#ipcDir;
+      try {
+        await removeTree(ipcDir);
+        if (this.#ipcDir === ipcDir) {
+          this.#ipcDir = undefined;
+        }
+      } catch (error) {
+        // Retain the path so later best-effort cleanup can retry it.
+        failures.push(error);
+      }
+      const temporaryInstanceDirectory = this.#temporaryInstanceDirectory;
+      if (temporaryInstanceDirectory !== undefined) {
+        try {
+          await removeTree(temporaryInstanceDirectory);
+          if (this.#temporaryInstanceDirectory === temporaryInstanceDirectory) {
+            this.#temporaryInstanceDirectory = undefined;
+          }
+        } catch (error) {
+          // Retain the managed-root cleanup identity after a failed removal.
+          failures.push(error);
+        }
+      }
+    }
+    if (
+      this.#stream !== undefined ||
+      this.#child !== undefined ||
+      this.#ipcDir !== undefined ||
+      this.#temporaryInstanceDirectory !== undefined
+    ) {
+      // Public close is terminal after the first destructive attempt, so no
+      // later facade call is available to own these uncertain resources. Keep
+      // the exact private handle alive through process exit instead of letting
+      // GC discard the only stream/child/path cleanup identity.
+      retainedFailedBrokerHandles.add(this);
+    } else {
+      retainedFailedBrokerHandles.delete(this);
+    }
+    throwCollectedCloseFailures(failures, 'native broker teardown failed');
   }
 
   async request(frame: Parameters<typeof writeBrokerRequest>[1]): Promise<BrokerResponseFrame> {
@@ -230,7 +326,7 @@ class BrokerHandle {
       await writeBrokerRequest(stream, frame);
       return await readBrokerResponse(stream);
     } catch (error) {
-      await this.markFailed();
+      await this.markFailed(error);
       throw error;
     }
   }
@@ -239,57 +335,146 @@ class BrokerHandle {
     if (this.#closed) {
       throw new Error('native broker session is closed');
     }
-    if (this.#stream === undefined) {
-      await this.start();
+    if (this.#failed) {
+      throw new Error(
+        'native broker helper failed; close and reopen the database before running more work',
+        { cause: this.#failure },
+      );
     }
     if (this.#stream === undefined) {
-      throw new Error('native broker stream is unavailable');
+      throw new Error(
+        'native broker stream is unavailable; close and reopen the database before running more work',
+      );
     }
     return this.#stream;
   }
 
-  async markFailed(): Promise<void> {
-    await this.#stream?.close();
-    this.#stream = undefined;
-    const child = this.#child;
-    this.#child = undefined;
-    if (child !== undefined) {
-      child.kill('SIGKILL');
-      await child.wait();
+  async markFailed(error: unknown): Promise<void> {
+    if (!this.#failed) {
+      this.#failed = true;
+      this.#failure = error;
     }
-    await removeTree(this.#ipcDir);
-    this.#ipcDir = undefined;
+    const stream = this.#stream;
+    try {
+      await stream?.close();
+      if (this.#stream === stream) {
+        this.#stream = undefined;
+      }
+    } catch {
+      // Preserve the operation/transport failure that made session state
+      // unknown. Keep cleanup ownership so explicit close can retry it.
+    }
+    const child = this.#child;
+    if (child !== undefined) {
+      try {
+        child.kill('SIGKILL');
+        const reaped = await waitForManagedChild(child, this.shutdownTimeoutMs);
+        if (reaped && this.#child === child) {
+          this.#child = undefined;
+        }
+      } catch {
+        // Retain the child handle so explicit close can retry reaping it.
+      }
+    }
+    if (this.#child === undefined) {
+      const ipcDir = this.#ipcDir;
+      try {
+        await removeTree(ipcDir);
+        if (this.#ipcDir === ipcDir) {
+          this.#ipcDir = undefined;
+        }
+      } catch {
+        // Retain the path so explicit close retries filesystem cleanup.
+      }
+    }
+    this.#cancelEndpoint = undefined;
+    this.#authToken = undefined;
   }
 }
 
-async function launchBroker(
-  executable: string,
+/** @internal Execute one out-of-band cancellation and always release its control stream. */
+export async function cancelBrokerStream(stream: ByteStream, authToken: string): Promise<void> {
+  try {
+    await authenticateBroker(stream, authToken);
+    await writeBrokerRequest(stream, { kind: 'cancel' });
+    const response = await readBrokerResponse(stream);
+    if (response.kind === 'error') {
+      throw new Error(`native broker cancel failed: ${response.message}`);
+    }
+    if (response.kind === 'chunk') {
+      throw new Error('native broker cancel endpoint returned a stream chunk');
+    }
+    if (response.kind === 'streamCallbackAborted') {
+      throw new Error(
+        `native broker cancel endpoint returned a stream callback-aborted frame: ${response.message}`,
+      );
+    }
+  } catch (primaryFailure) {
+    try {
+      await stream.close();
+    } catch (closeFailure) {
+      throw new AggregateError(
+        [primaryFailure, closeFailure],
+        'native broker cancel and control-stream close both failed',
+      );
+    }
+    throw primaryFailure;
+  }
+  await stream.close();
+}
+
+// Intentionally process-lifetime ownership for resources whose destructive
+// cleanup did not complete. Entries are removed only if a package-internal
+// best-effort retry later releases every exact resource.
+const retainedFailedBrokerHandles = new Set<BrokerHandle>();
+
+async function openBrokerHandle(
+  executable: string | undefined,
   config: NormalizedOpenConfig,
-  authToken: string,
-): Promise<{
+): Promise<BrokerHandle> {
+  const authToken = randomHexToken();
+  const launch = await launchBroker(executable, config, authToken);
+  return new BrokerHandle(config, launch, authToken);
+}
+
+type BrokerLaunch = {
   child: ManagedChild;
   stream: ByteStream;
   cancelEndpoint: string;
   ipcDir?: string;
-}> {
-  const startupTimeoutMs = brokerStartupTimeoutMs();
-  const endpoint = await allocateBrokerEndpoint(config);
-  const nativeInstall = await resolveBrokerNativeInstall(config);
-  const child = spawnManagedChild({
-    executable,
-    args: brokerSpawnArgs(config, endpoint),
-    env: brokerSpawnEnv(authToken, nativeInstall),
-    replaceEnv: true,
-  });
+};
+
+async function launchBroker(
+  executable: string | undefined,
+  config: NormalizedOpenConfig,
+  authToken: string,
+): Promise<BrokerLaunch> {
+  const failedLaunch: FailedManagedLaunch = {
+    paths: [undefined, config.temporaryDirectory ? config.instanceDirectory : undefined],
+  };
   try {
+    const startupTimeoutMs = brokerStartupTimeoutMs();
+    const resolvedExecutable = await resolveBrokerExecutable(executable);
+    const endpoint = await allocateBrokerEndpoint(config);
+    failedLaunch.paths[0] = endpoint.ipcDir;
+    const nativeInstall = await resolveBrokerNativeInstall(config);
+    const child = spawnManagedChild({
+      executable: resolvedExecutable,
+      args: brokerSpawnArgs(config, endpoint),
+      env: brokerSpawnEnv(authToken, nativeInstall),
+      replaceEnv: true,
+    });
+    failedLaunch.child = child;
+    const readiness = new AbortController();
     const line = await Promise.race([
-      readReadyLine(child.stdout, startupTimeoutMs, 'native broker'),
+      readReadyLine(child.stdout, startupTimeoutMs, 'native broker', readiness.signal),
       child.exited().then((code) => {
         throw new Error(`native broker exited before readiness with code ${code ?? 'signal'}`);
       }),
-    ]);
+    ]).finally(() => readiness.abort());
     const ready = parseBrokerReadyLine(line);
     const stream = await connectEndpoint(parseReadyEndpoint(ready.primary));
+    failedLaunch.stream = stream;
     await authenticateBroker(stream, authToken);
     return {
       child,
@@ -298,9 +483,15 @@ async function launchBroker(
       ipcDir: endpoint.ipcDir,
     };
   } catch (error) {
-    child.kill('SIGKILL');
-    await child.wait();
-    await removeTree(endpoint.ipcDir);
+    const cleanupFailures = await cleanupFailedManagedLaunch(
+      failedLaunch,
+      SHUTDOWN_TIMEOUT_MS,
+      'native broker startup child',
+    );
+    throwCollectedCloseFailures(
+      [error, ...cleanupFailures],
+      'native broker startup and cleanup failed',
+    );
     throw error;
   }
 }
@@ -451,6 +642,39 @@ async function authenticateBroker(stream: ByteStream, authToken: string): Promis
   const response = await readBrokerResponse(stream);
   if (response.kind === 'error') {
     throw new Error(`native broker authentication failed: ${response.message}`);
+  }
+  if (response.kind === 'chunk') {
+    throw new Error('native broker authentication returned a stream chunk');
+  }
+  if (response.kind === 'streamCallbackAborted') {
+    throw new Error(
+      `native broker authentication returned a stream callback-aborted frame: ${response.message}`,
+    );
+  }
+}
+
+type BrokerStreamCompletionFrame = Exclude<BrokerResponseFrame, { kind: 'chunk' }>;
+
+/** @internal */
+export function resolveBrokerStreamCompletion(
+  response: BrokerStreamCompletionFrame,
+  callbackFailed: boolean,
+  callbackError: unknown,
+): void {
+  switch (response.kind) {
+    case 'ok':
+      if (callbackFailed) throw callbackError;
+      return;
+    case 'error':
+      // A generic error means the broker did not confirm recovery to
+      // ReadyForQuery. That native failure is authoritative even when the
+      // client callback also failed earlier in the stream.
+      throw new Error(response.message);
+    case 'streamCallbackAborted':
+      if (callbackFailed) throw callbackError;
+      throw new Error(
+        `native broker reported a recovered stream callback abort without a stored client callback error: ${response.message}`,
+      );
   }
 }
 
@@ -682,14 +906,6 @@ function startupAssignments(startupArgs: string[]): string[] {
     }
   }
   return assignments;
-}
-
-async function waitForChild(child: ManagedChild, timeoutMs: number): Promise<boolean> {
-  const timeout = new Promise<false>((resolveTimeout) => {
-    setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  const result = await Promise.race([child.wait().then(() => true), timeout]);
-  return result;
 }
 
 function asBrokerHandle(handle: RuntimeHandle): BrokerHandle {

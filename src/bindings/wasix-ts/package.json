@@ -32,13 +32,13 @@
       "browser": "./lib/index.js",
       "default": "./lib/index.js"
     },
-    "./protocol": {
-      "types": "./lib/protocol.d.ts",
-      "default": "./lib/protocol.js"
-    },
-    "./query": {
-      "types": "./lib/query.d.ts",
-      "default": "./lib/query.js"
+    "./worker": {
+      "types": "./lib/worker-entry.d.ts",
+      "deno": "./lib/worker-entry.deno.js",
+      "bun": "./lib/worker-entry.bun.js",
+      "node": "./lib/worker-entry.node.js",
+      "browser": "./lib/worker-entry.js",
+      "default": "./lib/worker-entry.js"
     },
     "./internal/tools": {
       "types": "./lib/internal.d.ts",

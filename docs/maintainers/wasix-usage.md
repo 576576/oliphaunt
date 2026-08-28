@@ -15,8 +15,9 @@ Neither binding imports, selects, or falls back to a native SDK.
 oliphaunt-wasix = "0.1"
 ```
 
-`Oliphaunt::open()` uses a true Wasmer memory filesystem. Persistence is an
-explicit managed root:
+The root `Oliphaunt::open()` API retains Wasmer and PostgreSQL on the calling
+thread and uses a true Wasmer memory filesystem. Persistence is an explicit
+managed root:
 
 ```rust,no_run
 use oliphaunt_wasix::{DatabaseStorage, Oliphaunt};
@@ -41,13 +42,28 @@ Physical archives use the dedicated restore API. There is no legacy
 PGDATA-only restore path; nonempty descriptorless roots and incomplete stores
 fail without mutation.
 
-`OliphauntServer` supplies a local PostgreSQL endpoint when an existing Rust
-client needs one. The optional `tools` feature supplies direct `pg_dump` and
-non-interactive `psql`.
+`OliphauntServer::builder().start()` supplies a local PostgreSQL endpoint when
+an existing Rust client needs one; the returned handle exposes only its
+connection string, closed state, and close. The parallel
+`AsyncOliphauntServer::builder().start().await` keeps lifecycle work off the
+async caller. The optional `tools` feature supplies `pg_dump` and
+non-interactive `psql` as fluent database methods. Applications that must keep
+an async executor responsive use root `AsyncOliphaunt`; it owns a dedicated
+database thread, returns futures, and is cloneable. Root `Oliphaunt` stays the
+no-hop, exclusive caller-thread surface.
 
-Extensions are exact Cargo feature/package selections. Reopening a database
-whose catalog uses an extension requires the receiving host to provide that
-extension code again.
+Blocking `Oliphaunt` is neither `Send` nor `Sync`; blocking
+`OliphauntServer` is `Send` but not `Sync`. The cloneable async database and
+server handles are `Send + Sync`, while `AsyncTransaction` is `Send` but not
+`Sync` and requires exclusive mutable access. These traits expose the real
+Wasmer/runtime owner instead of implying concurrency that does not exist.
+
+Each exact `extension-*` leaf feature enables the common extension selector
+machinery and its matching uppercase associated constant. `Extension::ALL`
+and `Extension::by_sql_name` contain only the enabled leaf set, while
+`sql_name` returns the selected extension's PostgreSQL name. Reopening a
+database whose catalog uses an extension requires the receiving host to select
+and provide that runtime code again.
 
 ## TypeScript host
 
@@ -58,10 +74,13 @@ await using database = await Oliphaunt.open();
 const result = await database.query('select $1::int + 1 as answer', [41]);
 ```
 
-The package runs in a browser, Node.js, Bun, or Deno. Worker placement is the
-default; `execution: 'direct'` uses the same API in the caller realm and blocks
-that realm during PostgreSQL work. Browser execution requires cross-origin
-isolation.
+The package runs in a browser, Node.js, Bun, or Deno. Its root entry point owns
+execution in the importing JavaScript realm. Its methods return promises, but
+synchronous PostgreSQL guest work can block that realm. Applications that need
+the caller's event loop to remain responsive import
+`@oliphaunt/wasix-ts/worker`; it owns a Web Worker or Node-compatible worker
+thread. Execution placement is selected by that import boundary. Browser
+execution requires cross-origin isolation.
 
 Memory is the default. Persistent providers are selective imports:
 
@@ -69,15 +88,19 @@ Memory is the default. Persistent providers are selective imports:
 - `storage/node`, `storage/bun`, and `storage/deno` on those runtimes.
 
 IndexedDB hydrates a Wasmer memory directory and publishes journaled changes.
-OPFS worker execution uses direct synchronous access to an opaque backing-file
-pool; other browser placements publish the same journal to that same format.
+OPFS Worker execution uses synchronous access handles for exact-range I/O to an
+opaque backing-file pool; the root direct entry point and browsers without that
+facility publish the same journal to that same format.
 Node, Bun, and Deno directory providers publish below the managed root's
 `pgdata` child. Ordinary operations complete a provider boundary after
 `ReadyForQuery`; callback transactions do so once after confirmed `COMMIT` or
-`ROLLBACK`; explicit `checkpoint()` sends PostgreSQL `CHECKPOINT` and then
-publishes.
+`ROLLBACK`. A new persistent direct-OPFS database uses one separate internal
+full-publication boundary after initialization. That boundary is not a public
+operation or option. Applications that need a PostgreSQL checkpoint issue
+`execute("CHECKPOINT")`; it completes the same ordinary provider boundary as
+another successful statement.
 
-IndexedDB publication is one transaction. Direct OPFS honors guest file flushes,
+IndexedDB publication is one transaction. OPFS honors guest file flushes,
 drains WAL at operation boundaries, and flushes all dirty files in PostgreSQL
 order for checkpoint, close, or namespace publication. Its portable path uses
 copy-on-write file backings and publishes namespace state last. A publication
@@ -85,7 +108,7 @@ failure poisons the handle because the live guest may be ahead of durable
 storage. PostgreSQL statement errors that recover through `ReadyForQuery` do
 not poison storage.
 
-The direct path reserves a bounded set of preopened backing files for the
+The synchronous OPFS path reserves a bounded set of preopened backing files for the
 synchronous hot path. A larger creation burst is staged only until the mandatory
 host boundary. That boundary allocates, writes, and flushes every staged file
 before publishing namespace state; failure poisons the live handle and leaves
@@ -98,10 +121,14 @@ is an internal performance detail, not a database-capacity setting.
 accepts that archive and new or empty persistent storage. Restore rejects
 memory and nonempty destinations. The destination creates its own descriptor.
 
-`execProtocolStream()` is the bounded callback form of the raw protocol escape
-hatch. The optional `@oliphaunt/wasix-tools` package runs standard plain
-`pg_dump` against direct or worker placement and non-interactive `psql` against
-worker placement, including in browsers. It preserves PostgreSQL's normal
+`execProtocolRawStream()` is the bounded callback form of the raw protocol
+escape hatch on a database/root handle. Managed transaction and server handles
+have no raw bypass. Transaction ownership is derived from exact backend command
+tags and its terminal readiness status; manual lifecycle SQL and `AND CHAIN`
+are unsupported, while savepoints and `ROLLBACK TO` remain valid. The optional
+`@oliphaunt/wasix-tools` package runs standard plain
+`pg_dump` against direct or Worker handles and non-interactive `psql` against a
+Worker handle, including in browsers. It preserves PostgreSQL's normal
 COPY-based plain dump rather than rewriting it.
 
 Node, Bun, and Deno applications may import `openServer` from the matching
@@ -109,13 +136,21 @@ Node, Bun, and Deno applications may import `openServer` from the matching
 PostgreSQL-named Unix socket and admits one complete client connection at a
 time, matching the single embedded backend; concurrent connections are
 rejected. The listener and storage lease persist, while each admitted client
-receives a fresh backend. Browsers have no server subpath.
+receives a fresh backend. The returned handle exposes only `connectionString`,
+closed state, close, and asynchronous disposal; the external driver or ORM owns
+all SQL, transactions, and cancellation. Browsers have no server subpath.
 This compatibility endpoint remains distinct from the concurrent
 `liboliphaunt-wasix-postmaster` product.
 
 TypeScript still has no cancellation or dedicated typed COPY API. Those
 absences are recorded in the SDK parity policy rather than represented as
 capability flags.
+
+Across both bindings, selecting extensions supplies exact runtime artifacts,
+dependencies, and required pre-start preload/GUC configuration only. Open and
+server start never execute database-local `CREATE EXTENSION`, `ALTER
+EXTENSION`, `LOAD`, schema setup, or post-create SQL. Applications and ORM
+migrations own those normal PostgreSQL operations.
 
 ## Shared storage contract
 

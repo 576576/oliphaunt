@@ -1,31 +1,29 @@
+import { restoreWasix, serializeOpenConfig } from './client-common.js';
 import {
-  openWasixWithWorker,
-  restoreWasix,
-  serializeOpenConfig,
-  type WasixWorkerPort,
-} from './client-common.js';
-import { resolveExecutionMode } from './open-options.js';
+  openWasixDirect,
+  type DirectWasixEnvironment,
+  type DirectWasixHost,
+} from './direct-client-common.js';
 import type { OliphauntClient, OliphauntDatabase, OpenConfig } from './types.js';
 
+/** Open PostgreSQL in the importing browser realm. Guest execution may block that realm. */
 export async function openWasix(config: OpenConfig = {}): Promise<OliphauntDatabase> {
-  const execution = resolveExecutionMode(config);
+  return openWasixWithHost(config, () => import('./host/index.mjs'));
+}
+
+/** @internal Dependency seam for root-entrypoint contract qualification. */
+export async function openWasixWithHost(
+  config: OpenConfig,
+  loadHost: () => Promise<DirectWasixHost>,
+): Promise<OliphauntDatabase> {
+  const openOptions = serializeOpenConfig(config);
   if (globalThis.crossOriginIsolated !== true) {
     throw new Error(
       '@oliphaunt/wasix-ts requires COOP: same-origin and COEP: require-corp response headers',
     );
   }
-  const openOptions = serializeOpenConfig(config);
-  if (execution === 'direct') {
-    const [{ openWasixDirect }, host] = await Promise.all([
-      import('./direct-client-common.js'),
-      import('./host/index.mjs'),
-    ]);
-    return openWasixDirect(openOptions, host);
-  }
-  if (typeof Worker === 'undefined') {
-    throw new Error('@oliphaunt/wasix-ts worker execution requires a browser with Web Workers');
-  }
-  return openWasixWithWorker(createBrowserWorker, openOptions);
+  const host = await loadHost();
+  return openWasixDirect(openOptions, host, browserRealm());
 }
 
 export const Oliphaunt: OliphauntClient = {
@@ -33,24 +31,8 @@ export const Oliphaunt: OliphauntClient = {
   restore: restoreWasix,
 };
 
-function createBrowserWorker(): WasixWorkerPort {
-  const worker = new Worker(new URL('./worker.js', import.meta.url), {
-    type: 'module',
-    name: 'oliphaunt-wasix',
-  });
-  return {
-    postMessage: (message, transfer) => worker.postMessage(message, [...transfer]),
-    terminate: () => worker.terminate(),
-    onMessage: (listener) => {
-      worker.addEventListener('message', (event: MessageEvent) => listener(event.data));
-    },
-    onFatal: (listener) => {
-      worker.addEventListener('error', (event) => {
-        listener(new Error(event.message || 'Oliphaunt WASIX browser worker crashed'));
-      });
-      worker.addEventListener('messageerror', () => {
-        listener(new Error('Oliphaunt WASIX browser worker returned an unreadable message'));
-      });
-    },
-  };
+function browserRealm(): DirectWasixEnvironment {
+  return typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope
+    ? 'browser-worker'
+    : 'browser-main';
 }

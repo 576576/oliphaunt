@@ -33,47 +33,16 @@ extern volatile sig_atomic_t QueryCancelPending;
 extern Latch *MyLatch;
 extern void SetLatch(Latch *latch);
 
-static char global_last_error[1024];
-
 static int32_t close_unpublished_handle(OliphauntHandle *handle);
 
-void oliphaunt_set_error(OliphauntHandle *handle, const char *message) {
-    char *target = handle ? handle->last_error : global_last_error;
-    snprintf(target, 1024, "%s", message ? message : "unknown native liboliphaunt error");
+static bool last_error_is_empty(OliphauntHandle *handle) {
+    char snapshot[OLIPHAUNT_ERROR_CAPACITY];
+    (void)oliphaunt_copy_last_error(handle, snapshot, sizeof(snapshot));
+    return snapshot[0] == '\0';
 }
 
 const char *oliphaunt_handle_pgdata(OliphauntHandle *handle) {
     return handle != NULL ? handle->pgdata : NULL;
-}
-
-static bool config_string_matches(const char *actual, const char *requested, const char *fallback) {
-    const char *expected = requested != NULL ? requested : fallback;
-    return strcmp(actual != NULL ? actual : "", expected != NULL ? expected : "") == 0;
-}
-
-static bool startup_args_match(OliphauntHandle *handle, const OliphauntConfig *config) {
-    if (handle->startup_arg_count != config->startup_arg_count) {
-        return false;
-    }
-    for (size_t i = 0; i < handle->startup_arg_count; i++) {
-        const char *expected = config->startup_args != NULL ? config->startup_args[i] : NULL;
-        if (expected == NULL || strcmp(handle->startup_args[i], expected) != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool config_matches_resident_runtime(
-    OliphauntHandle *handle,
-    const OliphauntConfig *config) {
-    return handle != NULL &&
-           config_string_matches(handle->pgdata, config->pgdata, "") &&
-           config_string_matches(handle->runtime_dir, config->runtime_dir, "") &&
-           config_string_matches(handle->module_dir, config->module_dir, "") &&
-           config_string_matches(handle->username, config->username, "postgres") &&
-           config_string_matches(handle->database, config->database, "postgres") &&
-           startup_args_match(handle, config);
 }
 
 static int advance_logical_generation_locked(OliphauntHandle *handle) {
@@ -108,9 +77,9 @@ static int reopen_resident_runtime_locked(
         set_error(NULL, "native liboliphaunt resident runtime has already shut down");
         return -1;
     }
-    if (!config_matches_resident_runtime(handle, config)) {
+    if (!oliphaunt_config_matches_resident_runtime(handle, config)) {
         pthread_mutex_unlock(&handle->mutex);
-        set_error(NULL, "native liboliphaunt resident runtime is bound to a different root, identity, runtime, or extension startup configuration");
+        set_error(NULL, "native liboliphaunt resident runtime is bound to a different root, identity, runtime, root-lock ownership mode, or extension startup configuration");
         return -1;
     }
     if (advance_logical_generation_locked(handle) != 0) {
@@ -119,7 +88,7 @@ static int reopen_resident_runtime_locked(
         return -1;
     }
     handle->logical_active = true;
-    handle->last_error[0] = '\0';
+    oliphaunt_set_error(handle, "");
     *out = handle;
     pthread_mutex_unlock(&handle->mutex);
     return 0;
@@ -386,7 +355,7 @@ static void restore_backend_runtime_env(OliphauntHandle *handle) {
 
 static void mark_backend_failed(OliphauntHandle *handle) {
     pthread_mutex_lock(&handle->mutex);
-    if (handle->last_error[0] == '\0') {
+    if (last_error_is_empty(handle)) {
         set_error(handle, "embedded backend failed before startup");
     }
     handle->backend_status = -1;
@@ -401,7 +370,7 @@ static void *backend_thread_main(void *arg) {
     OliphauntHandle *handle = (OliphauntHandle *)arg;
     OliphauntBackendArgv backend_argv = {0};
     if (oliphaunt_build_backend_argv(handle, &backend_argv) != 0) {
-        if (handle->last_error[0] == '\0') {
+        if (last_error_is_empty(handle)) {
             set_error(handle, "failed to build embedded backend argv");
         }
         mark_backend_failed(handle);
@@ -447,25 +416,31 @@ static int start_backend(OliphauntHandle *handle) {
     pthread_attr_t attr;
     int rc = pthread_attr_init(&attr);
     if (rc != 0) {
-        snprintf(handle->last_error, sizeof(handle->last_error), "pthread_attr_init failed: %d", rc);
+        char message[OLIPHAUNT_ERROR_CAPACITY];
+        snprintf(message, sizeof(message), "pthread_attr_init failed: %d", rc);
+        set_error(handle, message);
         return -1;
     }
     size_t stack_size = oliphaunt_backend_stack_size_bytes();
     rc = pthread_attr_setstacksize(&attr, stack_size);
     if (rc != 0) {
         pthread_attr_destroy(&attr);
+        char message[OLIPHAUNT_ERROR_CAPACITY];
         snprintf(
-            handle->last_error,
-            sizeof(handle->last_error),
+            message,
+            sizeof(message),
             "pthread_attr_setstacksize(%zu) failed: %d",
             stack_size,
             rc);
+        set_error(handle, message);
         return -1;
     }
     rc = pthread_create(&handle->backend_thread, &attr, backend_thread_main, handle);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
-        snprintf(handle->last_error, sizeof(handle->last_error), "pthread_create failed: %d", rc);
+        char message[OLIPHAUNT_ERROR_CAPACITY];
+        snprintf(message, sizeof(message), "pthread_create failed: %d", rc);
+        set_error(handle, message);
         return -1;
     }
     handle->thread_started = true;
@@ -481,7 +456,7 @@ static int start_backend(OliphauntHandle *handle) {
     return rc;
 }
 
-int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
+static int32_t oliphaunt_init_impl(const OliphauntConfig *config, OliphauntHandle **out) {
     if (out == NULL) {
         set_error(NULL, "oliphaunt_init out parameter is null");
         return -1;
@@ -496,8 +471,11 @@ int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
         set_error(NULL, "invalid oliphaunt_init module_dir");
         return -1;
     }
-    if ((config->reserved_flags & ~OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK) != 0) {
+    if ((config->flags & ~OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK) != 0) {
         set_error(NULL, "invalid oliphaunt_init config flags");
+        return -1;
+    }
+    if (oliphaunt_validate_startup_args(NULL, config) != 0) {
         return -1;
     }
     char symbol_scope_error[512];
@@ -522,7 +500,16 @@ int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
         set_error(NULL, "out of memory allocating OliphauntHandle");
         return -1;
     }
+    if (pthread_mutex_init(&handle->error_mutex, NULL) != 0) {
+        free(handle);
+        oliphaunt_release_global_instance(false);
+        set_error(NULL, "failed to initialize native liboliphaunt error synchronization");
+        return -1;
+    }
+    handle->error_mutex_initialized = true;
     handle->stable_root_lock_fd = -1;
+    handle->external_root_lock =
+        (config->flags & OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK) != 0;
     handle->trace_protocol = oliphaunt_trace_enabled();
     handle->transaction_status = 'I';
 
@@ -539,22 +526,22 @@ int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
     }
     if (oliphaunt_dup_startup_args(handle, config) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "%s", handle->last_error);
+        (void)oliphaunt_copy_last_error(handle, message, sizeof(message));
         close_unpublished_handle(handle);
         set_error(NULL, message);
         return -1;
     }
-    if ((config->reserved_flags & OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK) == 0 &&
+    if ((config->flags & OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK) == 0 &&
         oliphaunt_acquire_root_lock(handle, handle->pgdata) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "%s", handle->last_error);
+        (void)oliphaunt_copy_last_error(handle, message, sizeof(message));
         close_unpublished_handle(handle);
         set_error(NULL, message);
         return -1;
     }
     if (oliphaunt_validate_managed_root(handle, handle->pgdata) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "%s", handle->last_error);
+        (void)oliphaunt_copy_last_error(handle, message, sizeof(message));
         close_unpublished_handle(handle);
         set_error(NULL, message);
         return -1;
@@ -582,7 +569,7 @@ int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
 
     if (start_backend(handle) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "%s", handle->last_error);
+        (void)oliphaunt_copy_last_error(handle, message, sizeof(message));
         close_unpublished_handle(handle);
         set_error(NULL, message);
         return -1;
@@ -603,11 +590,44 @@ int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
     return 0;
 }
 
-int32_t oliphaunt_detach(OliphauntHandle *handle) {
+static int32_t run_init_operation(
+    const OliphauntConfig *config,
+    OliphauntHandle **out,
+    OliphauntErrorCapture *capture,
+    bool capture_required) {
+    OliphauntErrorScope error_scope;
+    oliphaunt_error_scope_begin(&error_scope, NULL, "oliphaunt_init");
+    int32_t rc = -1;
+    if (capture_required && capture == NULL) {
+        set_error(NULL, "oliphaunt_init error capture is null");
+    } else {
+        rc = oliphaunt_init_impl(config, out);
+    }
+    oliphaunt_error_scope_end(&error_scope, rc != 0);
+    oliphaunt_error_capture_current(capture, NULL, rc != 0);
+    return rc;
+}
+
+int32_t oliphaunt_init(const OliphauntConfig *config, OliphauntHandle **out) {
+    return run_init_operation(config, out, NULL, false);
+}
+
+int32_t oliphaunt_init_with_error(
+    const OliphauntConfig *config,
+    OliphauntHandle **out,
+    OliphauntErrorCapture *error) {
+    return run_init_operation(config, out, error, true);
+}
+
+static int32_t oliphaunt_detach_impl(OliphauntHandle *handle) {
     if (handle == NULL) {
         return 0;
     }
     pthread_mutex_lock(&handle->mutex);
+    if (oliphaunt_reject_if_streaming_locked(handle) != 0) {
+        pthread_mutex_unlock(&handle->mutex);
+        return -1;
+    }
     if (!handle->logical_active) {
         pthread_mutex_unlock(&handle->mutex);
         return 0;
@@ -655,6 +675,47 @@ int32_t oliphaunt_detach(OliphauntHandle *handle) {
     return 0;
 }
 
+static int32_t run_detach_operation(
+    OliphauntHandle *handle,
+    OliphauntErrorCapture *capture,
+    bool capture_required) {
+    OliphauntErrorScope error_scope;
+    oliphaunt_error_scope_begin(&error_scope, NULL, "oliphaunt_detach");
+    int32_t rc = -1;
+    bool retiring = false;
+    if (capture_required && capture == NULL) {
+        set_error(NULL, "oliphaunt_detach error capture is null");
+    } else if (handle == NULL) {
+        rc = oliphaunt_detach_impl(handle);
+    } else if (oliphaunt_begin_handle_retirement(handle) == 0) {
+        retiring = true;
+        error_scope.fallback_handle = handle;
+        rc = oliphaunt_detach_impl(handle);
+    }
+    oliphaunt_error_scope_end(&error_scope, rc != 0);
+    /* A poisoned detach may promote this retirement to terminal close and
+     * free the handle. Successful captures are empty and never dereference
+     * their fallback; failures leave the retirement owner resident. */
+    oliphaunt_error_capture_current(
+        capture,
+        retiring && rc != 0 ? handle : NULL,
+        rc != 0);
+    if (retiring) {
+        oliphaunt_end_handle_retirement();
+    }
+    return rc;
+}
+
+int32_t oliphaunt_detach(OliphauntHandle *handle) {
+    return run_detach_operation(handle, NULL, false);
+}
+
+int32_t oliphaunt_detach_with_error(
+    OliphauntHandle *handle,
+    OliphauntErrorCapture *error) {
+    return run_detach_operation(handle, error, true);
+}
+
 int32_t oliphaunt_close_claimed_global_instance(OliphauntHandle *handle) {
     if (handle == NULL) {
         return 0;
@@ -682,10 +743,19 @@ int32_t oliphaunt_close_claimed_global_instance(OliphauntHandle *handle) {
         pthread_join(handle->backend_thread, NULL);
     }
 
+    /* Public wrappers may still be publishing an operation-owned error after
+     * their PostgreSQL work released handle->mutex. Keep every field and
+     * synchronization primitive alive through that boundary. */
+    oliphaunt_wait_for_active_handle_calls();
+
     if (handle->sync_initialized) {
         pthread_cond_destroy(&handle->input_cond);
         pthread_cond_destroy(&handle->output_cond);
         pthread_mutex_destroy(&handle->mutex);
+    }
+    if (handle->error_mutex_initialized) {
+        pthread_mutex_destroy(&handle->error_mutex);
+        handle->error_mutex_initialized = false;
     }
 
     free(handle->pgdata);
@@ -723,7 +793,7 @@ static int32_t close_unpublished_handle(OliphauntHandle *handle) {
     return rc;
 }
 
-int32_t oliphaunt_close_if_generation(uint64_t generation) {
+static int32_t oliphaunt_close_if_generation_impl(uint64_t generation) {
     if (generation == 0) {
         set_error(NULL, "invalid oliphaunt_close_if_generation generation");
         return -1;
@@ -747,7 +817,15 @@ int32_t oliphaunt_close_if_generation(uint64_t generation) {
     return oliphaunt_close_claimed_global_instance(claimed);
 }
 
-int32_t oliphaunt_close(OliphauntHandle *handle) {
+int32_t oliphaunt_close_if_generation(uint64_t generation) {
+    OliphauntErrorScope error_scope;
+    oliphaunt_error_scope_begin(&error_scope, NULL, "oliphaunt_close_if_generation");
+    int32_t rc = oliphaunt_close_if_generation_impl(generation);
+    oliphaunt_error_scope_end(&error_scope, rc < 0);
+    return rc;
+}
+
+static int32_t oliphaunt_close_impl(OliphauntHandle *handle) {
     if (handle == NULL) {
         return 0;
     }
@@ -767,7 +845,15 @@ int32_t oliphaunt_close(OliphauntHandle *handle) {
     return oliphaunt_close_claimed_global_instance(claimed);
 }
 
-int32_t oliphaunt_cancel(OliphauntHandle *handle) {
+int32_t oliphaunt_close(OliphauntHandle *handle) {
+    OliphauntErrorScope error_scope;
+    oliphaunt_error_scope_begin(&error_scope, NULL, "oliphaunt_close");
+    int32_t rc = oliphaunt_close_impl(handle);
+    oliphaunt_error_scope_end(&error_scope, rc != 0);
+    return rc;
+}
+
+static int32_t oliphaunt_cancel_impl(OliphauntHandle *handle) {
     if (handle == NULL) {
         set_error(NULL, "invalid oliphaunt_cancel arguments");
         return -1;
@@ -796,8 +882,23 @@ int32_t oliphaunt_cancel(OliphauntHandle *handle) {
     return 0;
 }
 
-const char *oliphaunt_last_error(OliphauntHandle *handle) {
-    return handle ? handle->last_error : global_last_error;
+int32_t oliphaunt_cancel(OliphauntHandle *handle) {
+    OliphauntErrorScope error_scope;
+    oliphaunt_error_scope_begin(&error_scope, NULL, "oliphaunt_cancel");
+    int32_t rc = -1;
+    bool leased = false;
+    if (handle == NULL) {
+        rc = oliphaunt_cancel_impl(handle);
+    } else if (oliphaunt_begin_handle_call(handle) == 0) {
+        leased = true;
+        error_scope.fallback_handle = handle;
+        rc = oliphaunt_cancel_impl(handle);
+    }
+    oliphaunt_error_scope_end(&error_scope, rc != 0);
+    if (leased) {
+        oliphaunt_end_handle_call();
+    }
+    return rc;
 }
 
 const char *oliphaunt_version(void) {

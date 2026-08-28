@@ -13,29 +13,36 @@ lifecycle, archive parser, or root validation.
 
 ## Public C boundary
 
-ABI version 8 exports one fixed surface from
+ABI version 10 exports one fixed surface from
 `src/runtimes/liboliphaunt/native/include/oliphaunt.h`:
 
 - `oliphaunt_init`, `oliphaunt_detach`, `oliphaunt_close`, generation-guarded
-  close, and version/error access;
+  close, version access, and atomic caller-owned error copies;
 - simple query, owned raw protocol response, and callback protocol streaming;
 - `oliphaunt_cancel`;
 - one physical `oliphaunt_backup` and one static `oliphaunt_restore`;
+- scheduler-safe `_with_error` variants that capture each operation's error in
+  caller-owned storage before its native invocation returns;
 - static extension registration; and
 - response release.
 
-`reserved_flags` must be zero. Fixed runtime behavior is not represented as a
-capability bitset, profile enum, archive-format enum, replacement policy, or
-initialization mode.
+`OliphauntConfig.flags` accepts zero or
+`OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK`. The flag tells `liboliphaunt` that the
+caller already owns the stable sibling root lease; without it, the C runtime
+acquires that lease itself. Every other bit is rejected. Fixed runtime behavior
+is not represented as a profile enum, archive-format enum, replacement policy,
+or initialization mode.
 
 ## Direct lifecycle
 
 One PostgreSQL backend may be resident in a process. The first successful init
 starts it and publishes a logical generation. `detach` ends the current logical
 lease while leaving the backend resident; a compatible reopen advances the
-generation. Generation-guarded close prevents stale language cleanup owners
-from terminating a newer logical lease. Terminal close shuts down the resident
-backend and prevents another physical backend from starting in that process.
+generation. Every reopen must preserve the resident runtime's original
+internal-versus-external root-lock ownership mode. Generation-guarded close
+prevents stale language cleanup owners from terminating a newer logical lease.
+Terminal close shuts down the resident backend and prevents another physical
+backend from starting in that process.
 
 The runtime temporarily owns process-global PostgreSQL environment needed by
 the embedded backend and restores caller state at terminal close. Applications
@@ -69,9 +76,11 @@ root.
 
 Direct init and static restore each take one non-blocking sibling lease for the
 target root. The lease is outside the managed root and outside backups. SDK
-direct and broker adapters rely on the C boundary rather than wrapping it in a
-second lease. The native Rust server takes the equivalent lease because its
-PostgreSQL process bypasses the C runtime.
+bindings that do not already own the lease leave the config flag clear and rely
+on the C boundary. The native Rust SDK instead retains the lease acquired while
+preparing a direct root and passes `OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK`; its
+broker child follows the same direct path. The native Rust server retains the
+equivalent lease itself because its PostgreSQL process bypasses the C runtime.
 
 ## Physical backup and restore
 
@@ -108,6 +117,16 @@ responses remain valid until `oliphaunt_free_response`. The streaming callback
 path applies a bounded queue so a slow consumer cannot create unbounded runtime
 memory. Cancellation targets the active backend operation and the connection
 must recover through normal PostgreSQL protocol readiness before reuse.
+Callback rejection has a typed positive status only after recovery reaches
+`ReadyForQuery`; a negative stream status is a native transport or recovery
+failure and must remain the primary error.
+
+Asynchronous FFI schedulers use the operation-specific `_with_error` ABI
+variants. Each invocation receives a fixed-layout `OliphauntErrorCapture` that
+is filled on the native worker before its handle lease is released. Synchronous
+bindings can continue to copy the operation-local TLS error immediately with
+`oliphaunt_copy_last_error`. This distinction prevents a resumed event-loop
+thread from reading another operation's shared handle error.
 
 Typed rows, callback transactions, and language stream shapes belong in SDKs.
 Keeping the C boundary byte-oriented avoids cross-language object ownership and
@@ -119,8 +138,10 @@ Desktop native runtimes load exact packaged extension modules through normal
 PostgreSQL `CREATE EXTENSION` and `$libdir` resolution. Mobile builds register
 selected statically linked modules before first init; the process-wide registry
 then becomes immutable. SDK packaging resolves exact extension artifacts and
-startup preload requirements. The runtime does not invent an extension
-migration system: PostgreSQL extension SQL remains authoritative.
+startup preload requirements. Selecting those artifacts does not execute
+`CREATE EXTENSION`, `LOAD`, schema setup, or post-create SQL. The runtime does
+not invent an extension migration system: application migrations and
+PostgreSQL extension SQL remain authoritative.
 
 ## Native modes
 
@@ -129,11 +150,13 @@ migration system: PostgreSQL extension SQL remains authoritative.
 - Server mode runs packaged PostgreSQL and exposes a connection endpoint; it
   does not call the C direct runtime.
 
-Mode-specific transport and process supervision remain SDK concerns. Storage,
-query, transaction, extension, backup, and error vocabulary stays aligned where
-the underlying mode supports it. Native server backup remains deliberately
-deferred in the SDK parity policy instead of being simulated through a hidden
-direct handle.
+Mode-specific transport and process supervision remain SDK concerns. Direct
+and broker database handles keep the aligned query, transaction, raw protocol,
+backup, and error vocabulary. A server handle owns only process/listener
+lifecycle and a connection string; ordinary PostgreSQL clients own its SQL,
+transactions, cancellation, and pooling. Native server backup remains
+deliberately deferred in the SDK parity policy instead of being simulated
+through a hidden direct handle.
 
 ## Verification
 

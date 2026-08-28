@@ -1,6 +1,31 @@
 import Foundation
 import COliphaunt
 
+enum OliphauntNativeStreamCompletion: Equatable {
+    case success
+    case callbackAborted
+    case nativeFailure
+    case protocolInconsistency
+
+    static let callbackAbortedResult = Int32(OLIPHAUNT_STREAM_CALLBACK_ABORTED)
+}
+
+func classifyOliphauntNativeStreamCompletion(
+    result: Int32,
+    callbackFailed: Bool
+) -> OliphauntNativeStreamCompletion {
+    if result < 0 {
+        return .nativeFailure
+    }
+    if result == OliphauntNativeStreamCompletion.callbackAbortedResult {
+        return callbackFailed ? .callbackAborted : .protocolInconsistency
+    }
+    if result == 0 {
+        return callbackFailed ? .protocolInconsistency : .success
+    }
+    return .protocolInconsistency
+}
+
 struct OliphauntNativeDirectEngine: OliphauntEngine {
     var libraryURL: URL?
     var runtimeDirectory: URL?
@@ -17,6 +42,14 @@ struct OliphauntNativeDirectEngine: OliphauntEngine {
     }
 
     func open(configuration: OliphauntConfiguration) async throws -> any OliphauntSession {
+        let owner = OliphauntNativeOwner(label: "dev.oliphaunt.swift.native-direct")
+        let box = try await owner.run { [self] in
+            try openOnOwner(configuration: configuration)
+        }
+        return NativeDirectSession(box: box, owner: owner)
+    }
+
+    private func openOnOwner(configuration: OliphauntConfiguration) throws -> NativeSessionBox {
         try validateOliphauntStorage(configuration.storage)
         try validateOliphauntStartupIdentity(configuration.username, label: "username")
         try validateOliphauntStartupIdentity(configuration.database, label: "database")
@@ -111,7 +144,7 @@ struct OliphauntNativeDirectEngine: OliphauntEngine {
                                     module_dir: nil,
                                     username: usernameCString,
                                     database: databaseCString,
-                                    reserved_flags: 0,
+                                    flags: 0,
                                     startup_args: startupArgPointers,
                                     startup_arg_count: startupArgs.count
                                 )
@@ -129,10 +162,17 @@ struct OliphauntNativeDirectEngine: OliphauntEngine {
             // process, never on a failed native open.
             throw OliphauntError.engine(Self.lastError(nil))
         }
-        return NativeDirectSession(session: session)
+        return NativeSessionBox(pointer: session)
     }
 
     func restore(destination: URL, bytes: Data) async throws {
+        let owner = OliphauntNativeOwner(label: "dev.oliphaunt.swift.native-direct.restore")
+        try await owner.run { [self] in
+            try restoreOnOwner(destination: destination, bytes: bytes)
+        }
+    }
+
+    private func restoreOnOwner(destination: URL, bytes: Data) throws {
         try validateOliphauntDirectory(destination, label: "restore destination")
         let libraryPath = libraryURL?.path
         let rc = destination.path.withCString { destinationCString in
@@ -462,10 +502,23 @@ struct OliphauntNativeDirectEngine: OliphauntEngine {
     }()
 
     fileprivate static func lastError(_ session: OpaquePointer?) -> String {
-        guard let pointer = oliphaunt_swift_last_error(session) else {
+        let required = oliphaunt_swift_copy_last_error(session, nil, 0)
+        guard required > 0, required < Int.max else {
             return "unknown liboliphaunt Swift runtime error"
         }
-        let message = String(cString: pointer)
+        var bytes = [CChar](repeating: 0, count: required + 1)
+        let currentRequired = bytes.withUnsafeMutableBufferPointer { buffer in
+            oliphaunt_swift_copy_last_error(session, buffer.baseAddress, buffer.count)
+        }
+        if currentRequired >= bytes.count {
+            bytes = [CChar](repeating: 0, count: currentRequired + 1)
+            bytes.withUnsafeMutableBufferPointer { buffer in
+                _ = oliphaunt_swift_copy_last_error(session, buffer.baseAddress, buffer.count)
+            }
+        }
+        let message = bytes.withUnsafeBufferPointer { buffer in
+            String(cString: buffer.baseAddress!)
+        }
         return message.isEmpty ? "unknown liboliphaunt Swift runtime error" : message
     }
 
@@ -603,38 +656,78 @@ private struct OliphauntFlatJSONParser {
     }
 }
 
-private actor NativeDirectSession: OliphauntSession {
+private final class NativeDirectSession: OliphauntSession, @unchecked Sendable {
     private let box: NativeSessionBox
+    private let owner: OliphauntNativeOwner
+    private let cancellationOwner = OliphauntNativeOwner(
+        label: "dev.oliphaunt.swift.native-direct.cancel"
+    )
 
-    init(session: OpaquePointer) {
-        self.box = NativeSessionBox(pointer: session)
+    init(box: NativeSessionBox, owner: OliphauntNativeOwner) {
+        self.box = box
+        self.owner = owner
     }
 
     deinit {
-        box.closeBestEffort()
+        let box = box
+        owner.enqueue {
+            box.closeBestEffort()
+        }
     }
 
     func execProtocolRaw(_ bytes: Data) async throws -> Data {
-        try box.execProtocolRaw(bytes)
+        try await owner.run { [box] in
+            try box.execProtocolRaw(bytes)
+        }
     }
 
-    func execProtocolStream(
+    func execProtocolRawStream(
         _ bytes: Data,
         onChunk: @escaping @Sendable (Data) throws -> Void
-    ) async throws {
-        try box.execProtocolStream(bytes, onChunk: onChunk)
+    ) async throws -> OliphauntProtocolStreamOutcome {
+        try await owner.run { [box] in
+            try box.execProtocolRawStream(bytes, onChunk: onChunk)
+        }
     }
 
     func backup() async throws -> Data {
-        try box.backup()
+        try await owner.run { [box] in
+            try box.backup()
+        }
     }
 
-    nonisolated func cancel() async throws {
-        try box.cancel()
+    func cancel() async throws {
+        try await cancellationOwner.run { [box] in
+            try box.cancel()
+        }
     }
 
-    nonisolated func close() async throws {
-        try box.close()
+    func close() async throws {
+        try await owner.run { [box] in
+            try box.close()
+        }
+    }
+}
+
+final class OliphauntNativeOwner: @unchecked Sendable {
+    private let queue: DispatchQueue
+
+    init(label: String) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+    }
+
+    func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result(catching: operation))
+            }
+        }
+    }
+
+    func enqueue(_ operation: @escaping @Sendable () -> Void) {
+        queue.async(execute: operation)
     }
 }
 
@@ -676,10 +769,10 @@ private final class NativeSessionBox: @unchecked Sendable {
         return Data(bytes: data, count: response.len)
     }
 
-    func execProtocolStream(
+    func execProtocolRawStream(
         _ bytes: Data,
         onChunk: @escaping @Sendable (Data) throws -> Void
-    ) throws {
+    ) throws -> OliphauntProtocolStreamOutcome {
         let pointer = try beginCall()
         defer {
             endCall()
@@ -689,7 +782,7 @@ private final class NativeSessionBox: @unchecked Sendable {
         let context = Unmanaged.passUnretained(callbackBox).toOpaque()
         let rc = bytes.withUnsafeBytes { rawBuffer in
             let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress
-            return oliphaunt_swift_exec_protocol_stream(
+            return oliphaunt_swift_exec_protocol_raw_stream(
                 pointer,
                 base,
                 bytes.count,
@@ -715,11 +808,30 @@ private final class NativeSessionBox: @unchecked Sendable {
                 context
             )
         }
-        if let error = callbackBox.error {
-            throw error
-        }
-        guard rc == 0 else {
+        switch classifyOliphauntNativeStreamCompletion(
+            result: rc,
+            callbackFailed: callbackBox.error != nil
+        ) {
+        case .success:
+            return .complete
+        case .callbackAborted:
+            // The positive status proves liboliphaunt drained through
+            // ReadyForQuery; only this outcome may preserve callback identity.
+            guard let callbackError = callbackBox.error else {
+                throw OliphauntError.engine(
+                    "liboliphaunt reported a recovered callback abort without a callback failure"
+                )
+            }
+            return .callbackAborted(callbackError)
+        case .nativeFailure:
+            // A negative result means transport or recovery failed. Its native
+            // diagnostic is authoritative even when the callback also threw.
             throw OliphauntError.engine(OliphauntNativeDirectEngine.lastError(pointer))
+        case .protocolInconsistency:
+            throw OliphauntError.engine(
+                "liboliphaunt returned protocol stream result \(rc) with " +
+                    (callbackBox.error == nil ? "no callback failure" : "an unconfirmed callback failure")
+            )
         }
     }
 

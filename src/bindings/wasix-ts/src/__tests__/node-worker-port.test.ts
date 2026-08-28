@@ -34,9 +34,10 @@ describe('Node WASIX worker transport', () => {
 
     worker.emit('exit', 0);
 
+    expect(database.closed).toBe(true);
     await queryRejection;
     await expect(database.close()).rejects.toThrow('Node worker exited unexpectedly with code 0');
-    await expect(database.query('select 1')).rejects.toThrow('database is closed');
+    await expect(database.query('select 1')).rejects.toThrow('Oliphaunt WASIX database is closed');
     expect(worker.terminations).toBe(1);
     expect(recoveries).toBe(1);
   });

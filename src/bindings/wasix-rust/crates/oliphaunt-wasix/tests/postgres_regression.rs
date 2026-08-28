@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use oliphaunt_wasix::{DatabaseStorage, Oliphaunt};
 use serde::Deserialize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,7 +123,7 @@ fn savepoints_error_recovery_and_indexed_updates() -> Result<()> {
         }
         transaction.execute("ROLLBACK TO SAVEPOINT expected_error")?;
         transaction.execute("UPDATE indexed_items SET value = 'updated' WHERE key = 42")?;
-        Ok(())
+        Ok::<(), oliphaunt_wasix::Error>(())
     })?;
 
     database.execute("SET enable_seqscan = off")?;
@@ -160,6 +161,42 @@ fn savepoints_error_recovery_and_indexed_updates() -> Result<()> {
             .get_text(0, "value")?
             == Some("42"),
         "the session did not recover after an expected PostgreSQL error"
+    );
+    database.close()?;
+    Ok(())
+}
+
+#[test]
+fn panicking_transaction_callback_rolls_back_and_releases_the_database() -> Result<()> {
+    let mut database = Oliphaunt::open()?;
+    database.execute("CREATE TABLE panic_probe(value integer NOT NULL)")?;
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _: oliphaunt_wasix::TransactionResult<(), oliphaunt_wasix::Error> = database
+            .transaction(|transaction| {
+                transaction.execute("INSERT INTO panic_probe VALUES (1)")?;
+                panic!("transaction callback panic probe");
+            });
+    }));
+    ensure!(panic.is_err(), "the callback panic must be rethrown");
+    ensure!(
+        database
+            .query("SELECT count(*)::text AS count FROM panic_probe")?
+            .get_text(0, "count")?
+            == Some("0"),
+        "the panicking callback's transaction was not rolled back"
+    );
+
+    database.transaction(|transaction| {
+        transaction.execute("INSERT INTO panic_probe VALUES (2)")?;
+        Ok::<(), oliphaunt_wasix::Error>(())
+    })?;
+    ensure!(
+        database
+            .query("SELECT value::text AS value FROM panic_probe")?
+            .get_text(0, "value")?
+            == Some("2"),
+        "transaction ownership remained stranded after the panic"
     );
     database.close()?;
     Ok(())

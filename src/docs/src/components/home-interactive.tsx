@@ -293,14 +293,13 @@ const SDK_EXAMPLES: readonly SdkExample[] = [
     brand: 'rust',
     packageName: 'oliphaunt',
     language: 'rust',
-    code: `use oliphaunt::Oliphaunt;
+    code: `use oliphaunt::{DatabaseStorage, Oliphaunt};
 
-async fn open_database() -> oliphaunt::Result<()> {
-    let db = Oliphaunt::builder()
-        .path(".oliphaunt")
+fn open_database() -> oliphaunt::Result<()> {
+    let mut db = Oliphaunt::builder()
+        .storage(DatabaseStorage::Directory(".oliphaunt".into()))
         .direct()
-        .open()
-        .await?;
+        .open()?;
 
     db.execute(r#"
         CREATE TABLE IF NOT EXISTS todos (
@@ -308,18 +307,17 @@ async fn open_database() -> oliphaunt::Result<()> {
             title text NOT NULL UNIQUE,
             done boolean NOT NULL DEFAULT false
         )
-    "#).await?;
-    db.query_params(
+    "#)?;
+    db.execute_with_params(
         "INSERT INTO todos (title) VALUES ($1) \
          ON CONFLICT (title) DO UPDATE SET done = false",
         ["Run the first product query"],
-    ).await?;
+    )?;
     let todos = db
-        .query("SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20")
-        .await?;
-    let first_title = todos.get_text(0, "title")?;
+        .query("SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20")?;
+    let first_title: &str = todos.rows()[0].try_get("title")?;
 
-    db.close().await?;
+    db.close()?;
     Ok(())
 }`,
   },
@@ -351,12 +349,12 @@ try await database.execute("""
 try await database.query(
     """INSERT INTO todos (title) VALUES ($1)
        ON CONFLICT (title) DO UPDATE SET done = false""",
-    parameters: [.text("Run the first product query")]
+    parameters: [.string("Run the first product query")]
 )
 let todos = try await database.query(
     "SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20"
 )
-let firstTitle = try todos.getText(row: 0, column: "title")
+let firstTitle: String? = try todos.rows[0].value(named: "title")
 
 try await database.close()`,
   },
@@ -386,12 +384,12 @@ database.execute(
 database.query(
     """INSERT INTO todos (title) VALUES (${'$'}1)
        ON CONFLICT (title) DO UPDATE SET done = false""".trimIndent(),
-    listOf(QueryParam.text("Run the first product query")),
+    listOf(QueryParam.string("Run the first product query")),
 )
 val todos = database.query(
     "SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20"
 )
-val firstTitle = todos.getText(row = 0, column = "title")
+val firstTitle = todos.rows.first().value("title", PostgresDecoders.string)
 
 database.close()`,
   },
@@ -423,7 +421,7 @@ await db.query(
 const todos = await db.query(
   'SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20',
 );
-const firstTitle = todos.getText(0, 'title');
+const firstTitle = todos.rows[0]?.title;
 
 await db.close();`,
   },
@@ -436,7 +434,7 @@ await db.close();`,
     code: `import { Oliphaunt } from '@oliphaunt/ts';
 
 const db = await Oliphaunt.open({
-  execution: 'broker',
+  topology: 'broker',
   storage: { kind: 'directory', path: './app-data/main.oliphaunt' },
   extensions: [],
 });
@@ -456,7 +454,7 @@ await db.query(
 const todos = await db.query(
   'SELECT title FROM todos WHERE NOT done ORDER BY id DESC LIMIT 20',
 );
-const firstTitle = todos.getText(0, 'title');
+const firstTitle = todos.rows[0]?.title;
 
 await db.close();`,
   },

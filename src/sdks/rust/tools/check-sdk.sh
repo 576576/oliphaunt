@@ -355,20 +355,32 @@ if [ "$mode" = "regression" ]; then
   exit 0
 fi
 
-if oliphaunt_runtime_native_host_ready extensions; then
-  native_runtime_ready=1
-  echo "using existing native Oliphaunt runtime at $(oliphaunt_runtime_native_host_work_root)"
-elif [ -n "${OLIPHAUNT_REQUIRE_NATIVE:-}" ]; then
-  oliphaunt_runtime_native_host_diagnostics extensions
-  exit 1
-else
-  echo "warning: native Oliphaunt runtime unavailable or incomplete; env-gated Rust SDK tests will skip" >&2
-  oliphaunt_runtime_native_host_diagnostics extensions
+native_runtime_profile=""
+case "$mode" in
+  extension-regression)
+    native_runtime_profile="extensions"
+    ;;
+  release-check|smoke-runtime|test-unit)
+    native_runtime_profile="basic"
+    ;;
+esac
+
+if [ -n "$native_runtime_profile" ]; then
+  if oliphaunt_runtime_native_host_ready "$native_runtime_profile"; then
+    native_runtime_ready=1
+    echo "using existing native Oliphaunt runtime at $(oliphaunt_runtime_native_host_work_root)"
+  elif [ -n "${OLIPHAUNT_REQUIRE_NATIVE:-}" ]; then
+    oliphaunt_runtime_native_host_diagnostics "$native_runtime_profile"
+    exit 1
+  else
+    echo "warning: native Oliphaunt runtime unavailable or incomplete; env-gated Rust SDK tests will skip" >&2
+    oliphaunt_runtime_native_host_diagnostics "$native_runtime_profile"
+  fi
 fi
 
 if [ "$mode" = "smoke-runtime" ]; then
   if [ "$native_runtime_ready" -ne 1 ]; then
-    oliphaunt_runtime_native_host_diagnostics extensions
+    oliphaunt_runtime_native_host_diagnostics basic
     exit 1
   fi
   native_runtime_lock cargo test -p oliphaunt --locked \
@@ -413,6 +425,11 @@ package_listing="$root/target/liboliphaunt-sdk-check/rust-cargo-package-list.txt
 mkdir -p "$(dirname "$package_listing")"
 run tools/dev/bun.sh tools/release/prepare-rust-release-source.mjs
 release_manifest="$root/target/release/cargo-package-sources/oliphaunt/Cargo.toml"
+release_query_core="$root/target/release/cargo-package-sources/oliphaunt/src/query_core.rs"
+if ! cmp -s src/shared/rust-query-core/query_core.rs "$release_query_core"; then
+  echo "Rust SDK staged query core must exactly match src/shared/rust-query-core/query_core.rs" >&2
+  exit 1
+fi
 printf '\n==> cargo package --manifest-path %s --allow-dirty --list\n' "$release_manifest"
 cargo package --manifest-path "$release_manifest" --allow-dirty --list >"$package_listing"
 cat "$package_listing"
@@ -422,7 +439,11 @@ for required in \
   README.md \
   ARCHITECTURE.md \
   src/lib.rs \
+  src/builder.rs \
   src/database.rs \
+  src/direct.rs \
+  src/session.rs \
+  src/query_core.rs \
   src/query.rs \
   tests/public_api.rs \
   tests/sdk_extensions.rs \
@@ -430,6 +451,7 @@ for required in \
   tests/native_sql_regression.rs \
   tests/native_extensions.rs \
   testdata/query-response-cases.json \
+  testdata/structured-sql-cases.json \
   testdata/database-root.json \
   testdata/behavior-contract.json
 do

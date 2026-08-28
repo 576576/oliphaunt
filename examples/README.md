@@ -9,7 +9,8 @@ The desktop examples keep the same todo schema across shells:
 
 Additional platform examples live here as well:
 
-- `browser-wasix`: direct and worker WASIX TypeScript usage with browser storage.
+- `browser-wasix`: the caller-realm root and explicit `/worker` WASIX
+  TypeScript entrypoints with browser storage.
 - `react-native-expo`: the React Native SDK in an Expo development build.
 
 Each app opts into `hstore`, `pg_trgm`, and `unaccent`, then uses `hstore`

@@ -5,8 +5,17 @@ export type JsiProtocolChunkResult =
     }
   | undefined;
 
+export type JsiProtocolStreamOutcome =
+  | { readonly kind: 'complete' }
+  | { readonly kind: 'callbackAborted'; readonly error: unknown };
+
 export type JsiRawProtocolTransport = {
   readonly version: 1;
+  /**
+   * Schedules best-effort cleanup for this exact process-unique session
+   * generation. A stale or already-closed generation is a successful no-op.
+   */
+  readonly closeIfGeneration: (generation: number) => void;
   readonly execProtocolRaw: (
     handle: number,
     request: Uint8Array,
@@ -35,6 +44,7 @@ export function resolveJsiRawProtocolTransport(): JsiRawProtocolTransport | null
   const candidate = (globalThis as GlobalWithOliphauntJsi).__oliphauntReactNativeJsi;
   if (
     candidate?.version === 1 &&
+    typeof candidate.closeIfGeneration === 'function' &&
     typeof candidate.execProtocolRaw === 'function' &&
     typeof candidate.execProtocolStream === 'function' &&
     typeof candidate.backup === 'function' &&
@@ -68,7 +78,7 @@ export async function execProtocolStreamJsi(
   handle: number,
   request: Uint8Array,
   onChunk: (chunk: Uint8Array) => void,
-): Promise<void> {
+): Promise<JsiProtocolStreamOutcome> {
   let callbackFailed = false;
   let callbackFailure: unknown;
   try {
@@ -86,13 +96,26 @@ export async function execProtocolStreamJsi(
       }
     });
   } catch (error) {
-    if (!callbackFailed) {
-      throw error;
+    if (callbackFailed && isProtocolCallbackAborted(error)) {
+      return { kind: 'callbackAborted', error: callbackFailure };
     }
+    // A generic platform rejection means execution or recovery failed. It is
+    // authoritative even if the JavaScript callback failed first.
+    throw error;
   }
   if (callbackFailed) {
-    throw callbackFailure;
+    return { kind: 'callbackAborted', error: callbackFailure };
   }
+  return { kind: 'complete' };
+}
+
+function isProtocolCallbackAborted(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { __oliphauntProtocolCallbackAborted?: unknown })
+      .__oliphauntProtocolCallbackAborted === true
+  );
 }
 
 function protocolChunkFailure(error: unknown): Exclude<JsiProtocolChunkResult, undefined> {

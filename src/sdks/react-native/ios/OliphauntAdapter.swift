@@ -5,6 +5,14 @@ private struct SendableData: @unchecked Sendable {
     let value: Data
 }
 
+private final class ProtocolStreamCallbackFailure: Error, @unchecked Sendable {
+    let callbackError: NSError
+
+    init(_ callbackError: NSError) {
+        self.callbackError = callbackError
+    }
+}
+
 private extension OliphauntDatabase {
     func reactNativeBackup() async throws -> SendableData {
         SendableData(value: try await backup())
@@ -34,7 +42,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
             return
         }
         let completionBox = CompletionBox(completion)
-        Task.detached(priority: .userInitiated) {
+        Task(priority: .userInitiated) {
             do {
                 let database = try await OliphauntDatabase.open(configuration: parsed.configuration)
                 completionBox.value(OliphauntAdapterDatabase(database: database), nil)
@@ -59,7 +67,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
                 storageName: storageName
             )
             let completionBox = CompletionBox(completion)
-            Task.detached(priority: .userInitiated) {
+            Task(priority: .userInitiated) {
                 do {
                     try await OliphauntDatabase.restore(destination: destination, bytes: backupData)
                     completionBox.value(nil)
@@ -87,14 +95,15 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
             return URL(fileURLWithPath: storagePath, isDirectory: true)
         case "applicationData":
             let name = try applicationDataName(storageName)
-            let support = try FileManager.default.url(
+            guard let support = FileManager.default.urls(
                 for: .applicationSupportDirectory,
-                in: .userDomainMask,
-                appropriateFor: nil,
-                create: true
-            ).appendingPathComponent("Oliphaunt", isDirectory: true)
-            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-            return support.appendingPathComponent(name, isDirectory: true)
+                in: .userDomainMask
+            ).first else {
+                throw adapterError("failed to resolve application data restore directory")
+            }
+            return support
+                .appendingPathComponent("Oliphaunt", isDirectory: true)
+                .appendingPathComponent(name, isDirectory: true)
         default:
             throw adapterError("unknown restore destination kind '\(storageKind)'")
         }
@@ -106,7 +115,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
         completion: @escaping (NSData?, NSError?) -> Void
     ) {
         let completionBox = CompletionBox(completion)
-        Task.detached(priority: .userInitiated) { [database] in
+        Task(priority: .userInitiated) { [database] in
             do {
                 let response = try await database.execProtocolRaw(request)
                 completionBox.value(response as NSData, nil)
@@ -124,16 +133,24 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
     ) {
         let completionBox = CompletionBox(completion)
         let chunkBox = CompletionBox(onChunk)
-        Task.detached(priority: .userInitiated) { [database] in
+        Task(priority: .userInitiated) { [database] in
             do {
-                try await database.execProtocolStream(request) { chunk in
+                try await database.execProtocolRawStream(request) { chunk in
                     if let error = chunkBox.value(chunk as NSData) {
-                        throw error
+                        throw ProtocolStreamCallbackFailure(error)
                     }
                 }
                 completionBox.value(nil)
             } catch {
-                completionBox.value(Self.nsError(error))
+                if let recoveredCallback = error as? ProtocolStreamCallbackFailure {
+                    // The Swift SDK can rethrow this private sentinel only for
+                    // the typed result after recovery reached ReadyForQuery.
+                    completionBox.value(
+                        Self.protocolStreamCallbackAbortedError(recoveredCallback.callbackError)
+                    )
+                } else {
+                    completionBox.value(Self.nsError(error))
+                }
             }
         }
     }
@@ -143,7 +160,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
         completion: @escaping (NSData?, NSError?) -> Void
     ) {
         let completionBox = CompletionBox(completion)
-        Task.detached(priority: .userInitiated) { [database] in
+        Task(priority: .userInitiated) { [database] in
             do {
                 let backup = try await database.reactNativeBackup()
                 completionBox.value(backup.value as NSData, nil)
@@ -156,7 +173,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
     @objc(cancelWithCompletion:)
     public func cancel(completion: @escaping (NSError?) -> Void) {
         let completionBox = CompletionBox(completion)
-        Task.detached(priority: .userInitiated) { [database] in
+        Task(priority: .userInitiated) { [database] in
             do {
                 try await database.cancel()
                 completionBox.value(nil)
@@ -169,7 +186,7 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
     @objc(closeWithCompletion:)
     public func close(completion: @escaping (NSError?) -> Void) {
         let completionBox = CompletionBox(completion)
-        Task.detached(priority: .userInitiated) { [database] in
+        Task(priority: .userInitiated) { [database] in
             do {
                 try await database.close()
                 completionBox.value(nil)
@@ -404,6 +421,17 @@ public final class OliphauntAdapterDatabase: NSObject, @unchecked Sendable {
             domain: errorDomain,
             code: 1,
             userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private static func protocolStreamCallbackAbortedError(_ error: NSError) -> NSError {
+        NSError(
+            domain: OliphauntProtocolStreamCallbackAbortedErrorDomain,
+            code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey: error.localizedDescription,
+                NSUnderlyingErrorKey: error,
+            ]
         )
     }
 

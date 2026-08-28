@@ -37,11 +37,11 @@ import Oliphaunt from '@oliphaunt/wasix-ts';
 
 await using database = await Oliphaunt.open();
 const result = await database.query('select $1::int + 1 as answer', [41]);
-console.log(result.getText(0, 'answer'));
+console.log(result.rows[0]?.answer);
 ```
 
-Browser pages must send these response headers and keep the package's module
-Worker edge intact:
+Browser pages must send these response headers. Bundlers using the explicit
+Worker surface must also preserve its module Worker asset:
 
 ```text
 Cross-Origin-Opener-Policy: same-origin
@@ -68,6 +68,15 @@ Use `transaction(async tx => …)` for one callback-scoped transaction. Calls on
 the database handle do not interleave with the callback; use the `tx` handle
 inside it.
 
+A callback failure is rethrown unchanged after rollback and required persistence
+publication succeed. If rollback also fails, `AggregateError.errors` contains
+the callback failure followed by the rollback failure. If the callback throws a
+different value after an earlier independent database or protocol failure
+poisoned or expired transaction ownership, the aggregate instead contains the
+callback failure followed by that database failure and the database is
+close-only. Ordinary PostgreSQL statement errors that remain safely rollbackable
+do not automatically produce an aggregate.
+
 </Step>
 <Step>
 
@@ -92,26 +101,33 @@ content. A persistent identity may have one owner at a time within its provider;
 simultaneous cross-binding mutation is unsupported rather than coordinated by a
 new public lock protocol.
 
-With the default worker placement, OPFS uses browser synchronous access handles
-for direct exact-range PostgreSQL file I/O when available. Direct caller-realm
-placement and browsers without that facility use the portable journal against
-the same opaque OPFS format. This selection is automatic and adds no public
-mode or tuning option.
+OPFS uses browser synchronous access handles for exact-range PostgreSQL file
+I/O with the explicit Worker entry point and when the root entry point is
+imported inside an application-owned Dedicated Worker. A root import in a
+browser Window, and hosts without synchronous access handles, use the portable
+journal against the same opaque OPFS format. This selection is automatic and
+adds no public mode or tuning option.
 
 </Step>
 <Step>
 
-### Choose a mode
+### Choose execution placement
 
-Worker placement is the default. Choose `execution: 'direct'` only when blocking
-the caller's realm during PostgreSQL work is acceptable:
+Use the root entry point for direct execution in the importing realm. Import
+the explicit Worker entry point when the caller's event loop must remain
+responsive during PostgreSQL work:
 
 ```ts
-const database = await Oliphaunt.open({ execution: 'direct' });
+import OliphauntWorker from '@oliphaunt/wasix-ts/worker';
+
+const database = await OliphauntWorker.open();
 ```
 
-Both placements return the same `OliphauntDatabase`. There is no runtime
-fallback, capability profile, or host mode negotiation.
+Both entry points return the same `OliphauntDatabase` contract. Root open and
+operations remain promise-shaped for loading and durable publication, but
+synchronous guest execution can prevent the caller's realm from processing
+other work. The Worker surface adds an explicit RPC hop. There is no runtime
+fallback, capability profile, or host-mode negotiation.
 
 </Step>
 <Step>
@@ -120,12 +136,35 @@ fallback, capability profile, or host mode negotiation.
 
 Ordinary operations publish persistent changes before their promises settle.
 Transactions publish once after confirmed `COMMIT` or `ROLLBACK`.
-`checkpoint()` sends PostgreSQL `CHECKPOINT` and then publishes. A publication
-failure poisons the handle because PostgreSQL may contain changes not present in
-the last durable generation; close it and reopen the last complete generation.
+An explicit PostgreSQL checkpoint, when operationally required, is ordinary SQL:
+`await database.execute('CHECKPOINT')`. A publication failure poisons the handle
+because PostgreSQL may contain changes not present in the last durable
+generation; close it and reopen the last complete generation.
 
-`close()` is idempotent and releases the provider owner. `await using` calls the
-same operation through `Symbol.asyncDispose`.
+`close()` begins one terminal teardown attempt and attempts final provider
+publication and ownership release. Concurrent and later calls return the same
+promise. If teardown rejects, the error reports cleanup that could not complete,
+but the handle still becomes `closed` and cannot accept more work: its Worker
+transport or caller-realm guest has already been retired. `await using` calls
+the same operation through `Symbol.asyncDispose`.
+
+The shutdown deadline bounds orderly FIFO drain, not the entire close promise.
+On the Worker surface, expiry waits for forced Worker termination to settle
+before releasing other owned resources, so storage cleanup never races a live
+Worker.
+If a package-owned Worker crashes independently, `closed` becomes `true` as
+soon as the transport observes that ownership loss. Later operations fail
+without posting to the dead Worker. Calling `close()` remains useful and
+idempotent: it reports the same terminal transport failure while completing
+any remaining package-owned cleanup.
+If the public handle is forgotten instead, an owner-free generation token
+schedules best-effort cleanup for only that Worker or direct guest/storage
+lease. Stale finalizers cannot affect later opens, but finalization is not
+prompt; explicit close remains required when release must be observed.
+
+Calling database `close()` from inside its active transaction callback is the
+one pre-teardown rejection: the transaction still owns the session, so the
+database remains open and must be closed after the callback settles.
 
 </Step>
 <Step>
@@ -138,11 +177,14 @@ Import exact WASIX extension descriptors and pass them to `open()`:
 import pgtap from '@oliphaunt/extension-pgtap-wasix';
 
 const database = await Oliphaunt.open({ extensions: [pgtap] });
+await database.execute('CREATE EXTENSION pgtap');
 ```
 
 The core runtime does not bundle every extension. Reopen persistent data with
-the same installed extension code. PostgreSQL's normal extension SQL remains
-authoritative; Oliphaunt does not add a generic extension-migration mode.
+the same selected carrier code. Selection materializes verified artifacts and
+required startup/preload configuration only; it does not silently run
+`CREATE EXTENSION`, `LOAD`, schema, post-create, upgrade, or migration SQL.
+Applications and ORM migrations own that ordinary PostgreSQL lifecycle.
 
 </Step>
 <Step>
@@ -178,21 +220,22 @@ pnpm add @oliphaunt/wasix-tools
 
 ```ts
 import Oliphaunt from '@oliphaunt/wasix-ts';
+import OliphauntWorker from '@oliphaunt/wasix-ts/worker';
 import { pgDump, psql } from '@oliphaunt/wasix-tools';
 
 await using source = await Oliphaunt.open();
 const sql = await pgDump(source, { args: ['--schema-only'] });
-await using target = await Oliphaunt.open();
+await using target = await OliphauntWorker.open();
 await psql(target, { script: sql });
 ```
 
-Tools work in browsers, Node.js, Bun, and Deno. `pgDump()` supports direct or
-worker placement and returns PostgreSQL's ordinary plain UTF-8 dump, including
-its normal COPY statements. It does not force inserts or rewrite valid SQL.
-`psql()` requires worker placement because COPY restore is full duplex; it is
-included so the same standard output can be applied without inventing a second
-logical restore API. Interactive psql, custom archives, parallel jobs, and
-`pg_restore` are outside this minimal tools product.
+Tools work in browsers, Node.js, Bun, and Deno. `pgDump()` accepts either a
+direct or Worker handle and returns PostgreSQL's ordinary plain UTF-8 dump,
+including its normal COPY statements. It does not force inserts or rewrite
+valid SQL. `psql()` requires a Worker handle because COPY restore is full
+duplex; it is included so the same standard output can be applied without
+inventing a second logical restore API. Interactive psql, custom archives,
+parallel jobs, and `pg_restore` are outside this minimal tools product.
 
 Tool runs exclusively own and reset the embedded PostgreSQL session. Do not
 expect raw-protocol prepared statements or session settings to survive a tool
@@ -224,6 +267,9 @@ omitting the port chooses an available port. Unix hosts may use
 a time and rejects concurrent connections. Each admitted client receives a
 fresh embedded backend while the listener and storage lease remain open. The
 endpoint is absent in browsers and is not the concurrent WASIX postmaster.
+`server.closed` is read-only: it stays `false` while terminal teardown is in
+progress and becomes `true` after the memoized close attempt settles, even when
+that attempt rejects.
 
 </Step>
 </Steps>
@@ -239,6 +285,11 @@ ownership, compatibility, restore, or publication failures are
 failure commonly means the page is not cross-origin isolated or a Worker/runtime
 subresource violates COEP.
 
-Use `execProtocolStream(input, callback)` instead of `execProtocolRaw(input)`
+Use `execProtocolRawStream(input, callback)` instead of `execProtocolRaw(input)`
 when an adapter expects a large protocol response. The synchronous callback is
-backpressured and receives bounded chunks; typed query results remain buffered.
+backpressured and receives bounded chunks; it cannot return a Promise/thenable
+or reenter the same database or transaction. A callback error is preserved only
+after confirmed protocol recovery and leaves the database reusable. A buffered
+raw rejection or streamed execution, transport, or recovery failure poisons the
+database and takes precedence over the callback outcome. Typed query results
+remain buffered.

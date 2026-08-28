@@ -1,6 +1,8 @@
 #include "liboliphaunt_internal.h"
 
 #include <errno.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -20,6 +22,7 @@ void oliphaunt_set_error(OliphauntHandle *handle, const char *message) {
 
 int32_t oliphaunt_close_claimed_global_instance(OliphauntHandle *handle) {
     (void)handle;
+    oliphaunt_wait_for_active_handle_calls();
     return 0;
 }
 
@@ -27,6 +30,21 @@ typedef struct StaleCloseContext {
     int result;
     OliphauntHandle *claimed;
 } StaleCloseContext;
+
+typedef struct RetirementContext {
+    OliphauntHandle *handle;
+    atomic_int started;
+    atomic_int acquired;
+    int result;
+} RetirementContext;
+
+typedef struct LeaseCloseContext {
+    uint64_t generation;
+    atomic_int claimed;
+    atomic_int closed;
+    int result;
+    OliphauntHandle *handle;
+} LeaseCloseContext;
 
 typedef struct BackupStopFault {
     int calls;
@@ -57,7 +75,68 @@ static void *claim_stale_generation(void *data) {
     return NULL;
 }
 
+static void *retire_current_handle(void *data) {
+    RetirementContext *context = (RetirementContext *)data;
+    atomic_store(&context->started, 1);
+    context->result = oliphaunt_begin_handle_retirement(context->handle);
+    if (context->result == 0) {
+        atomic_store(&context->acquired, 1);
+        oliphaunt_end_handle_retirement();
+    }
+    return NULL;
+}
+
+static void *claim_and_close_current_generation(void *data) {
+    LeaseCloseContext *context = (LeaseCloseContext *)data;
+    OliphauntHandle *claimed = NULL;
+    context->result = oliphaunt_claim_global_instance_for_close(
+        NULL,
+        context->generation,
+        true,
+        &claimed);
+    context->handle = claimed;
+    atomic_store(&context->claimed, 1);
+    if (context->result == 0) {
+        (void)oliphaunt_close_claimed_global_instance(claimed);
+        atomic_store(&context->closed, 1);
+    }
+    return NULL;
+}
+
 int main(void) {
+    char *startup_args[] = {"-c", "search_path=public"};
+    OliphauntHandle resident_config;
+    memset(&resident_config, 0, sizeof(resident_config));
+    resident_config.pgdata = "/managed/pgdata";
+    resident_config.runtime_dir = "/runtime";
+    resident_config.module_dir = "/modules";
+    resident_config.username = "postgres";
+    resident_config.database = "postgres";
+    resident_config.startup_args = startup_args;
+    resident_config.startup_arg_count = 2;
+    OliphauntConfig reopen_config = {
+        .abi_version = OLIPHAUNT_ABI_VERSION,
+        .pgdata = "/managed/pgdata",
+        .runtime_dir = "/runtime",
+        .module_dir = "/modules",
+        .username = "postgres",
+        .database = "postgres",
+        .flags = 0,
+        .startup_args = (const char *const *)startup_args,
+        .startup_arg_count = 2,
+    };
+    CHECK(oliphaunt_config_matches_resident_runtime(&resident_config, &reopen_config),
+          "an internally locked resident runtime must accept the same reopen mode");
+    reopen_config.flags = OLIPHAUNT_CONFIG_EXTERNAL_ROOT_LOCK;
+    CHECK(!oliphaunt_config_matches_resident_runtime(&resident_config, &reopen_config),
+          "an internally locked resident runtime must reject external-lock reopen");
+    resident_config.external_root_lock = true;
+    CHECK(oliphaunt_config_matches_resident_runtime(&resident_config, &reopen_config),
+          "an externally locked resident runtime must accept the same reopen mode");
+    reopen_config.flags = 0;
+    CHECK(!oliphaunt_config_matches_resident_runtime(&resident_config, &reopen_config),
+          "an externally locked resident runtime must reject internal-lock reopen");
+
     const uint8_t completed_select_one[] = {
         'C', 0, 0, 0, 13, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '1', 0,
         'Z', 0, 0, 0, 5, 'I',
@@ -277,13 +356,90 @@ int main(void) {
     CHECK(oliphaunt_logical_generation(&handle) == 2,
           "stale close must leave the reopened generation published");
 
+    CHECK(oliphaunt_begin_handle_call(&handle) == 0,
+          "current handle call lease must be acquired");
+    RetirementContext retirement = {
+        .handle = &handle,
+        .started = 0,
+        .acquired = 0,
+        .result = -1,
+    };
+    pthread_t retirement_thread;
+    CHECK(pthread_create(
+              &retirement_thread,
+              NULL,
+              retire_current_handle,
+              &retirement) == 0,
+          "cannot start concurrent logical-retirement check");
+    while (!atomic_load(&retirement.started)) {
+        sched_yield();
+    }
+    for (;;) {
+        int admission = oliphaunt_begin_handle_call(&handle);
+        if (admission != 0) {
+            break;
+        }
+        oliphaunt_end_handle_call();
+        sched_yield();
+    }
+    CHECK(!atomic_load(&retirement.acquired),
+          "logical retirement crossed an active public-call boundary");
+    oliphaunt_end_handle_call();
+    CHECK(pthread_join(retirement_thread, NULL) == 0,
+          "cannot join concurrent logical-retirement check");
+    CHECK(retirement.result == 0 && atomic_load(&retirement.acquired),
+          "logical retirement did not resume after the active call ended");
+    CHECK(oliphaunt_begin_handle_call(&handle) == 0,
+          "completed logical retirement left the call gate closed");
+    oliphaunt_end_handle_call();
+
+    handle.streaming = true;
     CHECK(oliphaunt_claim_global_instance_for_close(
               NULL,
               2,
               true,
-              &claimed) == 0,
-          "current generation must atomically claim terminal close");
-    CHECK(claimed == &handle, "current generation claimed the wrong resident handle");
+              &claimed) == -1,
+          "raw stream callback reentry must not claim terminal close");
+    CHECK(claimed == NULL,
+          "raw stream callback reentry unexpectedly returned a claimed handle");
+    CHECK(strstr(handle.last_error, "busy delivering a raw protocol stream") != NULL,
+          "raw stream callback reentry must report the active stream owner");
+    CHECK(oliphaunt_begin_handle_retirement(&handle) == -1,
+          "raw stream callback reentry must not begin logical retirement");
+    CHECK(oliphaunt_logical_generation(&handle) == 2,
+          "rejected callback close must leave the current generation published");
+    handle.streaming = false;
+
+    CHECK(oliphaunt_begin_handle_call(&handle) == 0,
+          "stream wrapper tail must retain its active-call lease");
+    LeaseCloseContext close = {
+        .generation = 2,
+        .claimed = 0,
+        .closed = 0,
+        .result = -1,
+        .handle = NULL,
+    };
+    pthread_t close_thread;
+    CHECK(pthread_create(
+              &close_thread,
+              NULL,
+              claim_and_close_current_generation,
+              &close) == 0,
+          "cannot start terminal-close lease check");
+    while (!atomic_load(&close.claimed)) {
+        sched_yield();
+    }
+    CHECK(close.result == 0 && close.handle == &handle,
+          "current generation did not atomically claim terminal close");
+    CHECK(!atomic_load(&close.closed),
+          "terminal close crossed the active stream wrapper boundary");
+    CHECK(oliphaunt_begin_handle_call(&handle) != 0,
+          "terminal claim admitted a new public handle call");
+    oliphaunt_end_handle_call();
+    CHECK(pthread_join(close_thread, NULL) == 0,
+          "cannot join terminal-close lease check");
+    CHECK(atomic_load(&close.closed),
+          "terminal close did not resume after the active call ended");
 
     claimed = NULL;
     CHECK(oliphaunt_claim_global_instance_for_close(

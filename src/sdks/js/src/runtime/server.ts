@@ -6,14 +6,16 @@ import { createServer } from 'node:net';
 
 import type { NormalizedOpenConfig } from '../config.js';
 import type { ServerListen } from '../types.js';
-import { simpleQuery } from '../protocol.js';
 import { envVar } from '../native/common.js';
 import {
   connectEndpoint,
+  cleanupFailedManagedLaunch,
   removeTree,
   spawnManagedChild,
   unixSocketPathsFit,
+  waitForManagedChild,
   type LocalEndpoint,
+  type FailedManagedLaunch,
   type ManagedChild,
 } from './node-adapter.js';
 import { PostgresWireClient } from './pgwire.js';
@@ -23,6 +25,8 @@ import {
   nativePostgresChildEnvironment,
 } from '../native/initialize.js';
 import type { RuntimeBinding, RuntimeHandle } from './types.js';
+import { throwCollectedCloseFailures } from './close.js';
+import { createForgottenRuntimeHandleCleanup } from './forgotten-handle.js';
 import {
   materializeNodeExtensionInstall,
   resolveNodeNativeInstall,
@@ -44,6 +48,9 @@ type ServerTools = {
 };
 
 export function createServerRuntimeBinding(): RuntimeBinding {
+  const forgottenHandles = createForgottenRuntimeHandleCleanup<ServerHandle>((handle) =>
+    handle.detach(),
+  );
   return {
     connectionString(handle: RuntimeHandle): string {
       return asServerHandle(handle).connectionString;
@@ -51,107 +58,226 @@ export function createServerRuntimeBinding(): RuntimeBinding {
     async open(config: NormalizedOpenConfig): Promise<ServerHandle> {
       return openServer(config);
     },
-    execProtocolRaw(handle: RuntimeHandle, request: Uint8Array): Promise<Uint8Array> {
-      return asServerHandle(handle).execProtocolRaw(request);
+    execProtocolRaw(_handle: RuntimeHandle, _request: Uint8Array): Promise<Uint8Array> {
+      return rejectServerDatabaseOperation();
     },
     execProtocolStream(
-      handle: RuntimeHandle,
-      request: Uint8Array,
-      onChunk: (chunk: Uint8Array) => void,
+      _handle: RuntimeHandle,
+      _request: Uint8Array,
+      _onChunk: (chunk: Uint8Array) => void,
     ): Promise<void> {
-      return asServerHandle(handle).execProtocolStream(request, onChunk);
+      return rejectServerDatabaseOperation();
     },
-    execSimpleQuery(handle: RuntimeHandle, sql: string): Promise<Uint8Array> {
-      return asServerHandle(handle).execProtocolRaw(simpleQuery(sql));
+    cancel(_handle: RuntimeHandle): Promise<void> {
+      return rejectServerDatabaseOperation();
     },
-    cancel(handle: RuntimeHandle): Promise<void> {
-      return asServerHandle(handle).cancel();
+    async close(handle: RuntimeHandle) {
+      try {
+        await asServerHandle(handle).detach();
+        return { state: 'closed' };
+      } catch (error) {
+        // ServerHandle.detach() marks the session closed before terminating
+        // the process. Any subsequent failure is terminal.
+        return { state: 'terminal', error };
+      }
     },
-    detach(handle: RuntimeHandle): Promise<void> {
-      return asServerHandle(handle).detach();
+    registerForgottenHandleCleanup(
+      owner: object,
+      handle: RuntimeHandle,
+      _releaseOwnership: () => void,
+    ): void {
+      forgottenHandles.register(owner, asServerHandle(handle));
+    },
+    unregisterForgottenHandleCleanup(owner: object): void {
+      forgottenHandles.unregister(owner);
     },
   };
 }
 
-class ServerHandle {
+function rejectServerDatabaseOperation(): Promise<never> {
+  return Promise.reject(
+    new Error(
+      'native server handles own only server lifecycle; connect with a PostgreSQL driver using connectionString',
+    ),
+  );
+}
+
+/** @internal Runtime-owned handle; exported only for package-internal contract tests. */
+export class ServerHandle {
   #closed = false;
+  #child: ManagedChild | undefined;
+  #ownedSocketDir: string | undefined;
+  #temporaryInstanceDirectory: string | undefined;
+  #shutdownCommandCompletion: Promise<number | null> | undefined;
+  #scheduledShutdownCommandCompletion: Promise<number | null> | undefined;
+  #detachTail: Promise<void> = Promise.resolve();
+  readonly #shutdownServer: () => Promise<void>;
 
   constructor(
-    readonly child: ManagedChild,
-    readonly client: PostgresWireClient,
+    child: ManagedChild,
     readonly instanceDirectory: string,
     readonly pgdata: string,
     readonly pgCtl: string,
     readonly toolEnvironment: Record<string, string>,
-    readonly ownedSocketDir: string | undefined,
+    ownedSocketDir: string | undefined,
     readonly connectionString: string,
     readonly temporaryDirectory: boolean,
-  ) {}
-
-  async execProtocolRaw(request: Uint8Array): Promise<Uint8Array> {
-    this.assertOpen();
-    return this.client.execProtocolRaw(request);
+    shutdownServer?: () => Promise<void>,
+    private readonly shutdownTimeoutMs = STOP_TIMEOUT_MS,
+  ) {
+    this.#child = child;
+    this.#ownedSocketDir = ownedSocketDir;
+    this.#temporaryInstanceDirectory = temporaryDirectory ? instanceDirectory : undefined;
+    this.#shutdownServer =
+      shutdownServer ??
+      (() =>
+        runCommand(
+          this.pgCtl,
+          ['-D', this.pgdata, '-m', 'fast', '-w', 'stop'],
+          this.toolEnvironment,
+          STOP_TIMEOUT_MS,
+        ).then(() => undefined));
   }
 
-  async execProtocolStream(
-    request: Uint8Array,
-    onChunk: (chunk: Uint8Array) => void,
-  ): Promise<void> {
-    this.assertOpen();
-    await this.client.execProtocolStream(request, onChunk);
+  detach(): Promise<void> {
+    const attempt = this.#detachTail.then(() => this.#detachOnce());
+    this.#detachTail = attempt.then(
+      () => undefined,
+      () => undefined,
+    );
+    return attempt;
   }
 
-  async cancel(): Promise<void> {
-    this.assertOpen();
-    await this.client.cancel();
-  }
-
-  async detach(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
+  async #detachOnce(): Promise<void> {
+    const firstAttempt = !this.#closed;
     this.#closed = true;
-    await this.client.terminate().catch(() => {});
-    let failure: unknown;
-    try {
-      await runCommand(
-        this.pgCtl,
-        ['-D', this.pgdata, '-m', 'fast', '-w', 'stop'],
-        this.toolEnvironment,
-        STOP_TIMEOUT_MS,
-      );
-    } catch (error) {
-      failure = error;
-    }
-    const exited = await waitForChild(this.child, STOP_TIMEOUT_MS);
-    if (!exited) {
-      this.child.kill('SIGKILL');
-      await this.child.wait();
-      failure ??= new Error(`native server did not stop within ${STOP_TIMEOUT_MS}ms`);
-    }
-    try {
-      await removeTree(this.ownedSocketDir);
-    } catch (error) {
-      failure ??= error;
-    }
-    if (this.temporaryDirectory) {
+    const failures: unknown[] = [];
+    if (firstAttempt) {
       try {
-        await removeTree(this.instanceDirectory);
+        await this.#shutdownServer();
       } catch (error) {
-        failure ??= error;
+        failures.push(error);
+        const completion = unconfirmedServerCommandCompletion(error);
+        this.#shutdownCommandCompletion = completion;
+        if (completion !== undefined && this.#scheduledShutdownCommandCompletion !== completion) {
+          this.#scheduledShutdownCommandCompletion = completion;
+          void completion.then(
+            () => {
+              // Public close becomes terminal after its first failure. Queue
+              // one internal cleanup pass behind that attempt once pg_ctl is
+              // conclusively reaped so retained socket/PGDATA paths can be
+              // released without requiring another public close.
+              void this.detach().catch(() => {});
+            },
+            () => {},
+          );
+        }
+      }
+    } else if (this.#shutdownCommandCompletion !== undefined) {
+      const completion = this.#shutdownCommandCompletion;
+      try {
+        if (await waitForServerCommand(completion, this.shutdownTimeoutMs)) {
+          if (this.#shutdownCommandCompletion === completion) {
+            this.#shutdownCommandCompletion = undefined;
+          }
+        } else {
+          failures.push(
+            new Error(
+              `native server shutdown command reap remained unconfirmed after ${this.shutdownTimeoutMs}ms`,
+            ),
+          );
+        }
+      } catch (error) {
+        failures.push(error);
       }
     }
-    if (failure !== undefined) {
-      throw failure;
+    const child = this.#child;
+    if (child !== undefined) {
+      try {
+        let exited = await waitForManagedChild(child, this.shutdownTimeoutMs);
+        if (!exited) {
+          failures.push(new Error(`native server did not stop within ${this.shutdownTimeoutMs}ms`));
+          child.kill('SIGKILL');
+          exited = await waitForManagedChild(child, this.shutdownTimeoutMs);
+          if (!exited) {
+            failures.push(
+              new Error(
+                `native server was not reaped within ${this.shutdownTimeoutMs}ms after SIGKILL`,
+              ),
+            );
+          }
+        }
+        if (exited && this.#child === child) {
+          this.#child = undefined;
+        }
+      } catch (error) {
+        failures.push(error);
+      }
     }
-  }
-
-  assertOpen(): void {
-    if (this.#closed) {
-      throw new Error('native server session is closed');
+    // A process whose reap is unconfirmed may still be using its socket and
+    // PGDATA. Retain both exact paths and defer deletion until the process is
+    // conclusively gone.
+    if (this.#child === undefined && this.#shutdownCommandCompletion === undefined) {
+      const ownedSocketDir = this.#ownedSocketDir;
+      try {
+        await removeTree(ownedSocketDir);
+        if (this.#ownedSocketDir === ownedSocketDir) {
+          this.#ownedSocketDir = undefined;
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+      const temporaryInstanceDirectory = this.#temporaryInstanceDirectory;
+      if (temporaryInstanceDirectory !== undefined) {
+        try {
+          await removeTree(temporaryInstanceDirectory);
+          if (this.#temporaryInstanceDirectory === temporaryInstanceDirectory) {
+            this.#temporaryInstanceDirectory = undefined;
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
     }
+    if (
+      this.#child !== undefined ||
+      this.#shutdownCommandCompletion !== undefined ||
+      this.#ownedSocketDir !== undefined ||
+      this.#temporaryInstanceDirectory !== undefined
+    ) {
+      retainedFailedServerHandles.add(this);
+    } else {
+      retainedFailedServerHandles.delete(this);
+    }
+    throwCollectedCloseFailures(failures, 'native server teardown failed');
   }
 }
+
+// Terminal public close has no retry surface. Preserve any exact cleanup
+// resources which remain after that cutoff until process exit.
+const retainedFailedServerHandles = new Set<ServerHandle>();
+// A readiness connection is never part of a published server handle. If its
+// exact stream cannot be released even after the internal cleanup retry, keep
+// it alive instead of silently dropping unresolved socket ownership.
+const retainedFailedReadinessClients = new Set<PostgresWireClient>();
+
+type ServerCommandProcess = {
+  readonly stdout: NodeJS.ReadableStream;
+  readonly failures: unknown[];
+  kill(signal: NodeJS.Signals): boolean;
+  wait(): Promise<number | null>;
+};
+
+class UnconfirmedServerCommandReapError extends Error {
+  constructor(
+    message: string,
+    readonly completion: Promise<number | null>,
+  ) {
+    super(message);
+  }
+}
+
+const retainedUnreapedServerCommands = new Set<ServerCommandProcess>();
 
 async function openServer(config: NormalizedOpenConfig): Promise<ServerHandle> {
   let ownedSocketDir: string | undefined;
@@ -181,21 +307,21 @@ async function openServer(config: NormalizedOpenConfig): Promise<ServerHandle> {
     ownedSocketDir = listen.transport === 'tcp' ? socketDir : undefined;
     child = spawnManagedChild({
       executable,
-      args: postgresArgs(config, listen, port, socketDir),
+      args: postgresServerArguments(config, listen, port, socketDir),
       env: toolEnvironment,
       replaceEnv: true,
     });
     const endpoint = sdkEndpoint(port, socketDir);
-    const client = await waitForServer(
+    const readinessClient = await waitForServer(
       endpoint,
       child,
       config.username,
       config.database,
       startupTimeoutMs,
     );
+    await releaseReadinessClient(readinessClient);
     return new ServerHandle(
       child,
-      client,
       config.instanceDirectory,
       config.pgdata,
       pgCtl,
@@ -205,14 +331,18 @@ async function openServer(config: NormalizedOpenConfig): Promise<ServerHandle> {
       config.temporaryDirectory,
     );
   } catch (error) {
-    if (child !== undefined) {
-      child.kill('SIGKILL');
-      await child.wait();
-    }
-    await removeTree(ownedSocketDir);
-    if (config.temporaryDirectory) {
-      await removeTree(config.instanceDirectory);
-    }
+    const cleanupFailures = await cleanupFailedManagedLaunch(
+      {
+        child,
+        paths: [ownedSocketDir, config.temporaryDirectory ? config.instanceDirectory : undefined],
+      },
+      STOP_TIMEOUT_MS,
+      'native server startup child',
+    );
+    throwCollectedCloseFailures(
+      [error, ...cleanupFailures],
+      'native server startup and cleanup failed',
+    );
     throw error;
   }
 }
@@ -242,7 +372,8 @@ export async function initializeServerDataDir(
   });
 }
 
-function postgresArgs(
+/** @internal Exact PostgreSQL argv construction, exported only for contract tests. */
+export function postgresServerArguments(
   config: NormalizedOpenConfig,
   listen: ServerListen,
   port: number,
@@ -262,10 +393,16 @@ function postgresArgs(
   ];
   args.push(
     '-c',
-    socketDir === undefined ? 'unix_socket_directories=' : `unix_socket_directories=${socketDir}`,
+    socketDir === undefined
+      ? 'unix_socket_directories='
+      : postgresUnixSocketDirectoryAssignment(socketDir),
   );
   args.push(...config.startupArgs);
   return args;
+}
+
+function postgresUnixSocketDirectoryAssignment(directory: string): string {
+  return `unix_socket_directories="${directory.replaceAll('"', '""')}"`;
 }
 
 async function waitForServer(
@@ -293,6 +430,34 @@ async function waitForServer(
     }
   }
   throw new Error(`native server did not accept SDK connections: ${errorString(lastError)}`);
+}
+
+async function releaseReadinessClient(client: PostgresWireClient): Promise<void> {
+  const failures: unknown[] = [];
+  try {
+    await client.terminate();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (!client.isTerminated) {
+    try {
+      // terminate() memoizes the protocol request and retries only the exact
+      // stream close, so this cannot send a second Terminate packet.
+      await client.terminate();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (client.isTerminated) {
+    retainedFailedReadinessClients.delete(client);
+    return;
+  }
+  retainedFailedReadinessClients.add(client);
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'native server readiness connection cleanup failed');
+  }
+  throw new Error('native server readiness connection remained open after cleanup');
 }
 
 function sdkEndpoint(port: number, socketDir: string | undefined): LocalEndpoint {
@@ -575,26 +740,75 @@ async function runCommand(
     env: env ?? process.env,
     stdio: ['ignore', 'pipe', 'inherit'],
   });
+  const processFailures: unknown[] = [];
+  const exited = new Promise<number | null>((resolveExit, rejectExit) => {
+    child.once('error', (error) => {
+      if (child.pid === undefined) {
+        rejectExit(error);
+      } else {
+        processFailures.push(error);
+      }
+    });
+    child.once('exit', resolveExit);
+  });
+  return runSpawnedServerCommand(
+    command,
+    {
+      stdout: child.stdout,
+      failures: processFailures,
+      kill: (signal) => child.kill(signal),
+      wait: () => exited,
+    },
+    timeoutMs,
+  );
+}
+
+/** @internal Process runner split out for deterministic lifecycle contract tests. */
+export async function runSpawnedServerCommand(
+  command: string,
+  child: ServerCommandProcess,
+  timeoutMs?: number,
+): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   child.stdout.on('data', (chunk: Buffer) => chunks.push(new Uint8Array(chunk)));
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const code = await new Promise<number | null>((resolve, reject) => {
-    child.once('error', reject);
-    child.once('exit', resolve);
-    if (timeoutMs !== undefined) {
-      timeout = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error(`${command} did not finish within ${timeoutMs}ms`));
-      }, timeoutMs);
+  const failures = child.failures;
+  const completion = child.wait();
+  let timedOut = false;
+  let code: number | null | undefined;
+  if (timeoutMs === undefined) {
+    code = await completion;
+  } else if (await waitForServerCommand(completion, timeoutMs)) {
+    code = await completion;
+  } else {
+    timedOut = true;
+    failures.push(new Error(`${command} did not finish within ${timeoutMs}ms`));
+    try {
+      if (!child.kill('SIGKILL')) {
+        failures.push(new Error(`${command} could not be killed after its timeout`));
+      }
+    } catch (error) {
+      failures.push(error);
     }
-  }).finally(() => {
-    if (timeout !== undefined) {
-      clearTimeout(timeout);
+    if (await waitForServerCommand(completion, timeoutMs)) {
+      code = await completion;
+    } else {
+      failures.push(
+        new UnconfirmedServerCommandReapError(
+          `${command} was not reaped within ${timeoutMs}ms after SIGKILL`,
+          completion,
+        ),
+      );
+      retainedUnreapedServerCommands.add(child);
+      void completion.then(
+        () => retainedUnreapedServerCommands.delete(child),
+        () => {},
+      );
     }
-  });
-  if (code !== 0) {
-    throw new Error(`${command} exited with status ${code}`);
   }
+  if (code !== undefined && code !== 0 && !timedOut) {
+    failures.push(new Error(`${command} exited with status ${code}`));
+  }
+  throwCollectedCloseFailures(failures, `${command} execution failed`);
   const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -605,8 +819,30 @@ async function runCommand(
   return out;
 }
 
-async function waitForChild(child: ManagedChild, timeoutMs: number): Promise<boolean> {
-  return Promise.race([child.wait().then(() => true), sleep(timeoutMs).then(() => false)]);
+async function waitForServerCommand(
+  completion: Promise<number | null>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolveTimeout) => {
+    timeoutHandle = setTimeout(() => resolveTimeout(false), timeoutMs);
+    timeoutHandle.unref();
+  });
+  try {
+    return await Promise.race([completion.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function unconfirmedServerCommandCompletion(error: unknown): Promise<number | null> | undefined {
+  if (error instanceof UnconfirmedServerCommandReapError) return error.completion;
+  if (!(error instanceof AggregateError)) return undefined;
+  for (const failure of error.errors) {
+    const completion = unconfirmedServerCommandCompletion(failure);
+    if (completion !== undefined) return completion;
+  }
+  return undefined;
 }
 
 function sleep(ms: number): Promise<void> {

@@ -39,6 +39,23 @@ PG_FUNCTION_INFO_V1(liboliphaunt_smoke_static_answer);
 
 static int liboliphaunt_smoke_static_init_calls = 0;
 
+#if defined(_MSC_VER)
+#define OLIPHAUNT_SMOKE_THREAD_LOCAL __declspec(thread)
+#else
+#define OLIPHAUNT_SMOKE_THREAD_LOCAL _Thread_local
+#endif
+
+static OLIPHAUNT_SMOKE_THREAD_LOCAL char
+    last_error_buffer[OLIPHAUNT_ERROR_CAPTURE_CAPACITY];
+
+static const char *last_error_message(OliphauntHandle *handle) {
+    (void)oliphaunt_copy_last_error(
+        handle,
+        last_error_buffer,
+        sizeof(last_error_buffer));
+    return last_error_buffer;
+}
+
 Datum liboliphaunt_smoke_static_answer(PG_FUNCTION_ARGS) {
     (void)fcinfo;
     PG_RETURN_INT32(2718);
@@ -62,7 +79,7 @@ static void push_query(unsigned char **buf, size_t *len, const char *sql) {
 }
 
 static int expect_error_contains(OliphauntHandle *db, const char *context, const char *needle) {
-    const char *message = oliphaunt_last_error(db);
+    const char *message = last_error_message(db);
     if (message == NULL || strstr(message, needle) == NULL) {
         fprintf(stderr, "%s did not set expected error containing '%s': %s\n",
                 context,
@@ -135,7 +152,7 @@ static int verify_global_contract(void) {
     OliphauntConfig invalid_flags = {
         .abi_version = OLIPHAUNT_ABI_VERSION,
         .pgdata = "/tmp/oliphaunt-invalid-flags-pgdata",
-        .reserved_flags = 1ull << 63,
+        .flags = 1ull << 63,
     };
     if (oliphaunt_init(&invalid_flags, &invalid) == 0 || invalid != NULL) {
         fprintf(stderr, "oliphaunt_init accepted unknown config flags\n");
@@ -145,6 +162,46 @@ static int verify_global_contract(void) {
         return 1;
     }
     if (expect_error_contains(NULL, "oliphaunt_init invalid flags", "invalid oliphaunt_init config flags") != 0) {
+        return 1;
+    }
+    const char *const owned_storage_gucs[] = {
+        "CONFIG_FILE=/tmp/other.conf",
+        "data_directory=/tmp/other",
+    };
+    for (size_t i = 0; i < sizeof(owned_storage_gucs) / sizeof(owned_storage_gucs[0]); i++) {
+        const char *const startup_args[] = {"-c", owned_storage_gucs[i]};
+        OliphauntConfig redirected_storage = {
+            .abi_version = OLIPHAUNT_ABI_VERSION,
+            .pgdata = "/tmp/oliphaunt-invalid-storage-redirection",
+            .startup_args = startup_args,
+            .startup_arg_count = sizeof(startup_args) / sizeof(startup_args[0]),
+        };
+        if (oliphaunt_init(&redirected_storage, &invalid) == 0 || invalid != NULL) {
+            fprintf(stderr, "oliphaunt_init accepted storage-routing GUC %s\n", owned_storage_gucs[i]);
+            if (invalid != NULL) {
+                oliphaunt_close(invalid);
+            }
+            return 1;
+        }
+        if (expect_error_contains(NULL, "oliphaunt_init storage-routing GUC", "Oliphaunt owns") != 0) {
+            return 1;
+        }
+    }
+    const char *const malformed_startup_args[] = {"-c", "bad-name=value"};
+    OliphauntConfig malformed_startup_config = {
+        .abi_version = OLIPHAUNT_ABI_VERSION,
+        .pgdata = "/tmp/oliphaunt-invalid-startup-guc",
+        .startup_args = malformed_startup_args,
+        .startup_arg_count = sizeof(malformed_startup_args) / sizeof(malformed_startup_args[0]),
+    };
+    if (oliphaunt_init(&malformed_startup_config, &invalid) == 0 || invalid != NULL) {
+        fprintf(stderr, "oliphaunt_init accepted a malformed startup GUC name\n");
+        if (invalid != NULL) {
+            oliphaunt_close(invalid);
+        }
+        return 1;
+    }
+    if (expect_error_contains(NULL, "oliphaunt_init malformed startup GUC", "dot-separated components") != 0) {
         return 1;
     }
     OliphauntConfig invalid_module_config = {
@@ -322,7 +379,7 @@ static int register_static_extension_fixture(void) {
         },
     };
     if (oliphaunt_register_static_extensions(extensions, sizeof(extensions) / sizeof(extensions[0])) != 0) {
-        fprintf(stderr, "oliphaunt_register_static_extensions failed: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "oliphaunt_register_static_extensions failed: %s\n", last_error_message(NULL));
         return 1;
     }
     return 0;
@@ -507,7 +564,7 @@ static int verify_shared_wal_range_fixture(void) {
                 fprintf(stderr, "shared WAL range case %s produced %s: %s\n",
                         cases[i].name,
                         collector.value,
-                        oliphaunt_last_error(NULL));
+                        last_error_message(NULL));
                 return 1;
             }
         } else {
@@ -593,7 +650,7 @@ static int verify_wal_range_archive_selection(const char *pgdata) {
         write_sparse_file(unrelated_path, segment_size) != 0 ||
         oliphaunt_archive_append_wal_range(
             &archive, NULL, root, required_start, required_stop, segment_size) != 0) {
-        fprintf(stderr, "failed to archive exact required WAL range: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "failed to archive exact required WAL range: %s\n", last_error_message(NULL));
         free(archive.data);
         (void)oliphaunt_remove_tree(root);
         return 1;
@@ -636,6 +693,14 @@ typedef struct StreamAccumulator {
     size_t cap;
     size_t chunks;
 } StreamAccumulator;
+
+typedef struct StreamReentrancyProbe {
+    OliphauntHandle *db;
+    uint64_t generation;
+    StreamAccumulator response;
+    int checked;
+    int failed;
+} StreamReentrancyProbe;
 
 typedef struct CancelQueryThread {
     OliphauntHandle *db;
@@ -699,7 +764,7 @@ static int exec_query_expect_tags(
     int rc = oliphaunt_exec_protocol(db, query, query_len, &response);
     free(query);
     if (rc != 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_exec_protocol failed: %s\n", last_error_message(db));
         return 1;
     }
     for (size_t i = 0; i < tag_count; i++) {
@@ -723,7 +788,7 @@ static int exec_query_expect_bytes(OliphauntHandle *db, const char *sql, const c
     int rc = oliphaunt_exec_protocol(db, query, query_len, &response);
     free(query);
     if (rc != 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_exec_protocol failed: %s\n", last_error_message(db));
         return 1;
     }
     if (!contains_bytes(&response, needle)) {
@@ -740,7 +805,7 @@ static int exec_simple_query_expect_bytes(OliphauntHandle *db, const char *sql, 
     fprintf(stderr, "executing simple query ABI: %s\n", sql);
     int rc = oliphaunt_exec_simple_query(db, sql, strlen(sql), &response);
     if (rc != 0) {
-        fprintf(stderr, "oliphaunt_exec_simple_query failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_exec_simple_query failed: %s\n", last_error_message(db));
         return 1;
     }
     if (!contains_bytes(&response, needle)) {
@@ -775,18 +840,18 @@ static int exec_invalid_argument_checks(OliphauntHandle *db) {
     if (expect_error_contains(db, "oliphaunt_exec_protocol null out", "invalid oliphaunt_exec_protocol arguments") != 0) {
         return 1;
     }
-    if (oliphaunt_exec_protocol_stream(db, &byte, sizeof(byte), NULL, NULL) == 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol_stream accepted null callback\n");
+    if (oliphaunt_exec_protocol_raw_stream(db, &byte, sizeof(byte), NULL, NULL) == 0) {
+        fprintf(stderr, "oliphaunt_exec_protocol_raw_stream accepted null callback\n");
         return 1;
     }
-    if (expect_error_contains(db, "oliphaunt_exec_protocol_stream null callback", "invalid oliphaunt_exec_protocol_stream arguments") != 0) {
+    if (expect_error_contains(db, "oliphaunt_exec_protocol_raw_stream null callback", "invalid oliphaunt_exec_protocol_raw_stream arguments") != 0) {
         return 1;
     }
-    if (oliphaunt_exec_protocol_stream(db, NULL, 1, append_stream_chunk, NULL) == 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol_stream accepted null request with non-zero length\n");
+    if (oliphaunt_exec_protocol_raw_stream(db, NULL, 1, append_stream_chunk, NULL) == 0) {
+        fprintf(stderr, "oliphaunt_exec_protocol_raw_stream accepted null request with non-zero length\n");
         return 1;
     }
-    if (expect_error_contains(db, "oliphaunt_exec_protocol_stream null request", "invalid oliphaunt_exec_protocol_stream arguments") != 0) {
+    if (expect_error_contains(db, "oliphaunt_exec_protocol_raw_stream null request", "invalid oliphaunt_exec_protocol_raw_stream arguments") != 0) {
         return 1;
     }
     if (oliphaunt_exec_simple_query(db, NULL, 0, &response) == 0) {
@@ -843,7 +908,7 @@ static int expect_malformed_stream_rejected(
     size_t request_len,
     const char *needle) {
     StreamAccumulator acc = {0};
-    if (oliphaunt_exec_protocol_stream(db, request, request_len, append_stream_chunk, &acc) == 0) {
+    if (oliphaunt_exec_protocol_raw_stream(db, request, request_len, append_stream_chunk, &acc) == 0) {
         fprintf(stderr, "%s was accepted as a streaming raw protocol request\n", context);
         free(acc.data);
         return 1;
@@ -922,6 +987,59 @@ static int32_t append_stream_chunk(void *context, const uint8_t *data, size_t le
     return 0;
 }
 
+static void record_stream_reentrancy_result(
+    StreamReentrancyProbe *probe,
+    const char *operation,
+    int32_t rc) {
+    const char *error = last_error_message(probe->db);
+    if (rc == 0 || error == NULL ||
+        strstr(error, "busy delivering a raw protocol stream") == NULL) {
+        fprintf(
+            stderr,
+            "%s was not rejected as stream reentrancy: rc=%d error=%s\n",
+            operation,
+            (int)rc,
+            error != NULL ? error : "(null)");
+        probe->failed = 1;
+    }
+}
+
+static int32_t probe_stream_reentrancy(void *context, const uint8_t *data, size_t len) {
+    StreamReentrancyProbe *probe = (StreamReentrancyProbe *)context;
+    if (!probe->checked) {
+        probe->checked = 1;
+
+        OliphauntResponse response = {0};
+        static const char sql[] = "SELECT 0";
+        record_stream_reentrancy_result(
+            probe,
+            "oliphaunt_exec_simple_query from a stream callback",
+            oliphaunt_exec_simple_query(probe->db, sql, sizeof(sql) - 1, &response));
+        oliphaunt_free_response(&response);
+
+        response = (OliphauntResponse){0};
+        record_stream_reentrancy_result(
+            probe,
+            "oliphaunt_backup from a stream callback",
+            oliphaunt_backup(probe->db, &response));
+        oliphaunt_free_response(&response);
+
+        record_stream_reentrancy_result(
+            probe,
+            "oliphaunt_detach from a stream callback",
+            oliphaunt_detach(probe->db));
+        record_stream_reentrancy_result(
+            probe,
+            "oliphaunt_close_if_generation from a stream callback",
+            oliphaunt_close_if_generation(probe->generation));
+        record_stream_reentrancy_result(
+            probe,
+            "oliphaunt_close from a stream callback",
+            oliphaunt_close(probe->db));
+    }
+    return append_stream_chunk(&probe->response, data, len);
+}
+
 static int32_t fail_stream_chunk(void *context, const uint8_t *data, size_t len) {
     (void)data;
     (void)len;
@@ -941,10 +1059,10 @@ static int exec_stream_expect_tags(
 
     StreamAccumulator acc = {0};
     fprintf(stderr, "streaming raw protocol: %s\n", sql);
-    int rc = oliphaunt_exec_protocol_stream(db, query, query_len, append_stream_chunk, &acc);
+    int rc = oliphaunt_exec_protocol_raw_stream(db, query, query_len, append_stream_chunk, &acc);
     free(query);
     if (rc != 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol_stream failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_exec_protocol_raw_stream failed: %s\n", last_error_message(db));
         free(acc.data);
         return 1;
     }
@@ -975,11 +1093,15 @@ static int exec_stream_callback_failure_recovers(OliphauntHandle *db) {
 
     StreamAccumulator acc = {0};
     fprintf(stderr, "streaming raw protocol with failing callback\n");
-    int rc = oliphaunt_exec_protocol_stream(db, query, query_len, fail_stream_chunk, &acc);
+    int rc = oliphaunt_exec_protocol_raw_stream(db, query, query_len, fail_stream_chunk, &acc);
     free(query);
     free(acc.data);
-    if (rc == 0) {
-        fprintf(stderr, "oliphaunt_exec_protocol_stream succeeded despite callback failure\n");
+    if (rc != OLIPHAUNT_STREAM_CALLBACK_ABORTED) {
+        fprintf(
+            stderr,
+            "oliphaunt_exec_protocol_raw_stream returned %d for callback failure, expected %d\n",
+            rc,
+            OLIPHAUNT_STREAM_CALLBACK_ABORTED);
         return 1;
     }
     if (acc.chunks == 0) {
@@ -993,6 +1115,50 @@ static int exec_stream_callback_failure_recovers(OliphauntHandle *db) {
     return exec_query_expect_tags(db, "SELECT 4 AS recovered_after_callback_failure", select_tags, sizeof(select_tags));
 }
 
+static int exec_stream_reentrancy_is_rejected(OliphauntHandle *db) {
+    unsigned char *query = NULL;
+    size_t query_len = 0;
+    push_query(&query, &query_len, "SELECT repeat('r', 4096) AS reentrancy_guard");
+
+    StreamReentrancyProbe probe = {
+        .db = db,
+        .generation = oliphaunt_logical_generation(db),
+    };
+    fprintf(stderr, "streaming raw protocol with reentrancy probes\n");
+    int rc = oliphaunt_exec_protocol_raw_stream(
+        db,
+        query,
+        query_len,
+        probe_stream_reentrancy,
+        &probe);
+    free(query);
+    if (rc != 0 || !probe.checked || probe.failed) {
+        fprintf(
+            stderr,
+            "raw stream reentrancy guard failed: rc=%d checked=%d failed=%d error=%s\n",
+            rc,
+            probe.checked,
+            probe.failed,
+            last_error_message(db));
+        free(probe.response.data);
+        return 1;
+    }
+    OliphauntResponse response = {
+        .data = probe.response.data,
+        .len = probe.response.len,
+    };
+    const unsigned char tags[] = {'T', 'D', 'C', 'Z'};
+    for (size_t i = 0; i < sizeof(tags); i++) {
+        if (!contains_tag(&response, tags[i])) {
+            fprintf(stderr, "reentrancy-probe stream response omitted tag %c\n", tags[i]);
+            free(probe.response.data);
+            return 1;
+        }
+    }
+    free(probe.response.data);
+    return 0;
+}
+
 static void *cancel_query_thread_main(void *context) {
     CancelQueryThread *state = (CancelQueryThread *)context;
     unsigned char *query = NULL;
@@ -1004,7 +1170,7 @@ static void *cancel_query_thread_main(void *context) {
     int rc = oliphaunt_exec_protocol(state->db, query, query_len, &response);
     free(query);
     if (rc != 0) {
-        fprintf(stderr, "cancellable query failed at ABI level: %s\n", oliphaunt_last_error(state->db));
+        fprintf(stderr, "cancellable query failed at ABI level: %s\n", last_error_message(state->db));
         state->status = 1;
         return NULL;
     }
@@ -1041,7 +1207,7 @@ static int exec_cancel_recovers(OliphauntHandle *db) {
     smoke_sleep_millis(100);
     fprintf(stderr, "cancelling active raw protocol query\n");
     if (oliphaunt_cancel(db) != 0) {
-        fprintf(stderr, "oliphaunt_cancel failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_cancel failed: %s\n", last_error_message(db));
         pthread_join(thread, NULL);
         return 1;
     }
@@ -1857,7 +2023,7 @@ static int verify_restore_masks_tar_modes(const char *pgdata) {
         .len = archive.len,
     };
     if (oliphaunt_restore(&options) != 0) {
-        fprintf(stderr, "oliphaunt_restore rejected masked archive modes: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "oliphaunt_restore rejected masked archive modes: %s\n", last_error_message(NULL));
         return 1;
     }
 
@@ -2088,7 +2254,7 @@ static int verify_restore_accepts_canonicalized_tar_paths(const char *pgdata) {
         .len = archive.len,
     };
     if (oliphaunt_restore(&options) != 0) {
-        fprintf(stderr, "oliphaunt_restore rejected a canonicalizable archive path: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "oliphaunt_restore rejected a canonicalizable archive path: %s\n", last_error_message(NULL));
         return 1;
     }
 
@@ -2257,7 +2423,7 @@ static int verify_backup_restore_contract(OliphauntHandle *db, const char *pgdat
     if (oliphaunt_backup(db, &archive) != 0) {
         (void)remove(transient_backup_manifest);
         (void)remove(transient_ds_store);
-        fprintf(stderr, "oliphaunt_backup failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_backup failed: %s\n", last_error_message(db));
         return 1;
     }
     (void)remove(transient_backup_manifest);
@@ -2321,7 +2487,7 @@ static int verify_backup_restore_contract(OliphauntHandle *db, const char *pgdat
         .len = archive.len,
     };
     if (oliphaunt_restore(&empty_root_options) != 0) {
-        fprintf(stderr, "oliphaunt_restore rejected an existing empty target: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "oliphaunt_restore rejected an existing empty target: %s\n", last_error_message(NULL));
         oliphaunt_free_response(&archive);
         return 1;
     }
@@ -2372,7 +2538,7 @@ static int verify_backup_restore_contract(OliphauntHandle *db, const char *pgdat
     };
     fprintf(stderr, "restoring physical backup through C ABI: %s\n", restore_root);
     if (oliphaunt_restore(&options) != 0) {
-        fprintf(stderr, "oliphaunt_restore failed: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "oliphaunt_restore failed: %s\n", last_error_message(NULL));
         oliphaunt_free_response(&archive);
         return 1;
     }
@@ -2406,7 +2572,7 @@ static int run_cycle(const char *pgdata, const char *runtime_dir) {
         .runtime_dir = runtime_dir,
         .username = "postgres",
         .database = "postgres",
-        .reserved_flags = 0,
+        .flags = 0,
         .startup_args = startup_args,
         .startup_arg_count = sizeof(startup_args) / sizeof(startup_args[0]),
     };
@@ -2414,7 +2580,7 @@ static int run_cycle(const char *pgdata, const char *runtime_dir) {
     fprintf(stderr, "opening pgdata: %s\n", pgdata);
     int rc = oliphaunt_init(&config, &db);
     if (rc != 0 || db == NULL) {
-        fprintf(stderr, "oliphaunt_init failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_init failed: %s\n", last_error_message(db));
         return 1;
     }
     uint64_t first_generation = oliphaunt_logical_generation(db);
@@ -2509,6 +2675,11 @@ static int run_cycle(const char *pgdata, const char *runtime_dir) {
         return 1;
     }
 
+    if (exec_stream_reentrancy_is_rejected(db) != 0) {
+        oliphaunt_close(db);
+        return 1;
+    }
+
     if (exec_cancel_recovers(db) != 0) {
         oliphaunt_close(db);
         return 1;
@@ -2547,7 +2718,7 @@ static int run_cycle(const char *pgdata, const char *runtime_dir) {
     fprintf(stderr, "detaching logical database handle\n");
     rc = oliphaunt_detach(db);
     if (rc != 0) {
-        fprintf(stderr, "oliphaunt_detach failed: %s\n", oliphaunt_last_error(db));
+        fprintf(stderr, "oliphaunt_detach failed: %s\n", last_error_message(db));
         oliphaunt_close(db);
         return 1;
     }
@@ -2584,7 +2755,7 @@ static int run_cycle(const char *pgdata, const char *runtime_dir) {
     OliphauntHandle *reopened = NULL;
     rc = oliphaunt_init(&config, &reopened);
     if (rc != 0 || reopened == NULL) {
-        fprintf(stderr, "same-process logical reopen failed: %s\n", oliphaunt_last_error(NULL));
+        fprintf(stderr, "same-process logical reopen failed: %s\n", last_error_message(NULL));
         oliphaunt_close(db);
         return 1;
     }
@@ -2628,7 +2799,7 @@ static int expect_terminal_shutdown_reopen_rejected(const char *pgdata, const ch
         .runtime_dir = runtime_dir,
         .username = "postgres",
         .database = "postgres",
-        .reserved_flags = 0,
+        .flags = 0,
     };
     OliphauntHandle *db = NULL;
     fprintf(stderr, "verifying terminal direct shutdown remains process-final\n");

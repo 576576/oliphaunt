@@ -18,6 +18,22 @@ owners:
     "tools/**": ["@oliphaunt/sdk-js", "@oliphaunt/sdk-react-native"]
 
 tasks:
+  sync:
+    description: "Regenerate SDK mirrors from the canonical JavaScript query and protocol core."
+    command: "node src/shared/js-core/tools/check-js-core.mjs --write"
+    inputs:
+      - "/src/shared/js-core/src/*.ts"
+      - "/src/shared/js-core/tools/check-js-core.mjs"
+    outputs:
+      - "/src/sdks/js/src/protocol.ts"
+      - "/src/sdks/js/src/query.ts"
+      - "/src/sdks/react-native/src/protocol.ts"
+      - "/src/sdks/react-native/src/query.ts"
+      - "/src/bindings/wasix-ts/src/protocol.ts"
+      - "/src/bindings/wasix-ts/src/query.ts"
+    options:
+      cache: false
+      runFromWorkspaceRoot: true
   check:
     tags: ["quality", "static"]
     command: "node src/shared/js-core/tools/check-js-core.mjs"
@@ -29,6 +45,15 @@ tasks:
       - "/src/sdks/react-native/src/query.ts"
       - "/src/bindings/wasix-ts/src/protocol.ts"
       - "/src/bindings/wasix-ts/src/query.ts"
+    options:
+      cache: true
+      runFromWorkspaceRoot: true
+  test:
+    tags: ["quality", "unit"]
+    command: "tools/dev/bun.sh x vitest run src/shared/js-core/test/query.test.ts"
+    inputs:
+      - "/src/shared/js-core/**/*"
+      - "/src/shared/fixtures/protocol/**/*"
     options:
       cache: true
       runFromWorkspaceRoot: true

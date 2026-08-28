@@ -74,6 +74,41 @@ class OliphauntAndroidBoundaryTest {
   }
 
   @Test
+  fun forgottenJavaScriptCleanupIsBoundToAnExactProcessGeneration() {
+    val iosSource = File(System.getProperty("user.dir"), "../ios/Oliphaunt.mm").readText()
+    val androidSource = File(
+      System.getProperty("user.dir"),
+      "src/main/java/dev/oliphaunt/reactnative/OliphauntModule.kt",
+    ).readText()
+    val androidJsi = File(
+      System.getProperty("user.dir"),
+      "src/main/cpp/OliphauntJsiBindings.cpp",
+    ).readText()
+
+    assertTrue(
+      "Android must expose the process-owner generation as the opaque JS handle",
+      androidSource.contains("requireReactNativeHandle(claim.generation)"),
+    )
+    assertTrue(
+      "Android forgotten cleanup must compare and remove only the exact generation",
+      androidSource.contains("fun closeIfGeneration(generation: Long)") &&
+        androidSource.contains("claim.generation != key") &&
+        androidSource.contains("sessions.remove(key, session)"),
+    )
+    assertTrue(
+      "Android JSI must route forgotten cleanup to the exact-generation platform map",
+      androidJsi.contains("\"closeIfGeneration\"") &&
+        androidJsi.contains("getMethod<void(jlong)>(\"closeIfGeneration\")"),
+    )
+    assertTrue(
+      "iOS must use its process-owner claim as the opaque JS generation",
+      iosSource.contains("NSNumber *handle = @(claim);") &&
+        iosSource.contains("- (void)closeIfGeneration:(double)generation") &&
+        iosSource.contains("claim != key.unsignedLongLongValue"),
+    )
+  }
+
+  @Test
   fun iosProtocolStreamAcknowledgesEachCallback() {
     val iosSource = File(System.getProperty("user.dir"), "../ios/Oliphaunt.mm").readText()
     val adapterSource = File(
@@ -85,9 +120,13 @@ class OliphauntAndroidBoundaryTest {
       "React Native iOS JSI must use the bounded callback contract",
       iosSource.contains("class OliphauntChunkAcknowledgement") &&
         iosSource.contains("acknowledgement->wait()") &&
-        iosSource.contains("OliphauntProtocolStreamCallbackError") &&
+      iosSource.contains("OliphauntProtocolStreamCallbackError") &&
         adapterSource.contains("if let error = chunkBox.value") &&
-        adapterSource.contains("throw error"),
+        adapterSource.contains("throw ProtocolStreamCallbackFailure(error)"),
+    )
+    assertFalse(
+      "React Native iOS must delegate async work to the Swift SDK owner instead of detached blocking tasks",
+      adapterSource.contains("Task.detached"),
     )
   }
 
@@ -153,10 +192,12 @@ class OliphauntAndroidBoundaryTest {
         moduleSource.contains("session.execProtocolRaw(request)"),
     )
     assertTrue(
-      "React Native Android must stream through the Kotlin SDK and propagate acknowledged callback failures",
+      "React Native Android must classify recovered callback aborts with a private Kotlin sentinel",
       moduleSource.contains("fun execProtocolStreamBytes") &&
-        moduleSource.contains("session.execProtocolStream(request)") &&
-        moduleSource.contains("callback.emitChunk(chunk)"),
+        moduleSource.contains("session.execProtocolRawStream(request)") &&
+        moduleSource.contains("callback.emitChunk(chunk)") &&
+        moduleSource.contains("ReactNativeProtocolStreamCallbackFailure") &&
+        moduleSource.contains("callback.rejectCallbackAborted(error.callbackError.message)"),
     )
     assertTrue(
       "React Native Android must expose byte-array JSI backup/restore hooks instead of base64 TurboModule binary APIs",
@@ -172,6 +213,18 @@ class OliphauntAndroidBoundaryTest {
     assertFalse(
       "React Native Android must use the Kotlin SDK facade instead of constructing AndroidNativeDirectEngine",
       moduleSource.contains("AndroidNativeDirectEngine"),
+    )
+    val invalidateSource = moduleSource
+      .substringAfter("override fun invalidate")
+      .substringBefore("fun restoreBytes")
+    assertTrue(
+      "React Native Android invalidation must schedule native SDK cleanup asynchronously",
+      invalidateSource.contains("scope.launch") &&
+        invalidateSource.contains("session.close()"),
+    )
+    assertFalse(
+      "React Native Android invalidation must never block the main or UI thread",
+      invalidateSource.contains("runBlocking"),
     )
 
     val jsiSource = File(nativeSourceDir, "OliphauntJsiBindings.cpp").readText()
@@ -193,14 +246,32 @@ class OliphauntAndroidBoundaryTest {
         jsiSource.contains("acknowledgement->wait()") &&
         jsiSource.contains("protocol stream callback failed"),
     )
+    val emitChunkSource = jsiSource
+      .substringAfter("static jni::local_ref<jni::JString> nativeEmitChunk")
+      .substringBefore("static void nativeResolveUnit")
+    assertFalse(
+      "React Native Android must not settle or remove the JS stream before Kotlin reports native recovery",
+      emitChunkSource.contains("takePendingStream") || emitChunkSource.contains("stream->settle()"),
+    )
+    assertTrue(
+      "React Native Android must expose a typed recovered callback-abort completion marker",
+      jsiSource.contains("nativeRejectCallbackAborted") &&
+        jsiSource.contains("__oliphauntProtocolCallbackAborted"),
+    )
+    assertTrue(
+      "React Native JSI operations must return promises and delegate execution to Kotlin callbacks",
+      jsiSource.contains("getPropertyAsFunction(runtime, \"Promise\")") &&
+        jsiSource.contains("execProtocolRawBytes"),
+    )
     val callbackSource = File(
       System.getProperty("user.dir"),
       "src/main/java/dev/oliphaunt/reactnative/OliphauntJsiStreamCallback.kt",
     ).readText()
     assertTrue(
-      "React Native Android must surface a failed JSI acknowledgement to the Kotlin producer",
+      "React Native Android must surface callback failure to Kotlin and defer JS rejection until typed completion",
       callbackSource.contains("nativeEmitChunk(token, chunk)?.let") &&
-        callbackSource.contains("throw IllegalStateException(error)"),
+        callbackSource.contains("throw IllegalStateException(error)") &&
+        callbackSource.contains("nativeRejectCallbackAborted"),
     )
   }
 

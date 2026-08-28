@@ -39,6 +39,7 @@ macos_module_nm_audit="$repo_root/src/runtimes/liboliphaunt/native/tools/audit-m
 macos_provider_collision_audit="$repo_root/src/runtimes/liboliphaunt/native/tools/audit-macos-provider-collisions.awk"
 liboliphaunt_sources=(
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_native.c"
+  "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_error.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_runtime.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_protocol.c"
   "$repo_root/src/runtimes/liboliphaunt/native/src/liboliphaunt_config.c"
@@ -659,16 +660,23 @@ liboliphaunt_artifact_ready() {
     _oliphaunt_init \
     _oliphaunt_exec_protocol \
     _oliphaunt_exec_simple_query \
-    _oliphaunt_exec_protocol_stream \
+    _oliphaunt_exec_protocol_raw_stream \
     _oliphaunt_backup \
     _oliphaunt_restore \
+    _oliphaunt_init_with_error \
+    _oliphaunt_exec_protocol_with_error \
+    _oliphaunt_exec_simple_query_with_error \
+    _oliphaunt_exec_protocol_raw_stream_with_error \
+    _oliphaunt_backup_with_error \
+    _oliphaunt_restore_with_error \
+    _oliphaunt_detach_with_error \
     _oliphaunt_cancel \
     _oliphaunt_detach \
     _oliphaunt_logical_generation \
     _oliphaunt_close_if_generation \
     _oliphaunt_close \
     _oliphaunt_register_static_extensions \
-    _oliphaunt_last_error \
+    _oliphaunt_copy_last_error \
     _oliphaunt_version \
     _oliphaunt_free_response \
     _oliphaunt_embedded_kill \

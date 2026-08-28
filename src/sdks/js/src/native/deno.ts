@@ -13,34 +13,48 @@ import {
   nativePostgresChildEnvironment,
 } from './initialize.js';
 import {
+  errorCaptureBuffer,
   packConfigPointers,
   packRestoreOptionsPointers,
+  readErrorCapture,
   readResponseLength,
   readResponsePointer,
   responseBuffer,
 } from './ffi-layout.js';
-import type {
-  NativeBinding,
-  NativeBindingOptions,
-  NativeHandle,
-  NativeOpenConfig,
-  NativeRestoreOptions,
+import {
+  NativeDetachOutcomeUnknownError,
+  type NativeBinding,
+  type NativeBindingOptions,
+  type NativeHandle,
+  type NativeOpenConfig,
+  type NativeRestoreOptions,
 } from './types.js';
 import { resolveExactNativeRuntimeProfile } from './runtime-profile.js';
 
 type DenoPointer = object | null;
+const OLIPHAUNT_STREAM_CALLBACK_ABORTED = 1;
 type DenoSymbols = {
-  oliphaunt_init: (config: Uint8Array, out: Uint8Array) => number;
-  oliphaunt_exec_protocol: (...args: unknown[]) => Promise<number>;
-  oliphaunt_exec_protocol_stream: (...args: unknown[]) => number;
-  oliphaunt_exec_simple_query: (...args: unknown[]) => Promise<number>;
-  oliphaunt_backup: (...args: unknown[]) => Promise<number>;
-  oliphaunt_restore: (...args: unknown[]) => Promise<number>;
+  oliphaunt_init_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_exec_protocol_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_exec_protocol_raw_stream_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_exec_simple_query_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_backup_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_restore_with_error: (...args: unknown[]) => Promise<number>;
   oliphaunt_cancel: (...args: unknown[]) => unknown;
-  oliphaunt_detach: (...args: unknown[]) => unknown;
-  oliphaunt_last_error: (...args: unknown[]) => unknown;
+  oliphaunt_detach_with_error: (...args: unknown[]) => Promise<number>;
+  oliphaunt_logical_generation: (...args: unknown[]) => bigint;
+  oliphaunt_close_if_generation: (...args: unknown[]) => Promise<number>;
+  oliphaunt_copy_last_error: (...args: unknown[]) => unknown;
   oliphaunt_free_response: (...args: unknown[]) => unknown;
 };
+
+type DenoForgottenHandle = {
+  readonly generation: bigint;
+  readonly releaseOwnership: () => void;
+};
+
+let denoDirectAdmissionClosed = false;
+let denoDirectAdmissionFailure: unknown;
 
 export async function createDenoNativeBinding(
   options: NativeBindingOptions = {},
@@ -50,36 +64,86 @@ export async function createDenoNativeBinding(
   applyNativeIcuDataEnvironment(install.icuDataDirectory);
   applyNativeRuntimeLibraryEnvironment(install.runtimeDirectory);
   const dylib = deno.dlopen(install.libraryPath, {
-    oliphaunt_init: { parameters: ['buffer', 'buffer'], result: 'i32' },
-    oliphaunt_exec_protocol: {
-      parameters: ['pointer', 'buffer', 'usize', 'buffer'],
+    oliphaunt_init_with_error: {
+      parameters: ['buffer', 'buffer', 'buffer'],
       result: 'i32',
       nonblocking: true,
     },
-    oliphaunt_exec_protocol_stream: {
-      parameters: ['pointer', 'buffer', 'usize', 'function', 'pointer'],
-      result: 'i32',
-    },
-    oliphaunt_exec_simple_query: {
-      parameters: ['pointer', 'buffer', 'usize', 'buffer'],
+    oliphaunt_exec_protocol_with_error: {
+      parameters: ['pointer', 'buffer', 'usize', 'buffer', 'buffer'],
       result: 'i32',
       nonblocking: true,
     },
-    oliphaunt_backup: {
+    oliphaunt_exec_protocol_raw_stream_with_error: {
+      parameters: ['pointer', 'buffer', 'usize', 'function', 'pointer', 'buffer'],
+      result: 'i32',
+      nonblocking: true,
+    },
+    oliphaunt_exec_simple_query_with_error: {
+      parameters: ['pointer', 'buffer', 'usize', 'buffer', 'buffer'],
+      result: 'i32',
+      nonblocking: true,
+    },
+    oliphaunt_backup_with_error: {
+      parameters: ['pointer', 'buffer', 'buffer'],
+      result: 'i32',
+      nonblocking: true,
+    },
+    oliphaunt_restore_with_error: {
+      parameters: ['buffer', 'buffer'],
+      result: 'i32',
+      nonblocking: true,
+    },
+    oliphaunt_cancel: { parameters: ['pointer'], result: 'i32' },
+    oliphaunt_detach_with_error: {
       parameters: ['pointer', 'buffer'],
       result: 'i32',
       nonblocking: true,
     },
-    oliphaunt_restore: { parameters: ['buffer'], result: 'i32', nonblocking: true },
-    oliphaunt_cancel: { parameters: ['pointer'], result: 'i32' },
-    oliphaunt_detach: { parameters: ['pointer'], result: 'i32' },
-    oliphaunt_last_error: { parameters: ['pointer'], result: 'pointer' },
+    oliphaunt_logical_generation: {
+      parameters: ['pointer'],
+      result: 'u64',
+    },
+    oliphaunt_close_if_generation: {
+      parameters: ['u64'],
+      result: 'i32',
+      nonblocking: true,
+    },
+    oliphaunt_copy_last_error: {
+      parameters: ['pointer', 'buffer', 'usize'],
+      result: 'usize',
+    },
     oliphaunt_free_response: { parameters: ['buffer'], result: 'void' },
   });
   const symbols = dylib.symbols as DenoSymbols;
+  const generations = new WeakMap<object, bigint>();
+  const uncertainDetaches = new WeakMap<object, NativeDetachOutcomeUnknownError>();
+  const forgottenHandles = new FinalizationRegistry<DenoForgottenHandle>(
+    ({ generation, releaseOwnership }) => {
+      // A finalizer may only enqueue nonblocking FFI. Generation-guarded close
+      // atomically becomes a no-op when this cleanup record no longer owns the
+      // resident logical lease, so it can never dereference a stale pointer or
+      // terminate a newer Deno handle.
+      void closeDenoGeneration(symbols, generation).then(
+        () => {
+          try {
+            releaseOwnership();
+          } catch {
+            // Finalization is unobservable best effort. Never turn an owner
+            // bookkeeping failure into an unhandled rejection.
+          }
+        },
+        () => {
+          // The native process may still own this generation. Keep direct
+          // admission closed rather than publishing an unsafe second owner.
+        },
+      );
+    },
+  );
 
   return {
     async open(config: NativeOpenConfig): Promise<NativeHandle> {
+      assertDenoDirectAdmissionOpen();
       const explicitRuntimeDirectory =
         config.runtimeDirectory !== undefined || install.packageManaged === false;
       let openConfig = {
@@ -108,7 +172,7 @@ export async function createDenoNativeBinding(
           runtimeDirectory: validated.runtimeDirectory,
         };
         // Keep canonical lib/postgresql subprocess-owned during initdb. The
-        // separate lib/modules $libdir is carried in the ABI 7 config.
+        // separate lib/modules $libdir is carried in the native config.
         moduleDirectory = validated.moduleDirectory;
         applyNativeRuntimeLibraryEnvironment(validated.runtimeDirectory);
       }
@@ -136,42 +200,66 @@ export async function createDenoNativeBinding(
         pointerOf(deno, value),
       );
       const out = new Uint8Array(8);
-      const rc = symbols.oliphaunt_init(packed.config, out);
-      keepAlive(packed.keepAlive);
+      const captured = errorCaptureBuffer();
+      let rc: number;
+      try {
+        rc = await symbols.oliphaunt_init_with_error(packed.config, out, captured);
+      } catch (failure) {
+        closeDenoDirectAdmission(failure);
+        throw failure;
+      } finally {
+        keepAlive(packed.keepAlive);
+      }
       if (rc !== 0) {
-        throw errorMessage('native liboliphaunt init failed', rc, lastError(deno, symbols, null));
+        throw errorMessage('native liboliphaunt init failed', rc, readErrorCapture(captured));
       }
       const handle = pointerFromAddress(deno, readPointer(out));
       if (handle === null) {
-        throw new Error('native liboliphaunt init returned a null handle');
+        const failure = new Error('native liboliphaunt init returned a null handle');
+        closeDenoDirectAdmission(failure);
+        throw failure;
       }
+      const generation = symbols.oliphaunt_logical_generation(handle);
+      if (generation === 0n) {
+        // Zero means the native registry has already rejected this pointer as
+        // stale or non-current. It must not be dereferenced for cleanup.
+        const failure = new Error(
+          'native liboliphaunt init returned an invalid logical generation',
+        );
+        closeDenoDirectAdmission(failure);
+        throw failure;
+      }
+      generations.set(handle, generation);
       return handle;
     },
     async execProtocolRaw(handle: NativeHandle, request: Uint8Array): Promise<Uint8Array> {
       const response = responseBuffer();
-      const rc = await symbols.oliphaunt_exec_protocol(
+      const captured = errorCaptureBuffer();
+      const rc = await symbols.oliphaunt_exec_protocol_with_error(
         handle,
         request,
         BigInt(request.byteLength),
         response,
+        captured,
       );
       if (rc !== 0) {
         symbols.oliphaunt_free_response(response);
         throw errorMessage(
           'native liboliphaunt protocol execution failed',
           rc,
-          lastError(deno, symbols, handle),
+          readErrorCapture(captured),
         );
       }
       return copyResponse(deno, symbols, response);
     },
-    execProtocolStream(
+    async execProtocolStream(
       handle: NativeHandle,
       request: Uint8Array,
       onChunk: (chunk: Uint8Array) => void,
-    ): void {
+    ): Promise<void> {
+      let callbackFailed = false;
       let callbackError: unknown;
-      const callback = new deno.UnsafeCallback(
+      const callback = deno.UnsafeCallback.threadSafe(
         { parameters: ['pointer', 'pointer', 'usize'], result: 'i32' },
         (_data: DenoPointer, bytes: DenoPointer, length: bigint) => {
           try {
@@ -187,33 +275,43 @@ export async function createDenoNativeBinding(
             onChunk(view);
             return 0;
           } catch (error) {
+            callbackFailed = true;
             callbackError = error;
             return 1;
           }
         },
       );
       let rc: number;
+      const captured = errorCaptureBuffer();
       try {
-        rc = symbols.oliphaunt_exec_protocol_stream(
+        rc = await symbols.oliphaunt_exec_protocol_raw_stream_with_error(
           handle,
           request,
           BigInt(request.byteLength),
           callback.pointer,
           null,
+          captured,
         );
       } finally {
         callback.close();
       }
-      if (callbackError !== undefined) {
-        throw callbackError;
-      }
-      if (rc !== 0) {
-        throw errorMessage(
-          'native liboliphaunt protocol streaming failed',
-          rc,
-          lastError(deno, symbols, handle),
+      if (rc === OLIPHAUNT_STREAM_CALLBACK_ABORTED) {
+        if (callbackFailed) throw callbackError;
+        throw new Error(
+          'native liboliphaunt protocol streaming reported a recovered callback abort without a callback failure',
         );
       }
+      if (rc === 0) {
+        if (!callbackFailed) return;
+        throw new Error(
+          'native liboliphaunt protocol streaming reported success after the callback failed',
+        );
+      }
+      throw errorMessage(
+        'native liboliphaunt protocol streaming failed',
+        rc,
+        readErrorCapture(captured),
+      );
     },
     async execSimpleQuery(handle: NativeHandle, sql: string): Promise<Uint8Array> {
       if (sql.includes('\0')) {
@@ -221,68 +319,116 @@ export async function createDenoNativeBinding(
       }
       const bytes = new TextEncoder().encode(sql);
       const response = responseBuffer();
-      const rc = await symbols.oliphaunt_exec_simple_query(
+      const captured = errorCaptureBuffer();
+      const rc = await symbols.oliphaunt_exec_simple_query_with_error(
         handle,
         bytes,
         BigInt(bytes.byteLength),
         response,
+        captured,
       );
       if (rc !== 0) {
         symbols.oliphaunt_free_response(response);
         throw errorMessage(
           'native liboliphaunt simple query failed',
           rc,
-          lastError(deno, symbols, handle),
+          readErrorCapture(captured),
         );
       }
       return copyResponse(deno, symbols, response);
     },
     async backup(handle: NativeHandle): Promise<Uint8Array> {
       const response = responseBuffer();
-      const rc = await symbols.oliphaunt_backup(handle, response);
+      const captured = errorCaptureBuffer();
+      const rc = await symbols.oliphaunt_backup_with_error(handle, response, captured);
       if (rc !== 0) {
         symbols.oliphaunt_free_response(response);
-        throw errorMessage(
-          'native liboliphaunt backup failed',
-          rc,
-          lastError(deno, symbols, handle),
-        );
+        throw errorMessage('native liboliphaunt backup failed', rc, readErrorCapture(captured));
       }
       return copyResponse(deno, symbols, response);
     },
     async restore(options: NativeRestoreOptions): Promise<void> {
       const packed = packRestoreOptionsPointers(options, (value) => pointerOf(deno, value));
-      const rc = await symbols.oliphaunt_restore(packed.options);
+      const captured = errorCaptureBuffer();
+      const rc = await symbols.oliphaunt_restore_with_error(packed.options, captured);
       keepAlive(packed.keepAlive);
       if (rc !== 0) {
-        throw errorMessage(
-          'native liboliphaunt restore failed',
-          rc,
-          lastError(deno, symbols, null),
-        );
+        throw errorMessage('native liboliphaunt restore failed', rc, readErrorCapture(captured));
       }
     },
-    cancel(handle: NativeHandle): void {
+    async cancel(handle: NativeHandle): Promise<void> {
       const rc = symbols.oliphaunt_cancel(handle) as number;
       if (rc !== 0) {
-        throw errorMessage(
-          'native liboliphaunt cancel failed',
-          rc,
-          lastError(deno, symbols, handle),
-        );
+        throw errorMessage('native liboliphaunt cancel failed', rc, lastError(symbols, handle));
       }
     },
-    detach(handle: NativeHandle): void {
-      const rc = symbols.oliphaunt_detach(handle) as number;
-      if (rc !== 0) {
-        throw errorMessage(
-          'native liboliphaunt detach failed',
-          rc,
-          lastError(deno, symbols, handle),
-        );
+    async detach(handle: NativeHandle): Promise<void> {
+      if (typeof handle === 'object' && handle !== null) {
+        const priorFailure = uncertainDetaches.get(handle);
+        if (priorFailure !== undefined) throw priorFailure;
       }
+      const captured = errorCaptureBuffer();
+      let rc: number;
+      try {
+        rc = await symbols.oliphaunt_detach_with_error(handle, captured);
+      } catch (failure) {
+        const terminalFailure = new NativeDetachOutcomeUnknownError(
+          'Deno native detach delivery failed after its outcome became unknown; restart the process before opening another direct database',
+          { cause: failure },
+        );
+        closeDenoDirectAdmission(terminalFailure);
+        if (typeof handle === 'object' && handle !== null) {
+          generations.delete(handle);
+          uncertainDetaches.set(handle, terminalFailure);
+        }
+        throw terminalFailure;
+      }
+      if (rc !== 0) {
+        throw errorMessage('native liboliphaunt detach failed', rc, readErrorCapture(captured));
+      }
+      if (typeof handle === 'object' && handle !== null) {
+        generations.delete(handle);
+      }
+    },
+    registerForgottenHandleCleanup(
+      owner: object,
+      handle: NativeHandle,
+      releaseOwnership: () => void,
+    ): void {
+      if (typeof handle !== 'object' || handle === null) {
+        throw new Error('Deno native cleanup received an invalid handle');
+      }
+      const generation = generations.get(handle);
+      if (generation === undefined || generation === 0n) {
+        throw new Error('Deno native cleanup received a stale logical handle');
+      }
+      forgottenHandles.register(owner, Object.freeze({ generation, releaseOwnership }), owner);
+    },
+    unregisterForgottenHandleCleanup(owner: object): void {
+      forgottenHandles.unregister(owner);
     },
   };
+}
+
+async function closeDenoGeneration(symbols: DenoSymbols, generation: bigint): Promise<void> {
+  const rc = await symbols.oliphaunt_close_if_generation(generation);
+  if (rc !== 0 && rc !== 1) {
+    throw new Error(`native liboliphaunt generation cleanup failed with status ${rc}`);
+  }
+}
+
+function assertDenoDirectAdmissionOpen(): void {
+  if (!denoDirectAdmissionClosed) return;
+  throw new Error(
+    'Deno native direct admission is closed because a prior native lifecycle outcome left ownership unknown; restart the process before opening another direct database',
+    { cause: denoDirectAdmissionFailure },
+  );
+}
+
+function closeDenoDirectAdmission(failure: unknown): void {
+  if (denoDirectAdmissionClosed) return;
+  denoDirectAdmissionClosed = true;
+  denoDirectAdmissionFailure = failure;
 }
 
 async function prepareDenoPgdata(
@@ -371,15 +517,22 @@ function copyResponse(deno: any, symbols: DenoSymbols, response: Uint8Array): Ui
   }
 }
 
-function lastError(deno: any, symbols: DenoSymbols, handle: NativeHandle | null): string | null {
-  return cString(deno, symbols.oliphaunt_last_error(handle) as DenoPointer);
-}
-
-function cString(deno: any, pointer: DenoPointer): string | null {
-  if (pointer === null) {
+function lastError(symbols: DenoSymbols, handle: NativeHandle | null): string | null {
+  let output = new Uint8Array(1024);
+  const reported = Number(
+    symbols.oliphaunt_copy_last_error(handle, output, BigInt(output.byteLength)),
+  );
+  if (!Number.isSafeInteger(reported) || reported < 0) {
+    return 'native liboliphaunt returned an invalid error length';
+  }
+  if (reported >= output.byteLength) {
+    output = new Uint8Array(reported + 1);
+    symbols.oliphaunt_copy_last_error(handle, output, BigInt(output.byteLength));
+  }
+  if (reported === 0) {
     return null;
   }
-  return new deno.UnsafePointerView(pointer).getCString();
+  return new TextDecoder().decode(output.subarray(0, reported));
 }
 
 function keepAlive(_values: ReadonlyArray<Uint8Array>): void {

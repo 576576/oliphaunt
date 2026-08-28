@@ -53,11 +53,6 @@ try {
       throw new Error(`WASIX TypeScript package dry-run omitted ${path}`);
     }
   }
-  for (const removed of ['lib/node-lock-identity.js', 'lib/node-lock-identity.d.ts']) {
-    if (paths.has(removed)) {
-      throw new Error(`WASIX TypeScript package dry-run retained deleted output ${removed}`);
-    }
-  }
   const unexpectedPaths = [...paths].filter((path) => !expectedPaths.has(path)).sort();
   if (unexpectedPaths.length > 0) {
     throw new Error(
@@ -85,10 +80,9 @@ try {
   const exports = packageJson.exports ?? {};
   const expectedExports = [
     '.',
+    './worker',
     './package.json',
     './internal/tools',
-    './protocol',
-    './query',
     './server/bun',
     './server/deno',
     './server/node',
@@ -103,16 +97,6 @@ try {
   }
   if (exports['./storage/indexed-db'] === undefined) {
     throw new Error('WASIX TypeScript package omitted the selective IndexedDB entrypoint');
-  }
-  for (const name of ['protocol', 'query']) {
-    const entry = exports[`./${name}`];
-    if (
-      JSON.stringify(Object.keys(entry ?? {})) !== JSON.stringify(['types', 'default']) ||
-      entry?.types !== `./lib/${name}.d.ts` ||
-      entry?.default !== `./lib/${name}.js`
-    ) {
-      throw new Error(`WASIX TypeScript package ${name} subpath is not exact`);
-    }
   }
   const internalTools = exports['./internal/tools'];
   if (
@@ -185,6 +169,21 @@ try {
       'WASIX TypeScript package omitted its exact browser/Node/Bun/Deno conditional facade',
     );
   }
+  const workerExport = exports['./worker'];
+  if (
+    JSON.stringify(Object.keys(workerExport ?? {})) !==
+      JSON.stringify(['types', 'deno', 'bun', 'node', 'browser', 'default']) ||
+    workerExport?.types !== './lib/worker-entry.d.ts' ||
+    workerExport?.deno !== './lib/worker-entry.deno.js' ||
+    workerExport?.bun !== './lib/worker-entry.bun.js' ||
+    workerExport?.browser !== './lib/worker-entry.js' ||
+    workerExport?.node !== './lib/worker-entry.node.js' ||
+    workerExport?.default !== './lib/worker-entry.js'
+  ) {
+    throw new Error(
+      'WASIX TypeScript package omitted its exact browser/Node/Bun/Deno Worker facade',
+    );
+  }
 
   if (
     packageJson.dependencies?.[runtimePackage] !== undefined ||
@@ -212,6 +211,13 @@ try {
   );
   if (!isDeepStrictEqual(provenance, expectedHostBuild)) {
     throw new Error('WASIX TypeScript package omitted patched-host provenance');
+  }
+
+  const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
+  const nodeHost = await import('../lib/node-host.js');
+  await nodeHost.init();
+  if (!isDeepStrictEqual(Object.getOwnPropertyDescriptor(globalThis, 'Worker'), workerDescriptor)) {
+    throw new Error('WASIX TypeScript direct Node host mutated the caller realm Worker global');
   }
 
   console.log(`wasix-ts package-shape: PASS ${packed.filename}`);

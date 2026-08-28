@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { runWasixPgDumpProcess } from '../database.js';
+import { describe, expect, it, vi } from 'vitest';
+import { runWasixPgDumpProcess, WasixDatabaseImpl } from '../database.js';
+import type { WorkerResponse } from '../rpc.js';
 import { createWorkerSessionDispatcher } from '../worker-dispatch.js';
 import { openWorkerDatabase, WorkerRpc } from '../worker-rpc.js';
 import { FakeWorkerPort, workerOpenOptions } from './worker-helpers.js';
@@ -77,6 +78,31 @@ describe('WASIX worker RPC', () => {
     expect(port.terminations).toBe(1);
   });
 
+  it('preserves both worker-open and termination failures', async () => {
+    const port = new FakeWorkerPort();
+    port.terminate = () => {
+      port.terminations += 1;
+      throw new Error('worker termination failed');
+    };
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const request = port.requests[0]?.message;
+    if (request === undefined) throw new Error('open request was not posted');
+    port.respond({
+      id: request.id,
+      ok: false,
+      error: { name: 'Error', message: 'runtime initialization failed' },
+    });
+
+    const failure = await opening.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) throw new Error('expected aggregate open failure');
+    expect(failure.errors).toEqual([
+      expect.objectContaining({ message: 'runtime initialization failed' }),
+      expect.objectContaining({ message: 'worker termination failed' }),
+    ]);
+    expect(port.terminations).toBe(1);
+  });
+
   it('rejects every pending and later request with one fatal worker error', async () => {
     const port = new FakeWorkerPort();
     const rpc = new WorkerRpc(port);
@@ -85,7 +111,7 @@ describe('WASIX worker RPC', () => {
       input: Uint8Array.of(1),
       persistence: 'sync',
     });
-    const second = rpc.request({ method: 'sync', boundary: 'checkpoint' });
+    const second = rpc.request({ method: 'sync', boundary: 'full' });
     const failure = new Error('worker exited unexpectedly');
     const firstRejection = expect(first).rejects.toBe(failure);
     const secondRejection = expect(second).rejects.toBe(failure);
@@ -97,6 +123,142 @@ describe('WASIX worker RPC', () => {
     await expect(rpc.request({ method: 'close' })).rejects.toBe(failure);
     await rpc.terminate();
     expect(port.terminations).toBe(1);
+  });
+
+  it('makes an idle database terminal when its package Worker crashes', async () => {
+    const port = new FakeWorkerPort();
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const open = await postedRequest(port, 0);
+    port.respond({ id: open.id, ok: true });
+    const database = await opening;
+    const failure = new Error('worker crashed while idle');
+
+    expect(database.closed).toBe(false);
+    port.fail(failure);
+
+    expect(database.closed).toBe(true);
+    const operationFailure = await database.query('select 1').catch((error: unknown) => error);
+    expect(operationFailure).toMatchObject({
+      message: 'Oliphaunt WASIX database is closed',
+      cause: failure,
+    });
+
+    const firstClose = database.close();
+    const secondClose = database.close();
+    expect(secondClose).toBe(firstClose);
+    await expect(firstClose).rejects.toBe(failure);
+    await expect(secondClose).rejects.toBe(failure);
+    expect(database.closed).toBe(true);
+    expect(port.requests.map(({ message }) => message.method)).toEqual(['open']);
+    expect(port.terminations).toBe(1);
+  });
+
+  it('keeps a failed worker close terminal and never posts later work', async () => {
+    const port = new FakeWorkerPort();
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const open = await postedRequest(port, 0);
+    port.respond({ id: open.id, ok: true });
+    const database = await opening;
+
+    const first = database.close();
+    const second = database.close();
+    expect(second).toBe(first);
+    const close = await postedRequest(port, 1);
+    port.respond({
+      id: close.id,
+      ok: false,
+      error: { name: 'Error', message: 'guest close failed' },
+    });
+
+    await expect(first).rejects.toThrow('guest close failed');
+    await expect(second).rejects.toThrow('guest close failed');
+    expect(database.closed).toBe(true);
+    expect(database.close()).toBe(first);
+    await expect(database.execProtocolRaw(Uint8Array.of(1))).rejects.toThrow(
+      'Oliphaunt WASIX database is closed',
+    );
+    expect(port.requests.map(({ message }) => message.method)).toEqual(['open', 'close']);
+    expect(port.terminations).toBe(1);
+  });
+
+  it('preserves both remote-close and worker-termination failures', async () => {
+    const port = new FakeWorkerPort();
+    port.terminate = () => {
+      port.terminations += 1;
+      throw new Error('worker termination failed');
+    };
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const open = await postedRequest(port, 0);
+    port.respond({ id: open.id, ok: true });
+    const database = await opening;
+
+    const closing = database.close();
+    const close = await postedRequest(port, 1);
+    port.respond({
+      id: close.id,
+      ok: false,
+      error: { name: 'Error', message: 'guest close failed' },
+    });
+    const failure = await closing.catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) throw new Error('expected aggregate close failure');
+    expect(failure.errors).toEqual([
+      expect.objectContaining({ message: 'guest close failed' }),
+      expect.objectContaining({ message: 'worker termination failed' }),
+    ]);
+    expect(database.closed).toBe(true);
+    expect(port.terminations).toBe(1);
+  });
+
+  it('does not post an orderly close after a deadline aborts queued worker work', async () => {
+    vi.useFakeTimers();
+    try {
+      const port = new FakeWorkerPort();
+      let finishTermination: (() => void) | undefined;
+      port.terminate = () => {
+        port.terminations += 1;
+        return new Promise<void>((resolve) => {
+          finishTermination = resolve;
+        });
+      };
+      const opening = openWorkerDatabase(port, workerOpenOptions());
+      const open = await postedRequest(port, 0);
+      port.respond({ id: open.id, ok: true });
+      const database = await opening;
+      if (!(database instanceof WasixDatabaseImpl)) {
+        throw new Error('worker open returned an unexpected database handle');
+      }
+      let resourceCloses = 0;
+      database.registerResource({
+        close() {
+          resourceCloses += 1;
+        },
+      });
+
+      const query = database.execProtocolRaw(Uint8Array.of(1));
+      await postedRequest(port, 1);
+      const queryFailure = expect(query).rejects.toThrow('Oliphaunt WASIX worker was terminated');
+      const closing = database.close();
+      const closeFailure = expect(closing).rejects.toThrow(
+        'close exceeded 120000ms; worker termination was requested',
+      );
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await queryFailure;
+      expect(resourceCloses).toBe(0);
+      expect(database.closed).toBe(false);
+
+      finishTermination?.();
+      await closeFailure;
+
+      expect(database.closed).toBe(true);
+      expect(resourceCloses).toBe(1);
+      expect(port.requests.map(({ message }) => message.method)).toEqual(['open', 'exec']);
+      expect(port.terminations).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('preserves deferred execution and explicit sync boundaries across worker RPC', async () => {
@@ -133,6 +295,123 @@ describe('WASIX worker RPC', () => {
       { id: 2, ok: true, value: Uint8Array.of(1) },
       { id: 3, ok: true },
     ]);
+  });
+
+  it('stops worker-side delivery after the consumer failure signal', async () => {
+    const control = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
+    const responses: WorkerResponse[] = [];
+    const dispatch = createWorkerSessionDispatcher(
+      async () => ({
+        async exec(input) {
+          return input;
+        },
+        async execStream(_input, onChunk) {
+          try {
+            onChunk(Uint8Array.of(1));
+          } catch {
+            // Exercise the dispatcher's own guard even if a faulty session
+            // attempts another delivery after callback abort.
+            try {
+              onChunk(Uint8Array.of(2));
+            } catch {
+              // The session still reports its independently recovered outcome.
+            }
+            return 'callbackAborted';
+          }
+          return 'complete';
+        },
+        async sync() {},
+        async close() {},
+      }),
+      (response) => {
+        responses.push(response);
+        if ('kind' in response) {
+          Atomics.store(control, 1, 1);
+          Atomics.store(control, 0, response.sequence);
+          Atomics.notify(control, 0);
+        }
+      },
+    );
+
+    await dispatch({ id: 1, method: 'open', options: workerOpenOptions() });
+    await dispatch({
+      id: 2,
+      method: 'execStream',
+      input: Uint8Array.of(0),
+      persistence: 'sync',
+      control: control.buffer as SharedArrayBuffer,
+    });
+
+    expect(responses).toEqual([
+      { id: 1, ok: true },
+      { id: 2, kind: 'chunk', sequence: 1, value: Uint8Array.of(1) },
+      { id: 2, ok: true, streamOutcome: 'callbackAborted' },
+    ]);
+  });
+
+  it('retires the worker dispatcher before awaiting a failing session close', async () => {
+    let closes = 0;
+    let executions = 0;
+    const responses: Array<{ id: number; ok: boolean }> = [];
+    const dispatch = createWorkerSessionDispatcher(
+      async () => ({
+        async exec(input) {
+          executions += 1;
+          return input;
+        },
+        async sync() {},
+        async close() {
+          closes += 1;
+          throw new Error('guest close failed');
+        },
+      }),
+      (response) => {
+        if ('ok' in response) responses.push(response);
+      },
+    );
+
+    await dispatch({ id: 1, method: 'open', options: workerOpenOptions() });
+    await dispatch({ id: 2, method: 'close' });
+    await dispatch({
+      id: 3,
+      method: 'exec',
+      input: Uint8Array.of(1),
+      persistence: 'sync',
+    });
+    await dispatch({ id: 4, method: 'open', options: workerOpenOptions() });
+
+    expect(responses.map(({ id, ok }) => ({ id, ok }))).toEqual([
+      { id: 1, ok: true },
+      { id: 2, ok: false },
+      { id: 3, ok: false },
+      { id: 4, ok: false },
+    ]);
+    expect(closes).toBe(1);
+    expect(executions).toBe(0);
+  });
+
+  it('rejects a malformed one-shot restore without opening a database session', async () => {
+    let opened = false;
+    const responses: Array<{ id: number; ok: boolean }> = [];
+    const dispatch = createWorkerSessionDispatcher(
+      async () => {
+        opened = true;
+        throw new Error('unexpected open');
+      },
+      (response) => {
+        if ('ok' in response) responses.push(response);
+      },
+    );
+
+    await dispatch({
+      id: 1,
+      method: 'restore',
+      storage: { schema: 'oliphaunt-wasix-storage-v1', kind: 'indexed-db', name: 'restore' },
+      bytes: Uint8Array.of(1, 2, 3),
+    });
+
+    expect(opened).toBe(false);
+    expect(responses).toEqual([{ id: 1, ok: false, error: expect.anything() }]);
   });
 
   it('dispatches pg_dump in the opened session and transfers its outputs', async () => {
@@ -323,7 +602,7 @@ describe('WASIX worker RPC', () => {
     const database = await opening;
     const chunks: number[][] = [];
 
-    const streaming = database.execProtocolStream(Uint8Array.of(1, 2), (chunk) => {
+    const streaming = database.execProtocolRawStream(Uint8Array.of(1, 2), (chunk) => {
       chunks.push([...chunk]);
     });
     const request = await postedRequest(port, 1);
@@ -338,7 +617,7 @@ describe('WASIX worker RPC', () => {
     });
     expect(chunks).toEqual([[3, 4]]);
     expect(Atomics.load(control, 0)).toBe(1);
-    port.respond({ id: request.id, ok: true });
+    port.respond({ id: request.id, ok: true, streamOutcome: 'complete' });
     await streaming;
 
     const closing = database.close();
@@ -353,9 +632,42 @@ describe('WASIX worker RPC', () => {
     const open = await postedRequest(port, 0);
     port.respond({ id: open.id, ok: true });
     const database = await opening;
-    const consumerFailure = new Error('consumer stopped');
+    const consumerFailure = { reason: 'consumer stopped' };
+    let consumerCalls = 0;
 
-    const streaming = database.execProtocolStream(Uint8Array.of(1), () => {
+    const streaming = database.execProtocolRawStream(Uint8Array.of(1), () => {
+      consumerCalls += 1;
+      throw consumerFailure;
+    });
+    const request = await postedRequest(port, 1);
+    if (request.method !== 'execStream') throw new Error('expected streaming request');
+    const control = new Int32Array(request.control);
+    port.respond({ id: request.id, kind: 'chunk', sequence: 1, value: Uint8Array.of(2) });
+    expect(Atomics.load(control, 0)).toBe(1);
+    expect(Atomics.load(control, 1)).toBe(1);
+    // A stale or faulty worker must still be acknowledged without reentering a
+    // consumer whose first failure has already stopped delivery.
+    port.respond({ id: request.id, kind: 'chunk', sequence: 2, value: Uint8Array.of(3) });
+    expect(Atomics.load(control, 0)).toBe(2);
+    expect(consumerCalls).toBe(1);
+    port.respond({ id: request.id, ok: true, streamOutcome: 'callbackAborted' });
+    await expect(streaming).rejects.toBe(consumerFailure);
+
+    const closing = database.close();
+    const close = await postedRequest(port, 2);
+    port.respond({ id: close.id, ok: true });
+    await closing;
+  });
+
+  it('keeps a worker recovery failure primary over the stream consumer failure', async () => {
+    const port = new FakeWorkerPort();
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const open = await postedRequest(port, 0);
+    port.respond({ id: open.id, ok: true });
+    const database = await opening;
+    const consumerFailure = { reason: 'consumer stopped' };
+
+    const streaming = database.execProtocolRawStream(Uint8Array.of(1), () => {
       throw consumerFailure;
     });
     const request = await postedRequest(port, 1);
@@ -367,9 +679,41 @@ describe('WASIX worker RPC', () => {
     port.respond({
       id: request.id,
       ok: false,
-      error: { name: 'Error', message: 'protocol stream consumer failed' },
+      error: { name: 'Error', message: 'ReadyForQuery recovery failed' },
     });
-    await expect(streaming).rejects.toBe(consumerFailure);
+    await expect(streaming).rejects.toMatchObject({ message: 'ReadyForQuery recovery failed' });
+    await expect(database.execProtocolRaw(Uint8Array.of(3))).rejects.toMatchObject({
+      message: expect.stringContaining('transaction outcome became unknown'),
+      cause: expect.objectContaining({ message: 'ReadyForQuery recovery failed' }),
+    });
+    expect(port.requests.map(({ message }) => message.method)).toEqual(['open', 'execStream']);
+
+    const closing = database.close();
+    const close = await postedRequest(port, 2);
+    port.respond({ id: close.id, ok: true });
+    await closing;
+  });
+
+  it('rejects async stream consumers before acknowledging worker completion', async () => {
+    const port = new FakeWorkerPort();
+    const opening = openWorkerDatabase(port, workerOpenOptions());
+    const open = await postedRequest(port, 0);
+    port.respond({ id: open.id, ok: true });
+    const database = await opening;
+
+    const dynamicallyTypedAsyncCallback: (chunk: Uint8Array) => unknown = async () => undefined;
+    const streaming = database.execProtocolRawStream(
+      Uint8Array.of(1),
+      dynamicallyTypedAsyncCallback as unknown as (chunk: Uint8Array) => undefined,
+    );
+    const request = await postedRequest(port, 1);
+    if (request.method !== 'execStream') throw new Error('expected streaming request');
+    const control = new Int32Array(request.control);
+    port.respond({ id: request.id, kind: 'chunk', sequence: 1, value: Uint8Array.of(2) });
+    expect(Atomics.load(control, 0)).toBe(1);
+    expect(Atomics.load(control, 1)).toBe(1);
+    port.respond({ id: request.id, ok: true, streamOutcome: 'callbackAborted' });
+    await expect(streaming).rejects.toThrow(/must complete synchronously.*Promise or thenable/);
 
     const closing = database.close();
     const close = await postedRequest(port, 2);

@@ -13,27 +13,36 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import * as publicEntrypoint from '../index.js';
 import Oliphaunt, { type OliphauntClient } from '../index.js';
 import { resolveDenoNativeInstall } from '../native/assets-deno.js';
-import { liboliphauntPackageTarget, nativeRuntimeLibraryEnvironment } from '../native/common.js';
+import {
+  ABI_VERSION,
+  liboliphauntPackageTarget,
+  nativeRuntimeLibraryEnvironment,
+} from '../native/common.js';
 import { createDenoNativeBinding } from '../native/deno.js';
 import { nativeModuleSuffixForTarget } from '../native/extension-runtime.js';
 import {
   cString,
+  errorCaptureBuffer,
   OLIPHAUNT_CONFIG_SIZE,
+  OLIPHAUNT_ERROR_CAPTURE_CAPACITY,
+  OLIPHAUNT_ERROR_CAPTURE_SIZE,
   OLIPHAUNT_RESPONSE_SIZE,
   packConfigPointers,
   packPointerArray,
   packRestoreOptionsPointers,
   readResponseLength,
   readResponsePointer,
+  readErrorCapture,
   responseBuffer,
   writePointer,
 } from '../native/ffi-layout.js';
 import { createNodeNativeBinding } from '../native/node.js';
 import { publishNativeDescriptor } from '../root-descriptor.js';
+import { directRuntimeBinding } from '../runtime/direct.js';
 import { readTypeScriptPackageVersions } from './package-metadata.js';
 
 async function main(): Promise<void> {
@@ -111,6 +120,25 @@ function testFfiLayoutPackingAndBounds(): void {
   assert.equal(pointerView.getBigUint64(16, true), 3n);
   assert.equal(packPointerArray([]).byteLength, 8);
 
+  const emptyCapture = errorCaptureBuffer();
+  assert.equal(emptyCapture.byteLength, OLIPHAUNT_ERROR_CAPTURE_SIZE);
+  assert.equal(OLIPHAUNT_ERROR_CAPTURE_CAPACITY, 1024);
+  assert.equal(readErrorCapture(emptyCapture), null);
+  const capturedText = new TextEncoder().encode('operation-local failure');
+  new DataView(emptyCapture.buffer).setUint32(0, capturedText.byteLength, true);
+  emptyCapture.set(capturedText, 4);
+  assert.equal(readErrorCapture(emptyCapture), 'operation-local failure');
+  emptyCapture[4 + capturedText.byteLength] = 1;
+  assert.match(readErrorCapture(emptyCapture) ?? '', /invalid error capture/);
+  const invalidLengthCapture = errorCaptureBuffer();
+  new DataView(invalidLengthCapture.buffer).setUint32(0, OLIPHAUNT_ERROR_CAPTURE_CAPACITY, true);
+  assert.match(readErrorCapture(invalidLengthCapture) ?? '', /invalid error capture/);
+  const embeddedNulCapture = errorCaptureBuffer();
+  new DataView(embeddedNulCapture.buffer).setUint32(0, 3, true);
+  embeddedNulCapture.set([0x61, 0, 0x62], 4);
+  assert.match(readErrorCapture(embeddedNulCapture) ?? '', /invalid error capture/);
+  assert.match(readErrorCapture(new Uint8Array(4)) ?? '', /invalid error capture/);
+
   let nextPointer = 16n;
   const seenStrings: string[] = [];
   const pointerOf = (value: Uint8Array): bigint => {
@@ -138,7 +166,7 @@ function testFfiLayoutPackingAndBounds(): void {
   assert.ok(seenStrings.includes('work_mem=8MB'));
   assert.equal(packed.keepAlive.length, 8);
   const configView = new DataView(packed.config.buffer);
-  assert.equal(configView.getUint32(0, true), 8);
+  assert.equal(configView.getUint32(0, true), ABI_VERSION);
   assert.notEqual(configView.getBigUint64(24, true), 0n);
 
   const restore = packRestoreOptionsPointers(
@@ -163,6 +191,7 @@ function testFfiLayoutPackingAndBounds(): void {
 }
 
 async function testNodeNativeBindingUsesExplicitAssetsAndAddon(): Promise<void> {
+  const previousFinalizationRegistry = globalThis.FinalizationRegistry;
   const root = await mkdtemp(join(tmpdir(), 'oliphaunt-js-node-binding-'));
   const addonPath = join(root, 'mock-addon.cjs');
   const databaseRoot = join(root, 'database');
@@ -197,7 +226,7 @@ async function testNodeNativeBindingUsesExplicitAssetsAndAddon(): Promise<void> 
 let nextHandle = 40n;
 module.exports = {
   default: {
-    open(config) {
+    async open(config) {
       globalThis.__oliphauntNodeAddonCalls.push(['open', config]);
       nextHandle += 1n;
       return nextHandle;
@@ -206,8 +235,8 @@ module.exports = {
       globalThis.__oliphauntNodeAddonCalls.push(['execProtocolRaw', handle, Array.from(request)]);
       return request.buffer.slice(request.byteOffset, request.byteOffset + request.byteLength);
     },
-    execProtocolStream(handle, request, onChunk) {
-      globalThis.__oliphauntNodeAddonCalls.push(['execProtocolStream', handle, Array.from(request)]);
+    async execProtocolRawStream(handle, request, onChunk) {
+      globalThis.__oliphauntNodeAddonCalls.push(['execProtocolRawStream', handle, Array.from(request)]);
       onChunk(request.slice());
     },
     execSimpleQuery(handle, sql) {
@@ -224,8 +253,17 @@ module.exports = {
     cancel(handle) {
       globalThis.__oliphauntNodeAddonCalls.push(['cancel', handle]);
     },
-    detach(handle) {
+    async detach(handle) {
       globalThis.__oliphauntNodeAddonCalls.push(['detach', handle]);
+    },
+    createForgottenHandleRecoveryToken(handle) {
+      const token = 'recovery-token:' + handle;
+      globalThis.__oliphauntNodeAddonCalls.push(['createForgottenHandleRecoveryToken', handle, token]);
+      return token;
+    },
+    queueForgottenHandleRecovery(token) {
+      globalThis.__oliphauntNodeAddonCalls.push(['queueForgottenHandleRecovery', token]);
+      return token !== 'stale-recovery-token';
     },
   },
 };
@@ -237,9 +275,30 @@ module.exports = {
   const previousRuntime = process.env.OLIPHAUNT_RUNTIME_DIR;
   const previousModuleDirectory = process.env.OLIPHAUNT_EMBEDDED_MODULE_DIR;
   const callerModuleDirectory = join(root, 'caller-owned-modules');
+  type NodeForgottenHandle = {
+    readonly recoveryToken: unknown;
+    readonly releaseOwnership: () => void;
+  };
+  let finalizer: ((held: NodeForgottenHandle) => void) | undefined;
+  let registered: { target: object; held: NodeForgottenHandle; token?: object } | undefined;
+  const unregistered: object[] = [];
   process.env.OLIPHAUNT_RUNTIME_DIR = runtimeDirectory;
   process.env.OLIPHAUNT_EMBEDDED_MODULE_DIR = callerModuleDirectory;
   try {
+    (globalThis as { FinalizationRegistry: unknown }).FinalizationRegistry = class {
+      constructor(callback: (held: NodeForgottenHandle) => void) {
+        finalizer = callback;
+      }
+
+      register(target: object, held: NodeForgottenHandle, token?: object): void {
+        registered = { target, held, token };
+      }
+
+      unregister(token: object): boolean {
+        unregistered.push(token);
+        return true;
+      }
+    };
     const binding = await createNodeNativeBinding({
       libraryPath: join(root, 'liboliphaunt.dylib'),
       nodeAddonPath: addonPath,
@@ -275,18 +334,46 @@ module.exports = {
       destination: join(root, 'restore'),
       bytes: new Uint8Array([1]),
     });
-    binding.cancel(handle);
-    binding.detach(handle);
+    await binding.cancel(handle);
+
+    const forgottenOwner = {};
+    let released = 0;
+    binding.registerForgottenHandleCleanup?.(forgottenOwner, handle, () => {
+      released += 1;
+    });
+    assert.equal(registered?.target, forgottenOwner);
+    assert.equal(registered?.token, forgottenOwner);
+    assert.equal(registered?.held.recoveryToken, 'recovery-token:41');
+    finalizer?.(registered!.held);
+    assert.equal(released, 1);
+    let unsafeRelease = 0;
+    finalizer?.({
+      recoveryToken: 'stale-recovery-token',
+      releaseOwnership: () => {
+        unsafeRelease += 1;
+      },
+    });
+    assert.equal(unsafeRelease, 0, 'native recovery rejection must keep admission closed');
+
+    const explicitlyClosedOwner = {};
+    binding.registerForgottenHandleCleanup?.(explicitlyClosedOwner, handle, () => {});
+    await binding.detach(handle);
+    binding.unregisterForgottenHandleCleanup?.(explicitlyClosedOwner);
+    assert.deepEqual(unregistered, [explicitlyClosedOwner]);
     assert.deepEqual(
       calls.map((entry) => entry[0]),
       [
         'open',
         'execProtocolRaw',
-        'execProtocolStream',
+        'execProtocolRawStream',
         'execSimpleQuery',
         'backup',
         'restore',
         'cancel',
+        'createForgottenHandleRecoveryToken',
+        'queueForgottenHandleRecovery',
+        'queueForgottenHandleRecovery',
+        'createForgottenHandleRecoveryToken',
         'detach',
       ],
     );
@@ -296,6 +383,8 @@ module.exports = {
     } else {
       process.env.OLIPHAUNT_RUNTIME_DIR = previousRuntime;
     }
+    (globalThis as { FinalizationRegistry: unknown }).FinalizationRegistry =
+      previousFinalizationRegistry;
     restoreEnv('OLIPHAUNT_EMBEDDED_MODULE_DIR', previousModuleDirectory);
     delete (globalThis as { __oliphauntNodeAddonCalls?: unknown[][] }).__oliphauntNodeAddonCalls;
     await rm(root, { recursive: true, force: true });
@@ -372,46 +461,87 @@ async function testDenoNativeBindingRejectsPackageManagedExtensions(): Promise<v
       },
       dlopen(path: string, definitions: Record<string, unknown>) {
         calls.push(`dlopen:${path}`);
-        assert.deepEqual(definitions.oliphaunt_init, {
-          parameters: ['buffer', 'buffer'],
+        assert.deepEqual(definitions.oliphaunt_init_with_error, {
+          parameters: ['buffer', 'buffer', 'buffer'],
           result: 'i32',
+          nonblocking: true,
         });
-        assert.deepEqual(definitions.oliphaunt_backup, {
+        assert.deepEqual(definitions.oliphaunt_exec_protocol_with_error, {
+          parameters: ['pointer', 'buffer', 'usize', 'buffer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_exec_simple_query_with_error, {
+          parameters: ['pointer', 'buffer', 'usize', 'buffer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_exec_protocol_raw_stream_with_error, {
+          parameters: ['pointer', 'buffer', 'usize', 'function', 'pointer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_detach_with_error, {
           parameters: ['pointer', 'buffer'],
           result: 'i32',
           nonblocking: true,
         });
-        assert.deepEqual(definitions.oliphaunt_restore, {
-          parameters: ['buffer'],
+        assert.deepEqual(definitions.oliphaunt_logical_generation, {
+          parameters: ['pointer'],
+          result: 'u64',
+        });
+        assert.deepEqual(definitions.oliphaunt_close_if_generation, {
+          parameters: ['u64'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_copy_last_error, {
+          parameters: ['pointer', 'buffer', 'usize'],
+          result: 'usize',
+        });
+        assert.deepEqual(definitions.oliphaunt_backup_with_error, {
+          parameters: ['pointer', 'buffer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_restore_with_error, {
+          parameters: ['buffer', 'buffer'],
           result: 'i32',
           nonblocking: true,
         });
         return {
           symbols: {
-            oliphaunt_init() {
+            oliphaunt_init_with_error() {
               calls.push('init');
               return 0;
             },
-            oliphaunt_exec_protocol() {
+            oliphaunt_exec_protocol_with_error() {
               return 0;
             },
-            oliphaunt_exec_simple_query() {
+            oliphaunt_exec_simple_query_with_error() {
               return 0;
             },
-            oliphaunt_backup() {
+            oliphaunt_backup_with_error() {
               return 0;
             },
-            oliphaunt_restore() {
+            oliphaunt_restore_with_error() {
               return 0;
             },
             oliphaunt_cancel() {
               return 0;
             },
-            oliphaunt_detach() {
+            oliphaunt_detach_with_error() {
               return 0;
             },
-            oliphaunt_last_error() {
-              return null;
+            oliphaunt_logical_generation() {
+              return 1n;
+            },
+            oliphaunt_close_if_generation() {
+              return 1;
+            },
+            oliphaunt_copy_last_error(_handle: unknown, output: Uint8Array) {
+              output.fill(0);
+              return 0n;
             },
             oliphaunt_free_response() {},
           },
@@ -482,6 +612,7 @@ async function testDenoNativeBindingRejectsPackageManagedExtensions(): Promise<v
 
 async function testDenoNativeBindingUsesSeparateModuleDirectoryWithoutAmbientMutation(): Promise<void> {
   const previousDeno = (globalThis as { Deno?: unknown }).Deno;
+  const previousFinalizationRegistry = globalThis.FinalizationRegistry;
   const previousModuleDirectory = process.env.OLIPHAUNT_EMBEDDED_MODULE_DIR;
   const previousRuntime = process.env.OLIPHAUNT_RUNTIME_DIR;
   const previousLibraryPath = process.env.LIBOLIPHAUNT_PATH;
@@ -493,7 +624,52 @@ async function testDenoNativeBindingUsesSeparateModuleDirectoryWithoutAmbientMut
   const pointerStrings = new Map<bigint, string>();
   let nextPointer = 0x1000n;
   const calls: string[] = [];
+  let copyLastErrorCalls = 0;
+  let restoreCallsStartedResolve: (() => void) | undefined;
+  let releaseRestoreCalls: (() => void) | undefined;
+  let restoreCallCount = 0;
+  let rejectInit = false;
+  let initFailure: unknown;
+  let initStatus = 0;
+  let initHandleAddress = 0x99n;
+  let logicalGeneration = 23n;
+  let rejectDetach = false;
+  let detachFailure: unknown;
+  let generationCleanupStatus = 1;
+  const restoreCallsStarted = new Promise<void>((resolve) => {
+    restoreCallsStartedResolve = resolve;
+  });
+  const restoreCallsMayFinish = new Promise<void>((resolve) => {
+    releaseRestoreCalls = resolve;
+  });
+  let finalizer: ((held: { generation: bigint; releaseOwnership: () => void }) => void) | undefined;
+  let registered:
+    | {
+        target: object;
+        held: { generation: bigint; releaseOwnership: () => void };
+        token?: object;
+      }
+    | undefined;
+  const unregistered: object[] = [];
   try {
+    (globalThis as { FinalizationRegistry: unknown }).FinalizationRegistry = class {
+      constructor(callback: (held: { generation: bigint; releaseOwnership: () => void }) => void) {
+        finalizer = callback;
+      }
+
+      register(
+        target: object,
+        held: { generation: bigint; releaseOwnership: () => void },
+        token?: object,
+      ): void {
+        registered = { target, held, token };
+      }
+
+      unregister(token: object): boolean {
+        unregistered.push(token);
+        return true;
+      }
+    };
     delete process.env.OLIPHAUNT_EMBEDDED_MODULE_DIR;
     delete process.env.OLIPHAUNT_RUNTIME_DIR;
     delete process.env.LIBOLIPHAUNT_PATH;
@@ -520,51 +696,121 @@ async function testDenoNativeBindingUsesSeparateModuleDirectoryWithoutAmbientMut
     (globalThis as { Deno?: unknown }).Deno = {
       ...deno,
       dlopen(_path: string, definitions: Record<string, unknown>) {
-        assert.deepEqual(definitions.oliphaunt_init, {
-          parameters: ['buffer', 'buffer'],
+        assert.deepEqual(definitions.oliphaunt_init_with_error, {
+          parameters: ['buffer', 'buffer', 'buffer'],
           result: 'i32',
+          nonblocking: true,
         });
-        assert.deepEqual(definitions.oliphaunt_backup, {
+        assert.deepEqual(definitions.oliphaunt_exec_protocol_raw_stream_with_error, {
+          parameters: ['pointer', 'buffer', 'usize', 'function', 'pointer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_detach_with_error, {
           parameters: ['pointer', 'buffer'],
           result: 'i32',
           nonblocking: true,
         });
-        assert.deepEqual(definitions.oliphaunt_restore, {
-          parameters: ['buffer'],
+        assert.deepEqual(definitions.oliphaunt_logical_generation, {
+          parameters: ['pointer'],
+          result: 'u64',
+        });
+        assert.deepEqual(definitions.oliphaunt_close_if_generation, {
+          parameters: ['u64'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_copy_last_error, {
+          parameters: ['pointer', 'buffer', 'usize'],
+          result: 'usize',
+        });
+        assert.deepEqual(definitions.oliphaunt_backup_with_error, {
+          parameters: ['pointer', 'buffer', 'buffer'],
+          result: 'i32',
+          nonblocking: true,
+        });
+        assert.deepEqual(definitions.oliphaunt_restore_with_error, {
+          parameters: ['buffer', 'buffer'],
           result: 'i32',
           nonblocking: true,
         });
         return {
           symbols: {
-            oliphaunt_init(config: Uint8Array, out: Uint8Array) {
+            async oliphaunt_init_with_error(config: Uint8Array, out: Uint8Array) {
               calls.push('init');
+              if (rejectInit) throw initFailure;
               assert.equal(process.env.OLIPHAUNT_EMBEDDED_MODULE_DIR, undefined);
               const view = new DataView(config.buffer, config.byteOffset, config.byteLength);
-              assert.equal(view.getUint32(0, true), 8);
+              assert.equal(view.getUint32(0, true), ABI_VERSION);
               assert.equal(pointerStrings.get(view.getBigUint64(24, true)), embeddedModules);
-              new DataView(out.buffer, out.byteOffset, out.byteLength).setBigUint64(0, 0x99n, true);
+              new DataView(out.buffer, out.byteOffset, out.byteLength).setBigUint64(
+                0,
+                initHandleAddress,
+                true,
+              );
+              return initStatus;
+            },
+            oliphaunt_exec_protocol_with_error() {
               return 0;
             },
-            oliphaunt_exec_protocol() {
+            oliphaunt_exec_protocol_raw_stream_with_error(
+              _handle: unknown,
+              request: Uint8Array,
+              _requestLength: bigint,
+              callback: (context: unknown, bytes: unknown, length: bigint) => number,
+              context: unknown,
+              captured: Uint8Array,
+            ) {
+              const callbackStatus = callback(context, null, 0n);
+              if (request[0] === 4) {
+                assert.equal(callbackStatus, 0);
+                return 1;
+              }
+              assert.equal(callbackStatus, 1);
+              if (request[0] === 3) return 0;
+              if (request[0] === 1) {
+                writeErrorCapture(captured, 'stream callback aborted after confirmed recovery');
+                return 1;
+              }
+              writeErrorCapture(captured, 'stream transport recovery failed');
+              return -1;
+            },
+            oliphaunt_exec_simple_query_with_error() {
               return 0;
             },
-            oliphaunt_exec_simple_query() {
+            oliphaunt_backup_with_error() {
               return 0;
             },
-            oliphaunt_backup() {
-              return 0;
-            },
-            oliphaunt_restore() {
-              return 0;
+            async oliphaunt_restore_with_error(options: Uint8Array, captured: Uint8Array) {
+              const view = new DataView(options.buffer, options.byteOffset, options.byteLength);
+              const destination = pointerStrings.get(view.getBigUint64(8, true));
+              assert.ok(destination);
+              restoreCallCount += 1;
+              if (restoreCallCount === 2) restoreCallsStartedResolve?.();
+              await restoreCallsMayFinish;
+              writeErrorCapture(captured, `${destination} failed on its native worker`);
+              return -1;
             },
             oliphaunt_cancel() {
               return 0;
             },
-            oliphaunt_detach() {
+            async oliphaunt_detach_with_error(_handle: unknown, _captured: Uint8Array) {
+              calls.push('detach');
+              if (rejectDetach) throw detachFailure;
               return 0;
             },
-            oliphaunt_last_error() {
-              return null;
+            oliphaunt_logical_generation() {
+              calls.push('logical-generation');
+              return logicalGeneration;
+            },
+            oliphaunt_close_if_generation(generation: bigint) {
+              calls.push(`close-generation:${generation}`);
+              return generationCleanupStatus;
+            },
+            oliphaunt_copy_last_error(_handle: unknown, output: Uint8Array) {
+              copyLastErrorCalls += 1;
+              output.fill(0);
+              return 0n;
             },
             oliphaunt_free_response() {},
           },
@@ -587,6 +833,14 @@ async function testDenoNativeBindingUsesSeparateModuleDirectoryWithoutAmbientMut
         },
       },
       UnsafePointerView: class {},
+      UnsafeCallback: {
+        threadSafe(_definition: unknown, callback: unknown) {
+          return {
+            pointer: callback,
+            close() {},
+          };
+        },
+      },
     };
 
     const binding = await createDenoNativeBinding({
@@ -601,13 +855,223 @@ async function testDenoNativeBindingUsesSeparateModuleDirectoryWithoutAmbientMut
       startupArgs: [],
     });
     assert.deepEqual(handle, { address: 0x99n });
-    assert.deepEqual(calls, ['init']);
+    assert.deepEqual(calls, ['init', 'logical-generation']);
+
+    await assert.rejects(
+      () =>
+        binding.execProtocolStream(handle, new Uint8Array([1]), () => {
+          throw new Error('Deno stream callback failed');
+        }),
+      /Deno stream callback failed/,
+    );
+    const undefinedCallbackFailure = await binding
+      .execProtocolStream(handle, new Uint8Array([1]), () => {
+        throw undefined;
+      })
+      .then(
+        () => ({ fulfilled: true as const, error: undefined }),
+        (error: unknown) => ({ fulfilled: false as const, error }),
+      );
+    assert.equal(undefinedCallbackFailure.fulfilled, false);
+    assert.equal(
+      undefinedCallbackFailure.error,
+      undefined,
+      'a recovered Deno callback abort must preserve even an undefined rejection reason',
+    );
+    await assert.rejects(
+      () =>
+        binding.execProtocolStream(handle, new Uint8Array([3]), () => {
+          throw undefined;
+        }),
+      /reported success after the callback failed/,
+    );
+    await assert.rejects(
+      () => binding.execProtocolStream(handle, new Uint8Array([4]), () => undefined),
+      /reported a recovered callback abort without a callback failure/,
+    );
+    await assert.rejects(
+      () =>
+        binding.execProtocolStream(handle, new Uint8Array([2]), () => {
+          throw new Error('this callback failure must not mask native recovery');
+        }),
+      /stream transport recovery failed/,
+    );
+
+    const firstRestore = binding.restore({
+      destination: '/tmp/first-restore',
+      bytes: new Uint8Array([1]),
+    });
+    const secondRestore = binding.restore({
+      destination: '/tmp/second-restore',
+      bytes: new Uint8Array([2]),
+    });
+    await restoreCallsStarted;
+    releaseRestoreCalls?.();
+    const restoreResults = await Promise.allSettled([firstRestore, secondRestore]);
+    assert.equal(restoreResults[0]?.status, 'rejected');
+    assert.equal(restoreResults[1]?.status, 'rejected');
+    assert.match(
+      String((restoreResults[0] as PromiseRejectedResult).reason),
+      /\/tmp\/first-restore failed on its native worker/,
+    );
+    assert.match(
+      String((restoreResults[1] as PromiseRejectedResult).reason),
+      /\/tmp\/second-restore failed on its native worker/,
+    );
+    assert.equal(
+      copyLastErrorCalls,
+      0,
+      'nonblocking Deno failures must not read worker-local errors later on the JS thread',
+    );
+
+    const forgottenOwner = {};
+    let released = 0;
+    binding.registerForgottenHandleCleanup?.(forgottenOwner, handle, () => {
+      released += 1;
+    });
+    assert.equal(registered?.target, forgottenOwner);
+    assert.equal(registered?.token, forgottenOwner);
+    assert.equal(registered?.held.generation, 23n);
+    finalizer?.(registered!.held);
+    assert.equal(released, 0, 'the finalizer must return before native cleanup settles');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(released, 1);
+    assert.deepEqual(calls, ['init', 'logical-generation', 'close-generation:23']);
+
+    const failedCleanupOwner = {};
+    let releasedAfterFailedCleanup = 0;
+    generationCleanupStatus = -1;
+    binding.registerForgottenHandleCleanup?.(failedCleanupOwner, handle, () => {
+      releasedAfterFailedCleanup += 1;
+    });
+    finalizer?.(registered!.held);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      releasedAfterFailedCleanup,
+      0,
+      'failed native generation cleanup must keep direct admission closed',
+    );
+    assert.equal(calls.at(-1), 'close-generation:23');
+
+    const explicitlyClosedOwner = {};
+    binding.registerForgottenHandleCleanup?.(explicitlyClosedOwner, handle, () => {});
+    await binding.detach(handle);
+    binding.unregisterForgottenHandleCleanup?.(explicitlyClosedOwner);
+    assert.deepEqual(unregistered, [explicitlyClosedOwner]);
+    assert.equal(calls.at(-1), 'detach');
+
+    calls.length = 0;
+    const openConfig = {
+      pgdata: join(databaseRoot, 'pgdata'),
+      runtimeDirectory: runtime,
+      username: 'postgres',
+      database: 'postgres',
+      extensions: ['hstore'],
+      startupArgs: [],
+    };
+
+    const uncertainHandle = await binding.open(openConfig);
+    rejectDetach = true;
+    detachFailure = new Error('Deno detach worker delivery rejected');
+    const uncertainClose = await directRuntimeBinding(binding).close(uncertainHandle);
+    assert.equal(uncertainClose.state, 'terminal');
+    assert.match(
+      String(uncertainClose.error),
+      /detach delivery failed after its outcome became unknown/,
+    );
+    assert.equal((uncertainClose.error as Error).cause, detachFailure);
+    await assert.rejects(
+      () => binding.detach(uncertainHandle),
+      (error: unknown) => error === uncertainClose.error,
+    );
+    await assert.rejects(
+      () => binding.open(openConfig),
+      /prior native lifecycle outcome left ownership unknown/,
+    );
+    assert.deepEqual(
+      calls,
+      ['init', 'logical-generation', 'detach'],
+      'an outcome-unknown detach is terminal, cannot be retried, and closes admission before another init',
+    );
+
+    const createFreshBinding = async () => {
+      vi.resetModules();
+      const freshDeno = await import('../native/deno.js');
+      return freshDeno.createDenoNativeBinding({
+        libraryPath: join(root, 'liboliphaunt.so'),
+      });
+    };
+
+    calls.length = 0;
+    rejectInit = false;
+    initStatus = -1;
+    initHandleAddress = 0x99n;
+    logicalGeneration = 23n;
+    rejectDetach = false;
+    detachFailure = undefined;
+    let freshBinding = await createFreshBinding();
+    await assert.rejects(() => freshBinding.open(openConfig), /native liboliphaunt init failed/);
+    initStatus = 0;
+    const retryHandle = await freshBinding.open(openConfig);
+    await freshBinding.detach(retryHandle);
+    assert.deepEqual(
+      calls,
+      ['init', 'init', 'logical-generation', 'detach'],
+      'a confirmed nonzero init status remains retryable',
+    );
+
+    calls.length = 0;
+    rejectInit = true;
+    initStatus = 0;
+    initFailure = new Error('Deno init worker delivery rejected');
+    rejectDetach = false;
+    detachFailure = undefined;
+    initHandleAddress = 0x99n;
+    logicalGeneration = 23n;
+    freshBinding = await createFreshBinding();
+    await assert.rejects(
+      () => freshBinding.open(openConfig),
+      (error) => error === initFailure,
+    );
+    await assert.rejects(
+      () => freshBinding.open(openConfig),
+      /prior native lifecycle outcome left ownership unknown/,
+    );
+    assert.deepEqual(calls, ['init'], 'a rejected init worker must close admission immediately');
+
+    calls.length = 0;
+    rejectInit = false;
+    initHandleAddress = 0n;
+    freshBinding = await createFreshBinding();
+    await assert.rejects(() => freshBinding.open(openConfig), /init returned a null handle/);
+    await assert.rejects(
+      () => freshBinding.open(openConfig),
+      /prior native lifecycle outcome left ownership unknown/,
+    );
+    assert.deepEqual(calls, ['init'], 'a null successful init must close admission immediately');
+
+    calls.length = 0;
+    initHandleAddress = 0x99n;
+    logicalGeneration = 0n;
+    freshBinding = await createFreshBinding();
+    await assert.rejects(() => freshBinding.open(openConfig), /invalid logical generation/);
+    await assert.rejects(
+      () => freshBinding.open(openConfig),
+      /prior native lifecycle outcome left ownership unknown/,
+    );
+    assert.deepEqual(
+      calls,
+      ['init', 'logical-generation'],
+      'an invalid generation must close admission without dereferencing the handle',
+    );
   } finally {
     if (previousDeno === undefined) {
       delete (globalThis as { Deno?: unknown }).Deno;
     } else {
       (globalThis as { Deno?: unknown }).Deno = previousDeno;
     }
+    (globalThis as { FinalizationRegistry: unknown }).FinalizationRegistry =
+      previousFinalizationRegistry;
     restoreEnv('OLIPHAUNT_EMBEDDED_MODULE_DIR', previousModuleDirectory);
     restoreEnv('OLIPHAUNT_RUNTIME_DIR', previousRuntime);
     restoreEnv('LIBOLIPHAUNT_PATH', previousLibraryPath);
@@ -691,6 +1155,18 @@ function fsBackedDenoRuntime(tempRoot: string): unknown {
       };
     },
   };
+}
+
+function writeErrorCapture(capture: Uint8Array, message: string): void {
+  capture.fill(0);
+  const bytes = new TextEncoder().encode(message);
+  assert.ok(bytes.byteLength < OLIPHAUNT_ERROR_CAPTURE_CAPACITY);
+  new DataView(capture.buffer, capture.byteOffset, capture.byteLength).setUint32(
+    0,
+    bytes.byteLength,
+    true,
+  );
+  capture.set(bytes, 4);
 }
 
 function fsPath(path: string | URL): string {

@@ -13,6 +13,8 @@ PostgreSQL internals.
 - `include/oliphaunt.h`: public C ABI.
 - `src/liboliphaunt_native.c`: direct-mode lifecycle, backend thread ownership,
   and non-query public ABI entrypoints.
+- `src/liboliphaunt_error.c`: synchronized shared errors plus nested,
+  operation-local error attribution for binding-safe copies.
 - `src/liboliphaunt_runtime.c`: embedded backend argv/default-GUC construction
   and backend thread stack sizing policy.
 - `src/liboliphaunt_protocol.c`: raw protocol execution, streaming backpressure,
@@ -115,6 +117,20 @@ execution do not impose a synthetic query timeout; callers should use
 `oliphaunt_cancel` to interrupt long-running SQL. Ordinary SDK close is a
 lifecycle detach/wait boundary, not an implicit query cancellation primitive.
 
+Hosts serialize ordinary non-cancel calls on one logical C handle;
+`oliphaunt_cancel` is the cross-thread exception. Streaming callbacks borrow
+each byte chunk only for the callback invocation. They may copy it, inspect an
+error, or cancel, but same-handle query, backup, detach, close, and nested stream
+calls fail busy until streaming drains to `ReadyForQuery`. This guard applies
+while the callback lock is released as well, preventing callback reentrancy or a
+concurrent close from corrupting protocol state or freeing the active handle.
+
+FFI schedulers that resume on a different thread use the ABI 10 `_with_error`
+variants with one caller-owned `OliphauntErrorCapture` per invocation. The
+worker fills that fixed-layout capture before its handle lease ends; synchronous
+callers may continue copying the operation-local error immediately with
+`oliphaunt_copy_last_error`.
+
 The C runtime keeps throughput-oriented PostgreSQL defaults for direct callers:
 `shared_buffers=128MB`, `wal_buffers=4MB`, and `min_wal_size=80MB`. SDKs that
 need different PostgreSQL settings do not need a new C ABI; they pass validated
@@ -178,6 +194,9 @@ preparing direct, broker, and server roots, then passes
 try to acquire the same lease twice. Other C ABI consumers leave the flag clear
 and rely on the C runtime. The flag is only an ownership handoff; callers must
 already hold the stable lease for the full native handle lifetime.
+Detached reopens of a resident runtime must repeat the same root-lock ownership
+mode; changing the flag is rejected rather than silently changing who protects
+the live root.
 
 `oliphaunt_init` only validates an existing managed root. It requires the exact
 five-field `<root>/.oliphaunt.json`, a real `<root>/pgdata` directory,

@@ -1,11 +1,10 @@
 import type { WasixDirectoryMount, WasixRuntimeLayout } from './archive.js';
 import { WasixStorageError } from './errors.js';
-import type { PreparedWasixRuntime } from './extensions.js';
 import type { Directory } from './host/index.mjs';
 import { simpleQuery } from './protocol.js';
 import { assertSuccessfulQueryResponse, PostgresError } from './query.js';
 import type { SerializedOpenOptions } from './rpc.js';
-import type { WasixStorageLease } from './storage-provider.js';
+import { normalizeWasixStartupGUCs } from './startup-config.js';
 
 let compiledModuleCache: { sha256: string; module: Promise<WebAssembly.Module> } | undefined;
 
@@ -30,7 +29,7 @@ export function compileWasixModule(
   return compiledModuleCache.module;
 }
 
-/** @internal Materialize the exact runtime mounts shared by both execution placements. */
+/** @internal Materialize the exact runtime mounts shared by both execution surfaces. */
 export async function materializeWasixMounts(
   DirectoryConstructor: typeof Directory,
   layout: WasixRuntimeLayout,
@@ -102,14 +101,12 @@ function compareDirectoryDepth(left: string, right: string): number {
   return left.split('/').length - right.split('/').length || left.localeCompare(right);
 }
 
-/** @internal PostgreSQL argv shared by both execution placements. */
+/** @internal PostgreSQL argv shared by both execution surfaces. */
 export function wasixPostgresArgs(options: SerializedOpenOptions): string[] {
   const args = ['--single'];
   if (options.storage.kind === 'memory') args.push('-F');
   args.push('-O', '-j');
-  const startupGUCs = Object.fromEntries(
-    Object.entries(options.startupGUCs).map(([name, value]) => [name.trim(), value]),
-  );
+  const startupGUCs = normalizeWasixStartupGUCs(options.startupGUCs);
   for (const [configuredName, configuredValue] of Object.entries(startupGUCs)) {
     const managed = Object.entries(SINGLE_BACKEND_GUCS).find(
       ([name]) => name === configuredName.toLowerCase(),
@@ -132,7 +129,6 @@ export function wasixPostgresArgs(options: SerializedOpenOptions): string[] {
     ...SINGLE_BACKEND_GUCS,
     ...startupGUCs,
   })) {
-    validateGuc(name, value);
     args.push('-c', `${name}=${value}`);
   }
   // Keep a database name that begins with `-` out of PostgreSQL's option
@@ -154,7 +150,7 @@ const SINGLE_BACKEND_GUCS = {
   wal_sync_method: 'fdatasync',
 } as const;
 
-/** @internal PostgreSQL environment shared by both execution placements. */
+/** @internal PostgreSQL environment shared by both execution surfaces. */
 export function wasixPostgresEnvironment(
   options: SerializedOpenOptions,
   icuEnabled = false,
@@ -184,17 +180,6 @@ export function wasixPostgresEnvironment(
   };
 }
 
-function validateGuc(name: string, value: string): void {
-  if (!/^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/u.test(name)) {
-    throw new Error(
-      `PostgreSQL startup GUC name ${JSON.stringify(name)} must use dot-separated components that start with an ASCII letter or '_' and continue with ASCII letters, digits, '_', or '$'`,
-    );
-  }
-  if (value.includes('\0')) {
-    throw new Error(`PostgreSQL startup GUC ${JSON.stringify(name)} contains a NUL byte`);
-  }
-}
-
 /** @internal Normalize lifecycle diagnostics without discarding structured primary errors. */
 export function describeError(error: unknown): string {
   if (!(error instanceof Error)) {
@@ -214,8 +199,10 @@ export function composeLifecycleFailure(primary: Error, label: string, secondary
     `${label} while handling ${primary.name || 'Error'}`,
   );
   if (primary instanceof PostgresError) {
-    const composed = new PostgresError(primary.fields.map((field) => ({ ...field })));
-    composed.message = message;
+    const composed = new PostgresError(
+      primary.fields.map((field) => ({ ...field })),
+      [...primary.notices],
+    );
     Object.defineProperty(composed, 'cause', {
       configurable: true,
       value: cause,
@@ -232,20 +219,13 @@ export function composeLifecycleFailure(primary: Error, label: string, secondary
   return new Error(message, { cause });
 }
 
-/** @internal Complete extension and role setup after the direct bridge reaches ReadyForQuery. */
+/** @internal Apply caller role after the direct bridge reaches ReadyForQuery. */
 export async function configureWasixDatabase(
   options: SerializedOpenOptions,
-  prepared: PreparedWasixRuntime,
-  storageState: WasixStorageLease['state'],
   exec: (input: Uint8Array) => Promise<Uint8Array>,
 ): Promise<void> {
-  // Imported carrier install contracts own extension lifecycle. Activate them
-  // while the fixed bootstrap superuser is selected, then apply the caller's role.
-  if (storageState === 'new') {
-    for (const sql of prepared.setupSql) {
-      assertSuccessfulQueryResponse(await exec(simpleQuery(sql)));
-    }
-  }
+  // Extension selection owns files and startup configuration only. Database-
+  // local CREATE EXTENSION/LOAD/schema/migration SQL remains application-owned.
   await configureWasixRole(options.username, exec);
 }
 

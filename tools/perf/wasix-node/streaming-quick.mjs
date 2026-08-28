@@ -39,22 +39,25 @@ try {
   const packageRoot = (name) => resolve(fixture.consumer, 'node_modules', ...name.split('/'));
   const bindingRoot = packageRoot(fixture.packages.binding.name);
   const toolsRoot = packageRoot(fixture.packages.toolsFacade.name);
-  const { default: Oliphaunt } = await import(
+  const { default: DirectOliphaunt } = await import(
     pathToFileURL(resolve(bindingRoot, 'lib/index.node.js')).href
+  );
+  const { default: WorkerOliphaunt } = await import(
+    pathToFileURL(resolve(bindingRoot, 'lib/worker-entry.node.js')).href
   );
   const { openServer } = await import(
     pathToFileURL(resolve(bindingRoot, 'lib/server.node.js')).href
   );
   const { pgDump, psql } = await import(pathToFileURL(resolve(toolsRoot, 'lib/index.js')).href);
 
-  const placements = {};
-  for (const execution of ['direct', 'worker']) {
-    placements[execution] = await benchmarkPlacement(Oliphaunt, execution);
-  }
+  const surfaces = {
+    direct: await benchmarkSurface(DirectOliphaunt, 'direct'),
+    worker: await benchmarkSurface(WorkerOliphaunt, 'worker'),
+  };
   const server = await benchmarkServer(openServer);
-  const tools = await benchmarkTools(Oliphaunt, pgDump, psql);
+  const tools = await benchmarkTools(WorkerOliphaunt, pgDump, psql);
   const report = {
-    schema: 'oliphaunt-wasix-streaming-quick-v1',
+    schema: 'oliphaunt-wasix-streaming-quick-v2',
     measuredAt: new Date().toISOString(),
     durationMs: rounded(performance.now() - started),
     environment: {
@@ -70,12 +73,24 @@ try {
       slowConsumerDelayMs,
       toolRows,
       storage: 'memory',
+      executionSurfaces: {
+        direct: {
+          entrypoint: '@oliphaunt/wasix-ts',
+          callingContract: 'async',
+          executionOwner: 'caller',
+        },
+        worker: {
+          entrypoint: '@oliphaunt/wasix-ts/worker',
+          callingContract: 'async',
+          executionOwner: 'sdk-worker',
+        },
+      },
       resourceSamples: 'representative 4 MiB streams, data dump, and restore',
       resourceNote:
         'RSS is process-wide growth from each scenario start; retained allocations can reduce later deltas',
     },
-    placements,
-    comparison: comparePlacements(placements),
+    surfaces,
+    comparison: compareSurfaces(surfaces),
     server,
     tools,
   };
@@ -89,14 +104,13 @@ try {
   ]);
 }
 
-async function benchmarkPlacement(Oliphaunt, execution) {
-  const opening = await timed(() => Oliphaunt.open({ execution }));
+async function benchmarkSurface(Oliphaunt, surface) {
+  const opening = await timed(() => Oliphaunt.open());
   const database = opening.value;
   try {
     const query = await samples(async () => {
       const result = await database.query('SELECT 1::int AS value');
-      if (result.getText(0, 'value') !== '1')
-        throw new Error('query benchmark returned wrong value');
+      if (result.rows[0]?.value !== 1) throw new Error('query benchmark returned wrong value');
     });
     const request = simpleQuery('SELECT 1');
     const expected = await database.execProtocolRaw(request);
@@ -106,7 +120,7 @@ async function benchmarkPlacement(Oliphaunt, execution) {
     });
     const rawStreamed = await samples(async () => {
       let bytes = 0;
-      await database.execProtocolStream(request, (chunk) => {
+      await database.execProtocolRawStream(request, (chunk) => {
         bytes += chunk.length;
       });
       if (bytes !== expected.length) throw new Error('streamed protocol size changed');
@@ -119,14 +133,14 @@ async function benchmarkPlacement(Oliphaunt, execution) {
       const expectedCopyBytes = sizeMiB * 1024 * 1024;
       const buffered = await timed(() => database.execProtocolRaw(input));
       if (buffered.value.length < expectedCopyBytes) {
-        throw new Error(`${execution} buffered COPY response was truncated`);
+        throw new Error(`${surface} buffered COPY response was truncated`);
       }
       const streamed =
         sizeMiB === bulkSizesMiB.at(-1)
           ? await resourceTimed(() => consumeStream(database, input))
           : await timed(() => consumeStream(database, input));
       if (streamed.value.bytes !== buffered.value.length) {
-        throw new Error(`${execution} streamed COPY response differed from buffered response`);
+        throw new Error(`${surface} streamed COPY response differed from buffered response`);
       }
       bulk.push({
         sizeMiB,
@@ -140,13 +154,13 @@ async function benchmarkPlacement(Oliphaunt, execution) {
     }
 
     let slowConsumer;
-    if (execution === 'worker') {
+    if (surface === 'worker') {
       const input = simpleQuery(copyQuery(1));
       const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
       const measured = await timed(async () => {
         let bytes = 0;
         let chunks = 0;
-        await database.execProtocolStream(input, (chunk) => {
+        await database.execProtocolRawStream(input, (chunk) => {
           bytes += chunk.length;
           chunks += 1;
           Atomics.wait(sleeper, 0, 0, slowConsumerDelayMs);
@@ -237,7 +251,7 @@ async function benchmarkServer(openServer) {
 }
 
 async function benchmarkTools(Oliphaunt, pgDump, psql) {
-  const source = await Oliphaunt.open({ execution: 'worker' });
+  const source = await Oliphaunt.open();
   let dump;
   try {
     await source.execute(
@@ -265,11 +279,11 @@ async function benchmarkTools(Oliphaunt, pgDump, psql) {
 }
 
 async function benchmarkRestore(Oliphaunt, psql, dump) {
-  const target = await Oliphaunt.open({ execution: 'worker' });
+  const target = await Oliphaunt.open();
   try {
     const restored = await resourceTimed(() => psql(target, { script: dump }));
     const rows = Number(
-      (await target.query('SELECT count(*)::int AS rows FROM quick_tool_data')).getText(0, 'rows'),
+      (await target.query('SELECT count(*)::int AS rows FROM quick_tool_data')).rows[0]?.rows,
     );
     if (rows !== toolRows) throw new Error(`psql restored ${rows} rows, expected ${toolRows}`);
     return { elapsedMs: rounded(restored.ms), rows, resources: restored.resources };
@@ -339,7 +353,7 @@ async function consumeStream(database, input) {
   const request = typeof input === 'string' ? simpleQuery(input) : input;
   let bytes = 0;
   let chunks = 0;
-  await database.execProtocolStream(request, (chunk) => {
+  await database.execProtocolRawStream(request, (chunk) => {
     bytes += chunk.length;
     chunks += 1;
   });
@@ -366,9 +380,9 @@ function textResult(value, milliseconds) {
   };
 }
 
-function comparePlacements(placements) {
-  const direct = placements.direct.smallRoundTripMs;
-  const worker = placements.worker.smallRoundTripMs;
+function compareSurfaces(surfaces) {
+  const direct = surfaces.direct.smallRoundTripMs;
+  const worker = surfaces.worker.smallRoundTripMs;
   return Object.fromEntries(
     ['query', 'rawBuffered', 'rawStreamed'].map((name) => [
       name,
@@ -399,22 +413,22 @@ function printReport(report) {
     ['raw buffered', 'rawBuffered'],
     ['raw streamed', 'rawStreamed'],
   ]) {
-    const direct = report.placements.direct.smallRoundTripMs[name];
-    const worker = report.placements.worker.smallRoundTripMs[name];
+    const direct = report.surfaces.direct.smallRoundTripMs[name];
+    const worker = report.surfaces.worker.smallRoundTripMs[name];
     const added = report.comparison[name].workerMinusDirectMedianMs;
     console.log(
       `${label.padEnd(20)} ${formatPair(direct).padEnd(16)} ${formatPair(worker).padEnd(16)} ${formatMs(added)}`,
     );
   }
   console.log('\nBulk protocol transfer (MiB/s; elapsed ms)');
-  for (const placement of ['direct', 'worker']) {
-    for (const row of report.placements[placement].bulk) {
+  for (const surface of ['direct', 'worker']) {
+    for (const row of report.surfaces[surface].bulk) {
       console.log(
-        `${placement.padEnd(7)} ${String(row.sizeMiB).padStart(2)} MiB  buffered ${formatTransfer(row.buffered)}  streamed ${formatTransfer(row.streamed)} (${row.streamed.chunks} chunks)`,
+        `${surface.padEnd(8)} ${String(row.sizeMiB).padStart(2)} MiB  buffered ${formatTransfer(row.buffered)}  streamed ${formatTransfer(row.streamed)} (${row.streamed.chunks} chunks)`,
       );
     }
   }
-  const slow = report.placements.worker.slowConsumer;
+  const slow = report.surfaces.worker.slowConsumer;
   console.log(
     `\nSlow consumer: ${slow.chunks} chunks × ${slow.delayPerChunkMs} ms requested; ` +
       `${slow.elapsedMs.toFixed(3)} ms total`,
@@ -434,8 +448,8 @@ function printReport(report) {
   );
   console.log('\nRepresentative event-loop delay / process RSS growth');
   for (const [label, resources] of [
-    ['direct 4 MiB stream', report.placements.direct.bulk.at(-1).streamed.resources],
-    ['worker 4 MiB stream', report.placements.worker.bulk.at(-1).streamed.resources],
+    ['direct 4 MiB stream', report.surfaces.direct.bulk.at(-1).streamed.resources],
+    ['worker 4 MiB stream', report.surfaces.worker.bulk.at(-1).streamed.resources],
     ['server 4 MiB COPY', report.server.bulk.at(-1).resources],
     ['pg_dump data', report.tools.dataDump.resources],
     ['psql restore', report.tools.restore.resources],
@@ -474,6 +488,7 @@ function parseArguments(args) {
 async function requireInputs() {
   const required = [
     'src/bindings/wasix-ts/lib/index.node.js',
+    'src/bindings/wasix-ts/lib/worker-entry.node.js',
     'src/bindings/wasix-ts/lib/host/index.mjs',
     'src/bindings/wasix-ts/tools-package/lib/index.js',
     'target/oliphaunt-wasix/assets/manifest.json',

@@ -1,9 +1,14 @@
-import { Oliphaunt, type DatabaseStorage, type OliphauntDatabase } from '@oliphaunt/react-native';
 import {
-  GENERATED_EXTENSION_METADATA,
-  GENERATED_EXTENSION_METADATA_SHA256,
-} from '@oliphaunt/react-native/extension-metadata';
-import { GENERATED_MOBILE_EXTENSION_SMOKE } from './generated/extension-smoke';
+  Oliphaunt,
+  type DatabaseStorage,
+  type OliphauntDatabase,
+  type QueryResult,
+} from '@oliphaunt/react-native';
+import {
+  GENERATED_MOBILE_EXTENSION_METADATA_SHA256,
+  GENERATED_MOBILE_EXTENSION_PLAN,
+  GENERATED_MOBILE_EXTENSION_SMOKE,
+} from './generated/extension-smoke';
 import {
   runMobileBindingProof,
   runMobileReleaseExtensionProof,
@@ -174,11 +179,11 @@ export default function HomeScreen() {
 
         stage('query:select1:start');
         const select = await db.query('SELECT 1::text AS value');
-        const selectOne = select.getText(0, 'value') ?? '';
+        const selectOne = requiredQueryText(select, 'value');
         stage('query:select1:done', { value: selectOne });
         stage('query:parameter:start');
         const parameterized = await db.query('SELECT $1::text AS value', ['hello']);
-        const parameterRoundTrip = parameterized.getText(0, 'value') ?? '';
+        const parameterRoundTrip = requiredQueryText(parameterized, 'value');
         stage('query:parameter:done', { value: parameterRoundTrip });
         const bindingProof = await runMobileBindingProof(
           db,
@@ -220,7 +225,7 @@ export default function HomeScreen() {
           activatedExtensions: extensionProofResult.activatedExtensions,
           extensionCatalogComplete: extensionProofResult.extensionCatalogComplete,
           pgTextsearchEnglishBm25: extensionProofResult.pgTextsearchEnglishBm25,
-          extensionCatalogSha256: GENERATED_EXTENSION_METADATA_SHA256,
+          extensionCatalogSha256: GENERATED_MOBILE_EXTENSION_METADATA_SHA256,
           catalogProfile: profileProof.catalogProfile,
           icuRuntimeProof: profileProof.catalogProfile === 'icu',
         });
@@ -470,7 +475,7 @@ async function runCatalogProfileReopenProof(
   const persisted = await reopened.query(
     'SELECT value FROM oliphaunt_mobile_reopen_marker WHERE id = 1',
   );
-  const reopenedMarker = persisted.getText(0, 'value') ?? '';
+  const reopenedMarker = requiredQueryText(persisted, 'value');
   if (reopenedMarker !== marker) {
     throw new Error(`database reopen marker mismatch: expected '${marker}', got '${reopenedMarker}'`);
   }
@@ -491,7 +496,7 @@ async function assertCatalogProfileProbe(
   profile: CatalogProfile,
 ): Promise<void> {
   const result = await db.query(`SELECT (${sql})::text AS result`);
-  const actual = result.getText(0, 'result') ?? '';
+  const actual = requiredQueryText(result, 'result');
   if (actual !== expected) {
     throw new Error(`${profile} packaged catalog probe failed: expected '${expected}', got '${actual}'`);
   }
@@ -516,7 +521,7 @@ function requiredPublicEnvironment(name: string, value: string | undefined): str
 }
 
 function mobileReleaseExtensionProofPlan() {
-  return GENERATED_EXTENSION_METADATA.map((extension) => {
+  return GENERATED_MOBILE_EXTENSION_PLAN.map((extension) => {
     const smokeStatements = (
       GENERATED_MOBILE_EXTENSION_SMOKE as Readonly<Record<string, readonly string[]>>
     )[extension.sqlName];
@@ -702,7 +707,7 @@ async function runNativeBenchmark(
         'background_checkpoint',
         'checkpoint latency',
         options.checkpointIterations,
-        () => db.checkpoint(),
+        () => db.execute('CHECKPOINT'),
       ),
     );
 
@@ -799,7 +804,7 @@ async function runCrashRecoveryPhase(
       [value],
     );
     const check = await db.query('SELECT value FROM rn_crash_recovery WHERE id = 1');
-    const persisted = check.getText(0, 'value') ?? '';
+    const persisted = requiredQueryText(check, 'value');
     if (persisted !== value) {
       throw new Error(`crash recovery write readback mismatch: ${persisted}`);
     }
@@ -828,7 +833,7 @@ async function runCrashRecoveryPhase(
 
   stage('crash:verify:start');
   const recovered = await db.query('SELECT value FROM rn_crash_recovery WHERE id = 1');
-  const value = recovered.getText(0, 'value') ?? '';
+  const value = requiredQueryText(recovered, 'value');
   if (!value.startsWith(`crash-${Platform.OS}-`)) {
     throw new Error(`crash recovery verification found unexpected value '${value}'`);
   }
@@ -873,13 +878,17 @@ async function readPostgresSettings(db: OliphauntDatabase): Promise<PostgresSett
   const row = await db.query(`SELECT ${columns}`);
   return Object.fromEntries(
     names.map((name) => {
-      const value = row.getText(0, name);
-      if (value === null) {
-        throw new Error(`PostgreSQL did not report current_setting('${name}')`);
-      }
-      return [name, value];
+      return [name, requiredQueryText(row, name)];
     }),
   );
+}
+
+function requiredQueryText(result: QueryResult, column: string, row = 0): string {
+  const value = result.rows[row]?.[column];
+  if (typeof value !== 'string') {
+    throw new Error(`query result missing text column '${column}' at row ${row}`);
+  }
+  return value;
 }
 
 function assertSafeCrashSettings(settings: PostgresSettings): void {

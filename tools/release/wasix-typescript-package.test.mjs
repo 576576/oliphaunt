@@ -22,13 +22,13 @@ function manifest() {
         browser: './lib/index.js',
         default: './lib/index.js',
       },
-      './protocol': {
-        types: './lib/protocol.d.ts',
-        default: './lib/protocol.js',
-      },
-      './query': {
-        types: './lib/query.d.ts',
-        default: './lib/query.js',
+      './worker': {
+        types: './lib/worker-entry.d.ts',
+        deno: './lib/worker-entry.deno.js',
+        bun: './lib/worker-entry.bun.js',
+        node: './lib/worker-entry.node.js',
+        browser: './lib/worker-entry.js',
+        default: './lib/worker-entry.js',
       },
       './internal/tools': {
         types: './lib/internal.d.ts',
@@ -106,6 +106,21 @@ describe('WASIX TypeScript release dependency closure', () => {
     );
   });
 
+  test('rejects a worker condition order that lets Node shadow Deno or Bun', () => {
+    const candidate = manifest();
+    candidate.exports['./worker'] = {
+      types: './lib/worker-entry.d.ts',
+      node: './lib/worker-entry.node.js',
+      deno: './lib/worker-entry.deno.js',
+      bun: './lib/worker-entry.bun.js',
+      browser: './lib/worker-entry.js',
+      default: './lib/worker-entry.js',
+    };
+    expect(() => assertWasixTypescriptManifest(candidate)).toThrow(
+      'must expose the exact browser, Node, Bun, and Deno worker entrypoint',
+    );
+  });
+
   test('rejects a cross-runtime directory storage fallback', () => {
     const candidate = manifest();
     candidate.exports['./storage/deno'].default = './lib/storage/deno.js';
@@ -114,11 +129,14 @@ describe('WASIX TypeScript release dependency closure', () => {
     );
   });
 
-  test('rejects an incomplete query entrypoint', () => {
+  test('rejects an accidental low-level query entrypoint', () => {
     const candidate = manifest();
-    delete candidate.exports['./query'].types;
+    candidate.exports['./query'] = {
+      types: './lib/query.d.ts',
+      default: './lib/query.js',
+    };
     expect(() => assertWasixTypescriptManifest(candidate)).toThrow(
-      'must expose the exact query entrypoint',
+      'exports do not match the deliberate public package surface',
     );
   });
 

@@ -4,20 +4,19 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { Oliphaunt } from '../index.js';
+import { simpleQuery } from '../protocol.js';
+import { parseSimpleQueryRawResponse } from '../query.js';
+import { PostgresWireClient } from '../runtime/pgwire.js';
 import { assertNativeDatabaseContract } from './native-direct-contract.mjs';
 
 async function main(): Promise<void> {
   const libraryPath = requiredEnv('LIBOLIPHAUNT_PATH');
-  await assertNativeDatabaseContract(
-    Oliphaunt,
-    { execution: 'direct', libraryPath },
-    'node-direct',
-  );
+  await assertNativeDatabaseContract(Oliphaunt, { topology: 'direct', libraryPath }, 'node-direct');
   const brokerExecutable = process.env.OLIPHAUNT_BROKER;
   if (brokerExecutable) {
     await assertNativeDatabaseContract(
       Oliphaunt,
-      { execution: 'broker', libraryPath, brokerExecutable },
+      { topology: 'broker', libraryPath, brokerExecutable },
       'broker',
     );
   }
@@ -37,15 +36,28 @@ async function main(): Promise<void> {
         });
         try {
           assert.match(server.connectionString, /^postgresql:\/\//u);
-          if (index === 0) {
-            assert.equal((await server.query('SELECT 1 AS value')).getText(0, 'value'), '1');
-            assert.equal('backup' in server, false);
+          assert.equal('query' in server, false);
+          assert.equal('cancel' in server, false);
+          assert.equal('backup' in server, false);
+          const connection = await connectToServer(server.connectionString);
+          let identifier: string | null;
+          try {
+            if (index === 0) {
+              const one = parseSimpleQueryRawResponse(
+                await connection.execProtocolRaw(simpleQuery('SELECT 1 AS value')),
+              );
+              assert.equal(one.getText(0, 'value'), '1');
+            }
+            identifier = parseSimpleQueryRawResponse(
+              await connection.execProtocolRaw(
+                simpleQuery(
+                  'SELECT system_identifier::text AS system_identifier FROM pg_control_system()',
+                ),
+              ),
+            ).getText(0, 'system_identifier');
+          } finally {
+            await connection.terminate();
           }
-          const identifier = (
-            await server.query(
-              'SELECT system_identifier::text AS system_identifier FROM pg_control_system()',
-            )
-          ).getText(0, 'system_identifier');
           assert.match(identifier ?? '', /^\d+$/u);
           assert.ok(identifier !== null);
           systemIdentifiers.push(identifier);
@@ -62,6 +74,22 @@ async function main(): Promise<void> {
       await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     }
   }
+}
+
+async function connectToServer(connectionString: string): Promise<PostgresWireClient> {
+  const endpoint = new URL(connectionString);
+  if (endpoint.hostname.length === 0) {
+    throw new Error('native server smoke requires a TCP connection string');
+  }
+  return PostgresWireClient.connect(
+    {
+      kind: 'tcp',
+      host: endpoint.hostname,
+      port: Number.parseInt(endpoint.port, 10),
+    },
+    decodeURIComponent(endpoint.username),
+    decodeURIComponent(endpoint.pathname.slice(1)),
+  );
 }
 
 function requiredEnv(name: string): string {

@@ -332,12 +332,11 @@ Cargo owns artifact selection:
 Consumer code uses the SDK without environment variables:
 
 ```rust
-let db = oliphaunt::Oliphaunt::builder()
-    .directory(".oliphaunt")
+let mut db = oliphaunt::Oliphaunt::builder()
+    .storage(oliphaunt::DatabaseStorage::Directory(".oliphaunt".into()))
     .direct()
-    .extension(oliphaunt::Extension::Vector)
-    .open()
-    .await?;
+    .extension(oliphaunt::Extension::VECTOR)
+    .open()?;
 ```
 
 Tauri documentation shows the one bundler stanza that copies the generated

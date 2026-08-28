@@ -1,4 +1,8 @@
-import type { WasixPersistenceMode, WasixProtocolConnectionMode } from './database.js';
+import type {
+  WasixPersistenceMode,
+  WasixProtocolConnectionMode,
+  WasixProtocolStreamOutcome,
+} from './database.js';
 import { WasixStorageError } from './errors.js';
 import { PostgresError, type PostgresErrorField } from './query.js';
 import type { SerializedWasixStorage } from './storage.js';
@@ -107,7 +111,7 @@ export type SerializedIcuDescriptor = {
   };
 };
 
-/** Host-ready open options shared by direct and worker execution. */
+/** Host-ready open options shared by both public execution surfaces. */
 export type SerializedOpenOptions = {
   runtime: SerializedRuntimeDescriptor;
   icu?: SerializedIcuDescriptor;
@@ -120,11 +124,14 @@ export type SerializedOpenOptions = {
   storage: SerializedWasixStorage;
 };
 
-/** @internal Compatibility name for the serialized options sent to a worker. */
-export type WorkerOpenOptions = SerializedOpenOptions;
-
 export type WorkerRequest =
   | { id: number; method: 'open'; options: SerializedOpenOptions }
+  | {
+      id: number;
+      method: 'restore';
+      storage: SerializedWasixStorage;
+      bytes: Uint8Array;
+    }
   | {
       id: number;
       method: 'exec';
@@ -161,11 +168,12 @@ export type SerializedWorkerError =
       code: WasixStorageError['code'];
       commitState: WasixStorageError['commitState'];
     }
-  | { name: 'PostgresError'; message: string; fields: PostgresErrorField[] }
-  | { name: 'Error'; message: string };
+  | { name: 'PostgresError'; fields: PostgresErrorField[] }
+  | { name: 'Error'; message: string; errorName?: string; stack?: string };
 
 export type WorkerResponse =
   | { id: number; kind: 'chunk'; sequence: number; value: Uint8Array }
+  | { id: number; ok: true; streamOutcome: WasixProtocolStreamOutcome }
   | { id: number; ok: true; value?: Uint8Array | WasixToolProcessResult }
   | { id: number; ok: false; error: SerializedWorkerError };
 
@@ -181,14 +189,16 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
   if (error instanceof PostgresError) {
     return {
       name: 'PostgresError',
-      message: error.message,
       fields: error.fields.map((field) => ({ ...field })),
     };
   }
-  return {
+  const generic = {
     name: 'Error',
     message: error instanceof Error ? error.message : String(error),
-  };
+    ...(error instanceof Error && error.name !== 'Error' ? { errorName: error.name } : {}),
+    ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
+  } as const;
+  return generic;
 }
 
 export function deserializeWorkerError(error: SerializedWorkerError): Error {
@@ -199,9 +209,10 @@ export function deserializeWorkerError(error: SerializedWorkerError): Error {
     });
   }
   if (error.name === 'PostgresError') {
-    const restored = new PostgresError(error.fields);
-    restored.message = error.message;
-    return restored;
+    return new PostgresError(error.fields);
   }
-  return new Error(error.message);
+  const restored = new Error(error.message);
+  restored.name = error.errorName ?? 'Error';
+  if (error.stack !== undefined) restored.stack = error.stack;
+  return restored;
 }

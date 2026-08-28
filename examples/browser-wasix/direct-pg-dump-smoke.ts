@@ -12,7 +12,7 @@ export async function expectDirectPgDump(database: OliphauntDatabase): Promise<v
     throw new Error('direct browser pg_dump did not preserve standard plain COPY output');
   }
 
-  const result = await database.query('SELECT value FROM direct_pg_dump_probe WHERE id = 1');
+  const result = await database.queryRaw('SELECT value FROM direct_pg_dump_probe WHERE id = 1');
   if (result.getText(0, 'value') !== 'same-realm') {
     throw new Error('direct browser database was not usable after pg_dump');
   }

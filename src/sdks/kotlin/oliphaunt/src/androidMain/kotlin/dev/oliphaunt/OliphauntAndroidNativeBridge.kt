@@ -19,11 +19,11 @@ internal object OliphauntAndroidNativeBridge {
         request: ByteArray,
     ): ByteArray
 
-    external fun execProtocolStreamNative(
+    external fun execProtocolRawStreamNative(
         handle: Long,
         request: ByteArray,
         sink: OliphauntAndroidProtocolStreamSink,
-    )
+    ): Boolean
 
     external fun backupNative(handle: Long): ByteArray
 

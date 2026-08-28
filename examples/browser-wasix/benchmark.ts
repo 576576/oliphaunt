@@ -1,6 +1,7 @@
 import { PGlite } from '@electric-sql/pglite';
 import { PGliteWorker } from '@electric-sql/pglite/worker';
 import Oliphaunt from '@oliphaunt/wasix-ts';
+import WorkerOliphaunt from '@oliphaunt/wasix-ts/worker';
 import { opfs } from '@oliphaunt/wasix-ts/storage/opfs';
 
 type QueryParameters = readonly (null | string | number | boolean)[];
@@ -140,9 +141,22 @@ const engines: Engine[] = [
   { name: 'pgliteDirect', open: openPGliteDirect },
   { name: 'pgliteWorker', open: openPGliteWorker },
 ];
+const oliphauntExecutionSurfaces = {
+  direct: {
+    entrypoint: '@oliphaunt/wasix-ts',
+    callingContract: 'async',
+    executionOwner: 'caller',
+  },
+  worker: {
+    entrypoint: '@oliphaunt/wasix-ts/worker',
+    callingContract: 'async',
+    executionOwner: 'sdk-worker',
+  },
+} as const;
+type OliphauntExecutionSurface = keyof typeof oliphauntExecutionSurfaces;
 
 document.documentElement.dataset.oliphauntSmoke = 'running';
-status.textContent = 'Running direct-for-direct and worker-for-worker browser benchmarks…';
+status.textContent = 'Running caller-owned and Worker-owned browser benchmarks…';
 
 try {
   const startup = await measureStartup();
@@ -152,10 +166,10 @@ try {
   const insertSummary = summarizeInsertDiagnostics(insertDiagnostic);
   const postgresProfiles = representativePostgresProfiles(workload);
   const result = {
-    schema: 'oliphaunt-wasix-browser-engine-result-v1',
-    plan: 'browser-pglite-memory-v1',
+    schema: 'oliphaunt-wasix-browser-engine-result-v2',
+    plan: 'browser-pglite-memory-v2',
     mode: quick ? 'quick' : 'full',
-    benchmark: 'oliphaunt-wasix-vs-pglite-v3',
+    benchmark: 'oliphaunt-wasix-vs-pglite-v4',
     measuredAt: new Date().toISOString(),
     environment: {
       userAgent: navigator.userAgent,
@@ -163,7 +177,7 @@ try {
       crossOriginIsolated: globalThis.crossOriginIsolated,
     },
     configuration: {
-      primaryTopologies: ['direct-for-direct', 'worker-for-worker'],
+      executionSurfaces: oliphauntExecutionSurfaces,
       coldStartupComparable: false,
       coldStartupNote:
         'firstReady samples are descriptive because each implementation caches compiled assets differently',
@@ -503,8 +517,8 @@ function summarizeResults(
   workload: Record<Engine['name'], WorkloadRun[]>,
 ): Record<string, unknown> {
   const startupSummary = {
-    firstReadyMs: topologyComparisons(startup, (samples) => samples.slice(0, 1)),
-    warmReadyMs: topologyComparisons(startup, (samples) => samples.slice(1)),
+    firstReadyMs: executionSurfaceComparisons(startup, (samples) => samples.slice(0, 1)),
+    warmReadyMs: executionSurfaceComparisons(startup, (samples) => samples.slice(1)),
   };
   const workloadSummary = Object.fromEntries(
     workloadMetrics.map((metric) => [
@@ -524,7 +538,7 @@ function summarizeResults(
   return { startup: startupSummary, workload: workloadSummary };
 }
 
-function topologyComparisons(
+function executionSurfaceComparisons(
   samples: Record<Engine['name'], number[]>,
   select: (values: number[]) => number[],
 ) {
@@ -581,11 +595,11 @@ function comparison(wasixMs: number | undefined, pgliteMs: number | undefined) {
   };
 }
 
-async function openWasix(execution: 'direct' | 'worker'): Promise<OpenResult> {
+async function openWasix(executionSurface: OliphauntExecutionSurface): Promise<OpenResult> {
   const started = performance.now();
-  const database = await Oliphaunt.open({
-    execution,
-    ...(persistentWorkerStorage && execution === 'worker'
+  const client = executionSurface === 'direct' ? Oliphaunt : WorkerOliphaunt;
+  const database = await client.open({
+    ...(persistentWorkerStorage && executionSurface === 'worker'
       ? { storage: opfs(nextPersistentDatabase('wasix')) }
       : {}),
   });
@@ -595,17 +609,17 @@ async function openWasix(execution: 'direct' | 'worker'): Promise<OpenResult> {
     readyMs,
     database: {
       postgres,
-      query: (sql, parameters = []) => database.query(sql, parameters),
+      query: (sql, parameters = []) => database.queryRaw(sql, parameters),
       scalar: async (sql) => {
-        const result = await database.query(sql);
+        const result = await database.queryRaw(sql);
         return result.rows[0]?.text(0) ?? '';
       },
       transaction: (body) =>
         database.transaction((transaction) =>
-          body({ query: (sql, parameters = []) => transaction.query(sql, parameters) }),
+          body({ query: (sql, parameters = []) => transaction.queryRaw(sql, parameters) }),
         ),
       consume(result) {
-        const query = result as Awaited<ReturnType<typeof database.query>>;
+        const query = result as Awaited<ReturnType<typeof database.queryRaw>>;
         let checksum = 0;
         for (const row of query.rows) {
           checksum += Number(row.text(0));
@@ -730,7 +744,7 @@ function scalarFromResult(result: unknown): string {
 async function readWasixPostgresProfile(
   database: Awaited<ReturnType<typeof Oliphaunt.open>>,
 ): Promise<PostgresProfile> {
-  const result = await database.query(postgresProfileSql());
+  const result = await database.queryRaw(postgresProfileSql());
   return {
     version: result.getText(0, 'version') ?? 'unknown',
     fsync: result.getText(0, 'fsync') ?? 'unknown',

@@ -121,7 +121,7 @@ try {
   if (!correctness.passed) throw new Error('correctness result-stream hashes differ');
 
   const report = {
-    schema: 'oliphaunt-wasix-node-engine-run-v1',
+    schema: 'oliphaunt-wasix-node-engine-run-v2',
     plan: { id: source.plan.id, sha256: source.sha256 },
     engine: database.identity,
     repeat: args.repeat,
@@ -143,20 +143,25 @@ try {
 }
 
 async function openEngine(engine, plan, candidateRoot) {
-  if (engine === 'candidate') return openCandidate(plan, candidateRoot, false);
-  if (engine === 'candidate-main-thread') return openCandidate(plan, candidateRoot, true);
-  if (engine === 'comparison') return openComparisonWorker(plan);
-  return openComparisonMainThread(plan);
+  if (engine === 'candidate-direct') return openCandidate(plan, candidateRoot, 'direct');
+  if (engine === 'candidate-worker') return openCandidate(plan, candidateRoot, 'worker');
+  if (engine === 'comparison-direct') return openComparisonCallerRealm(plan);
+  if (engine === 'comparison-worker') return openComparisonWorker(plan);
+  throw new Error(`unsupported benchmark engine ${JSON.stringify(engine)}`);
 }
 
-async function openCandidate(plan, candidateRoot, direct) {
+async function openCandidate(plan, candidateRoot, surfaceName) {
   if (candidateRoot === undefined)
     throw new Error('--candidate-root is required for candidate runs');
   const require = createRequire(resolve(candidateRoot, 'package.json'));
-  const entry = require.resolve(plan.engines.candidate.package);
+  const surface = plan.engines.candidate.surfaces[surfaceName];
+  const entry = require.resolve(surface.entrypoint);
   const { manifest } = await findPackageManifest(entry, plan.engines.candidate.package);
-  if (!entry.split('\\').join('/').endsWith('/lib/index.node.js')) {
-    throw new Error(`candidate resolved ${entry}, expected the Node worker_threads entrypoint`);
+  const expectedFile = surfaceName === 'worker' ? 'worker-entry.node.js' : 'index.node.js';
+  if (!entry.split('\\').join('/').endsWith(`/lib/${expectedFile}`)) {
+    throw new Error(
+      `${surface.entrypoint} resolved ${entry}, expected the conditional Node entrypoint lib/${expectedFile}`,
+    );
   }
   const module = await import(pathToFileURL(entry).href);
   const client = module.default;
@@ -167,30 +172,31 @@ async function openCandidate(plan, candidateRoot, direct) {
     throw new Error(`${plan.engines.candidate.package} has no explicit memory storage selector`);
   }
   const instance = await client.open({
-    execution: direct ? 'direct' : 'worker',
     storage: module.memory(),
   });
   return {
     identity: {
-      kind: direct ? 'candidate-main-thread' : 'candidate',
+      kind: surface.engine,
       package: manifest.name,
       version: manifest.version,
       resolvedEntry: relative(candidateRoot, entry).split('\\').join('/'),
-      executionBoundary: direct
-        ? plan.engines.candidate.directExecutionBoundary
-        : plan.engines.candidate.executionBoundary,
-      isolationImplementation: direct
-        ? plan.engines.candidate.directIsolationImplementation
-        : plan.engines.candidate.isolationImplementation,
-      timingBoundary: direct
-        ? plan.engines.candidate.directTimingBoundary
-        : plan.engines.candidate.timingBoundary,
+      entrypoint: surface.entrypoint,
+      callingContract: surface.callingContract,
+      executionOwner: surface.executionOwner,
+      executionBoundary: surface.executionBoundary,
+      isolationImplementation: surface.isolationImplementation,
+      timingBoundary: surface.timingBoundary,
       storage: plan.engines.candidate.storage,
     },
-    query: async (sql, parameters) => canonicalCandidate(await instance.query(sql, parameters)),
+    query: async (sql, parameters) =>
+      canonicalCandidate(
+        await instance.query(sql, parameters, { rowMode: 'array', valueMode: 'text' }),
+      ),
     execute: (sql) => instance.execute(sql),
     measureQuery: async (sql, parameters) => {
-      const measured = await timed(() => instance.query(sql, parameters));
+      const measured = await timed(() =>
+        instance.query(sql, parameters, { rowMode: 'array', valueMode: 'text' }),
+      );
       return { result: canonicalCandidate(measured.value), elapsedMs: measured.elapsedMs };
     },
     measureRawProtocol: async (input) => {
@@ -202,6 +208,7 @@ async function openCandidate(plan, candidateRoot, direct) {
 }
 
 async function openComparisonWorker(plan) {
+  const surface = plan.engines.comparison.surfaces.worker;
   const resolved = await comparisonPackage(plan);
   const rpc = benchmarkWorkerRpc(
     new Worker(new URL('./pglite-node-worker.mjs', import.meta.url), {
@@ -211,14 +218,17 @@ async function openComparisonWorker(plan) {
   await rpc.ready;
   return {
     identity: {
-      kind: 'comparison',
+      kind: surface.engine,
       package: resolved.manifest.name,
       version: resolved.manifest.version,
       resolvedEntry: resolved.entry,
-      executionBoundary: plan.engines.comparison.executionBoundary,
-      isolationImplementation: plan.engines.comparison.isolationImplementation,
+      entrypoint: surface.entrypoint,
+      callingContract: surface.callingContract,
+      executionOwner: surface.executionOwner,
+      executionBoundary: surface.executionBoundary,
+      isolationImplementation: surface.isolationImplementation,
       isolationAdapter: 'tools/perf/wasix-node/pglite-node-worker.mjs',
-      timingBoundary: plan.engines.comparison.timingBoundary,
+      timingBoundary: surface.timingBoundary,
       storage: plan.engines.comparison.storage,
     },
     query: async (sql, parameters) =>
@@ -246,19 +256,23 @@ async function openComparisonWorker(plan) {
   };
 }
 
-async function openComparisonMainThread(plan) {
+async function openComparisonCallerRealm(plan) {
+  const surface = plan.engines.comparison.surfaces.callerRealm;
   const resolved = await comparisonPackage(plan);
   const { PGlite } = await import(plan.engines.comparison.package);
   const instance = await PGlite.create('memory://');
   return {
     identity: {
-      kind: 'comparison-main-thread',
+      kind: surface.engine,
       package: resolved.manifest.name,
       version: resolved.manifest.version,
       resolvedEntry: resolved.entry,
-      executionBoundary: plan.engines.comparison.directExecutionBoundary,
-      isolationImplementation: plan.engines.comparison.directIsolationImplementation,
-      timingBoundary: plan.engines.comparison.directTimingBoundary,
+      entrypoint: surface.entrypoint,
+      callingContract: surface.callingContract,
+      executionOwner: surface.executionOwner,
+      executionBoundary: surface.executionBoundary,
+      isolationImplementation: surface.isolationImplementation,
+      timingBoundary: surface.timingBoundary,
       storage: plan.engines.comparison.storage,
     },
     query: async (sql, parameters) => canonicalComparison(await instance.query(sql, parameters)),
@@ -366,7 +380,7 @@ function benchmarkWorkerRpc(worker) {
 function canonicalCandidate(result) {
   return canonicalResult(
     result.fields.map((field) => field.name),
-    result.rows.map((row) => row.values.map((_, index) => row.text(index))),
+    result.rows.map((row) => [...row]),
   );
 }
 
@@ -439,12 +453,12 @@ function parseArguments(argv) {
     values[flag] = value;
   }
   if (
-    !['candidate', 'candidate-main-thread', 'comparison', 'comparison-main-thread'].includes(
+    !['candidate-direct', 'candidate-worker', 'comparison-direct', 'comparison-worker'].includes(
       values['--engine'],
     )
   ) {
     throw new Error(
-      '--engine must be candidate, candidate-main-thread, comparison, or comparison-main-thread',
+      '--engine must be candidate-direct, candidate-worker, comparison-direct, or comparison-worker',
     );
   }
   const repeat = Number(values['--repeat']);

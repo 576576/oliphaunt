@@ -107,8 +107,13 @@ journal lets portable adapters publish only changed PGDATA paths. OPFS worker
 execution bypasses that copy through a same-realm synchronous filesystem
 bridge. Ordinary protocol operations complete their provider boundary after
 `ReadyForQuery`; callback transactions do so once after confirmed `COMMIT` or
-`ROLLBACK`. Explicit `checkpoint()` runs PostgreSQL `CHECKPOINT` and then one
-provider boundary.
+`ROLLBACK`. A new persistent direct-OPFS database has one separate internal
+full-publication boundary after initialization so an incomplete initial
+namespace never becomes ready. The initializing/ready phase and full-flush
+selector are provider details, not public operations or configuration.
+Applications that need a PostgreSQL checkpoint call `execute("CHECKPOINT")`;
+that statement completes the same ordinary provider boundary as another
+successful operation.
 
 Each logical IndexedDB name owns an independent physical IndexedDB database.
 Compatibility metadata and path rows change in one atomic read-write
@@ -192,7 +197,7 @@ The shared unit is the invariant, not a universal filesystem interface:
 | Concern | Shared owner | Language/provider-specific part |
 | --- | --- | --- |
 | Database-root identity | The neutral fixture defines the `.oliphaunt.json` schema and `pgdata` location; each runtime family owns its physical-format value | Native SDKs publish descriptors last during root preparation; `liboliphaunt` validates them on open and creates one only in private restore staging. `liboliphaunt-wasix` defines the WASIX value consumed by Rust and TypeScript hosts; cross-family opens have no special guard because they are outside the supported contract |
-| Native ownership | `liboliphaunt` owns direct, broker-helper, and restore sibling leases and validates descriptors | SDKs resolve paths and hydrate packaged PGDATA; Rust server takes the same sibling lease because it bypasses C |
+| Native ownership | C-backed direct and restore paths plus native Rust direct, broker, and server paths coordinate through one sibling-lock identity; `liboliphaunt` validates direct descriptors | C-backed SDKs let `liboliphaunt` own the lease; native Rust retains the byte-identical lease and hands direct/broker ownership into C explicitly, while its server keeps the lease because it bypasses C |
 | WASIX host-directory persistence | PostgreSQL major plus the versioned WASIX physical format define reopen compatibility | Rust accesses host PGDATA directly and uses a binding-local stable sibling owner; TypeScript host-directory adapters hydrate Wasmer memory, publish journaled deltas, and use their own stable sibling owner |
 | Browser persistence | Public lifecycle and error vocabulary | IndexedDB keeps atomic row transactions; OPFS uses one opaque pool for direct worker I/O and portable publication; both use Web Locks |
 | Cross-family transfer | Logical SQL dump/restore | Physical backup formats remain family-scoped |

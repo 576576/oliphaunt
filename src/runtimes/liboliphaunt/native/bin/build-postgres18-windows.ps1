@@ -104,6 +104,7 @@ $ExactExtensionCatalogRows = $null
 
 $LiboliphauntSources = @(
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_native.c",
+    "src/runtimes/liboliphaunt/native/src/liboliphaunt_error.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_runtime.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_protocol.c",
     "src/runtimes/liboliphaunt/native/src/liboliphaunt_config.c",
@@ -2973,7 +2974,7 @@ function Compile-LiboliphauntSources {
         $object = Join-Path $ObjDir ([System.IO.Path]::GetFileNameWithoutExtension($source) + ".obj")
         $sourceName = [System.IO.Path]::GetFileNameWithoutExtension($source)
         Invoke-Logged "compile-liboliphaunt-$sourceName.log" {
-            cl.exe /nologo /O2 /Zi /MD /DOLIPHAUNT_EMBEDDED /DOLIPHAUNT_BUILTIN_PLPGSQL /DOLIPHAUNT_BUILDING_DLL /D_CRT_SECURE_NO_WARNINGS `
+            cl.exe /nologo /std:c11 /O2 /Zi /MD /DOLIPHAUNT_EMBEDDED /DOLIPHAUNT_BUILTIN_PLPGSQL /DOLIPHAUNT_BUILDING_DLL /D_CRT_SECURE_NO_WARNINGS `
                 "/I$(Join-Path $RepoRoot "src/runtimes/liboliphaunt/native/include")" `
                 "/I$(Join-Path $RepoRoot "src/runtimes/liboliphaunt/native/src")" `
                 /c $source "/Fo$object"
@@ -2992,16 +2993,23 @@ function Link-LiboliphauntDll([System.Collections.Generic.List[string]]$Objects)
         "oliphaunt_init",
         "oliphaunt_exec_protocol",
         "oliphaunt_exec_simple_query",
-        "oliphaunt_exec_protocol_stream",
+        "oliphaunt_exec_protocol_raw_stream",
         "oliphaunt_backup",
         "oliphaunt_restore",
+        "oliphaunt_init_with_error",
+        "oliphaunt_exec_protocol_with_error",
+        "oliphaunt_exec_simple_query_with_error",
+        "oliphaunt_exec_protocol_raw_stream_with_error",
+        "oliphaunt_backup_with_error",
+        "oliphaunt_restore_with_error",
+        "oliphaunt_detach_with_error",
         "oliphaunt_cancel",
         "oliphaunt_detach",
         "oliphaunt_logical_generation",
         "oliphaunt_close_if_generation",
         "oliphaunt_close",
         "oliphaunt_register_static_extensions",
-        "oliphaunt_last_error",
+        "oliphaunt_copy_last_error",
         "oliphaunt_version",
         "oliphaunt_free_response",
         "oliphaunt_embedded_kill",
@@ -3244,12 +3252,24 @@ function Artifact-Ready {
     foreach ($symbol in @(
         "oliphaunt_init",
         "oliphaunt_exec_protocol",
-        "oliphaunt_exec_protocol_stream",
+        "oliphaunt_exec_simple_query",
+        "oliphaunt_exec_protocol_raw_stream",
         "oliphaunt_backup",
         "oliphaunt_restore",
+        "oliphaunt_init_with_error",
+        "oliphaunt_exec_protocol_with_error",
+        "oliphaunt_exec_simple_query_with_error",
+        "oliphaunt_exec_protocol_raw_stream_with_error",
+        "oliphaunt_backup_with_error",
+        "oliphaunt_restore_with_error",
+        "oliphaunt_detach_with_error",
+        "oliphaunt_cancel",
+        "oliphaunt_detach",
         "oliphaunt_logical_generation",
         "oliphaunt_close_if_generation",
         "oliphaunt_close",
+        "oliphaunt_register_static_extensions",
+        "oliphaunt_copy_last_error",
         "oliphaunt_version",
         "oliphaunt_free_response"
     )) {

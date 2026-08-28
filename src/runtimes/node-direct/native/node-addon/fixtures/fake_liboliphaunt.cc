@@ -1,5 +1,6 @@
 #include "oliphaunt.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,17 +18,27 @@ struct OliphauntHandle {
 namespace {
 
 std::mutex g_mutex;
+std::mutex g_log_mutex;
 std::condition_variable g_query_condition;
 OliphauntHandle g_handle;
 char g_last_error[256] = "";
 bool g_failed_detach_once = false;
 bool g_query_cancelled = false;
+bool g_query_active = false;
+
+constexpr uint8_t kStreamFailRecovery = 0xf1;
+constexpr uint8_t kStreamUnknownAfterCallback = 0xf2;
+constexpr uint8_t kStreamSuccessAfterCallback = 0xf3;
+constexpr uint8_t kStreamAbortWithoutCallback = 0xf4;
+constexpr uint8_t kStreamFailureWithoutCallback = 0xf5;
+constexpr uint8_t kStreamUnknownWithoutCallback = 0xf6;
 
 void SetError(const char *message) {
   std::snprintf(g_last_error, sizeof(g_last_error), "%s", message);
 }
 
 void RecordEvent(const char *event) {
+  std::lock_guard<std::mutex> guard(g_log_mutex);
   const char *path = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_LOG");
   if (path == nullptr || path[0] == '\0') {
     std::abort();
@@ -48,6 +59,12 @@ int32_t OpenFake(OliphauntHandle **out) {
     return -1;
   }
   *out = nullptr;
+  const char *block_open = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_OPEN");
+  if (block_open != nullptr && std::strcmp(block_open, "1") == 0) {
+    RecordEvent("open-started");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    RecordEvent("open-finished");
+  }
   std::lock_guard<std::mutex> guard(g_mutex);
   if (g_handle.terminally_closed) {
     RecordEvent("init-after-close");
@@ -59,6 +76,8 @@ int32_t OpenFake(OliphauntHandle **out) {
     SetError("fake runtime already has an active logical handle");
     return -1;
   }
+  g_query_cancelled = false;
+  g_query_active = false;
   ++g_handle.logical_generation;
   if (g_handle.logical_generation == 0) {
     RecordEvent("generation-overflow");
@@ -85,6 +104,33 @@ bool BlockArchiveOperation() {
   return block != nullptr && std::strcmp(block, "1") == 0;
 }
 
+int32_t InvokeObservedStreamCallback(
+    OliphauntStreamCallback callback,
+    void *context,
+    const uint8_t *bytes,
+    size_t length) {
+  if (callback == nullptr) {
+    return 1;
+  }
+  const char *observe = std::getenv(
+      "OLIPHAUNT_NODE_CLEANUP_TEST_OBSERVE_BLOCKED_STREAM_CALLBACK");
+  if (observe == nullptr || std::strcmp(observe, "1") != 0) {
+    return callback(context, bytes, length);
+  }
+
+  std::atomic<bool> callback_returned = false;
+  std::thread observer([&callback_returned]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!callback_returned.load(std::memory_order_acquire)) {
+      RecordEvent("stream-callback-blocked");
+    }
+  });
+  const int32_t result = callback(context, bytes, length);
+  callback_returned.store(true, std::memory_order_release);
+  observer.join();
+  return result;
+}
+
 }  // namespace
 
 extern "C" {
@@ -107,9 +153,15 @@ OLIPHAUNT_API int32_t oliphaunt_exec_protocol(
       out->len = 0;
     }
     std::unique_lock<std::mutex> guard(g_mutex);
+    g_query_active = true;
     RecordEvent("query-started");
+    if (g_query_cancelled) {
+      RecordEvent("cancel");
+    }
     g_query_condition.wait(guard, [] { return g_query_cancelled; });
+    g_query_active = false;
     RecordEvent("query-cancelled");
+    g_query_cancelled = false;
     SetError("fake query was cancelled");
     return -1;
   }
@@ -124,12 +176,60 @@ OLIPHAUNT_API int32_t oliphaunt_exec_simple_query(
   return UnsupportedResponse(out);
 }
 
-OLIPHAUNT_API int32_t oliphaunt_exec_protocol_stream(
+OLIPHAUNT_API int32_t oliphaunt_exec_protocol_raw_stream(
     OliphauntHandle *,
-    const uint8_t *,
-    size_t,
-    OliphauntStreamCallback,
-    void *) {
+    const uint8_t *request,
+    size_t request_len,
+    OliphauntStreamCallback callback,
+    void *context) {
+  const char *block_stream = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_STREAM");
+  if (block_stream != nullptr && std::strcmp(block_stream, "1") == 0) {
+    const uint8_t behavior = request != nullptr && request_len == 1 ? request[0] : 0;
+    RecordEvent("stream-started");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (behavior == kStreamAbortWithoutCallback) {
+      RecordEvent("stream-abort-without-callback");
+      SetError("fake stream reported callback abort without callback failure");
+      return OLIPHAUNT_STREAM_CALLBACK_ABORTED;
+    }
+    if (behavior == kStreamFailureWithoutCallback) {
+      RecordEvent("stream-failure-without-callback");
+      SetError("fake stream failed before callback delivery");
+      return -1;
+    }
+    if (behavior == kStreamUnknownWithoutCallback) {
+      RecordEvent("stream-unknown-without-callback");
+      SetError("fake stream returned an unknown status before callback delivery");
+      return 2;
+    }
+    const uint8_t chunks[][2] = {{1, 2}, {3, 4}, {5, 6}};
+    const size_t chunk_count = sizeof(chunks) / sizeof(chunks[0]);
+    for (size_t index = 0; index < chunk_count; index++) {
+      const auto &chunk = chunks[index];
+      if (InvokeObservedStreamCallback(
+              callback, context, chunk, sizeof(chunk)) != 0) {
+        RecordEvent("stream-aborted");
+        if (behavior == kStreamSuccessAfterCallback) {
+          RecordEvent("stream-success-after-callback-abort");
+          return 0;
+        }
+        if (behavior == kStreamFailRecovery) {
+          RecordEvent("stream-recovery-failed");
+          SetError("fake stream recovery failed after callback abort");
+          return -1;
+        }
+        if (behavior == kStreamUnknownAfterCallback) {
+          RecordEvent("stream-unknown-status");
+          SetError("fake stream returned an unknown positive status");
+          return 2;
+        }
+        SetError("fake stream callback aborted execution");
+        return OLIPHAUNT_STREAM_CALLBACK_ABORTED;
+      }
+    }
+    RecordEvent("stream-finished");
+    return 0;
+  }
   SetError("fake cleanup fixture does not implement protocol streaming");
   return -1;
 }
@@ -172,9 +272,26 @@ OLIPHAUNT_API int32_t oliphaunt_cancel(OliphauntHandle *) {
   const char *block_query = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_QUERY");
   if (block_query != nullptr && std::strcmp(block_query, "1") == 0) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    RecordEvent("cancel");
-    g_query_cancelled = true;
-    g_query_condition.notify_all();
+    const char *ignore_early_cancel = std::getenv(
+        "OLIPHAUNT_NODE_CLEANUP_TEST_IGNORE_EARLY_CANCEL");
+    if (!g_query_active && ignore_early_cancel != nullptr &&
+        std::strcmp(ignore_early_cancel, "1") == 0) {
+      RecordEvent("cancel-early-ignored");
+      return 0;
+    }
+    if (!g_query_cancelled) {
+      g_query_cancelled = true;
+      if (g_query_active) {
+        RecordEvent("cancel");
+      }
+      g_query_condition.notify_all();
+    } else {
+      const char *record_repeat = std::getenv(
+          "OLIPHAUNT_NODE_CLEANUP_TEST_RECORD_REPEAT_CANCEL");
+      if (record_repeat != nullptr && std::strcmp(record_repeat, "1") == 0) {
+        RecordEvent("cancel-repeat");
+      }
+    }
   }
   return 0;
 }
@@ -197,6 +314,12 @@ OLIPHAUNT_API int32_t oliphaunt_detach(OliphauntHandle *handle) {
     RecordEvent("detach-failed");
     SetError("injected fake detach failure");
     return -1;
+  }
+  const char *block_detach = std::getenv("OLIPHAUNT_NODE_CLEANUP_TEST_BLOCK_DETACH");
+  if (block_detach != nullptr && std::strcmp(block_detach, "1") == 0) {
+    RecordEvent("detach-started");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    RecordEvent("detach-finished");
   }
   RecordEvent("detach");
   g_handle.logical_active = false;
@@ -264,8 +387,18 @@ OLIPHAUNT_API int32_t oliphaunt_register_static_extensions(
   return 0;
 }
 
-OLIPHAUNT_API const char *oliphaunt_last_error(OliphauntHandle *) {
-  return g_last_error;
+OLIPHAUNT_API size_t oliphaunt_copy_last_error(
+    OliphauntHandle *,
+    char *out,
+    size_t capacity) {
+  std::lock_guard<std::mutex> guard(g_mutex);
+  const size_t length = std::strlen(g_last_error);
+  if (capacity != 0 && out != nullptr) {
+    const size_t copied = length < capacity - 1 ? length : capacity - 1;
+    std::memcpy(out, g_last_error, copied);
+    out[copied] = '\0';
+  }
+  return length;
 }
 
 OLIPHAUNT_API const char *oliphaunt_version(void) {

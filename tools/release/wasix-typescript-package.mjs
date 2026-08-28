@@ -76,20 +76,20 @@ export const WASIX_TYPESCRIPT_REQUIRED_PACKAGE_FILES = Object.freeze([
   'lib/internal.node.js',
   'lib/node-client.d.ts',
   'lib/node-client.js',
+  'lib/node-client-common.d.ts',
+  'lib/node-client-common.js',
   'lib/node-direct.d.ts',
   'lib/node-direct.js',
   'lib/node-directory-lock.d.ts',
   'lib/node-directory-lock.js',
+  'lib/node-environment.d.ts',
+  'lib/node-environment.js',
   'lib/node-fs-commit-state.d.ts',
   'lib/node-fs-commit-state.js',
   'lib/node-host.d.ts',
   'lib/node-host.js',
   'lib/node-tool-worker.d.ts',
   'lib/node-tool-worker.js',
-  'lib/node-web-worker-bootstrap.d.ts',
-  'lib/node-web-worker-bootstrap.js',
-  'lib/node-web-worker.d.ts',
-  'lib/node-web-worker.js',
   'lib/node-worker-options.d.ts',
   'lib/node-worker-options.js',
   'lib/node-worker-port.d.ts',
@@ -98,8 +98,6 @@ export const WASIX_TYPESCRIPT_REQUIRED_PACKAGE_FILES = Object.freeze([
   'lib/node-worker.js',
   'lib/node-zstd.d.ts',
   'lib/node-zstd.js',
-  'lib/open-options.d.ts',
-  'lib/open-options.js',
   'lib/pgwire.d.ts',
   'lib/pgwire.js',
   'lib/pgwire-connection.d.ts',
@@ -118,6 +116,8 @@ export const WASIX_TYPESCRIPT_REQUIRED_PACKAGE_FILES = Object.freeze([
   'lib/runtime-descriptor.js',
   'lib/server.node.d.ts',
   'lib/server.node.js',
+  'lib/startup-config.d.ts',
+  'lib/startup-config.js',
   'lib/storage-provider.d.ts',
   'lib/storage-provider.js',
   'lib/storage-snapshot.d.ts',
@@ -158,8 +158,20 @@ export const WASIX_TYPESCRIPT_REQUIRED_PACKAGE_FILES = Object.freeze([
   'lib/tool-worker.js',
   'lib/wasix-runtime.d.ts',
   'lib/wasix-runtime.js',
+  'lib/worker-client.d.ts',
+  'lib/worker-client.js',
   'lib/worker-dispatch.d.ts',
   'lib/worker-dispatch.js',
+  'lib/worker-entry.bun.d.ts',
+  'lib/worker-entry.bun.js',
+  'lib/worker-entry.deno.d.ts',
+  'lib/worker-entry.deno.js',
+  'lib/worker-entry.d.ts',
+  'lib/worker-entry.js',
+  'lib/worker-entry.node.d.ts',
+  'lib/worker-entry.node.js',
+  'lib/worker-node-client.d.ts',
+  'lib/worker-node-client.js',
   'lib/worker-rpc.d.ts',
   'lib/worker-rpc.js',
   'lib/worker-transfer.d.ts',
@@ -222,10 +234,9 @@ export function assertWasixTypescriptManifest(manifest, label = `${PACKAGE_NAME}
   const root = manifest.exports?.['.'];
   const expectedExports = [
     '.',
+    './worker',
     './package.json',
     './internal/tools',
-    './protocol',
-    './query',
     './server/bun',
     './server/deno',
     './server/node',
@@ -250,15 +261,18 @@ export function assertWasixTypescriptManifest(manifest, label = `${PACKAGE_NAME}
   ) {
     fail(`${label} must expose exact browser, Node, Bun, and Deno conditional entrypoints`);
   }
-  for (const name of ['protocol', 'query']) {
-    const entry = manifest.exports?.[`./${name}`];
-    if (
-      JSON.stringify(Object.keys(entry ?? {})) !== JSON.stringify(['types', 'default'])
-      || entry?.types !== `./lib/${name}.d.ts`
-      || entry?.default !== `./lib/${name}.js`
-    ) {
-      fail(`${label} must expose the exact ${name} entrypoint`);
-    }
+  const worker = manifest.exports?.['./worker'];
+  if (
+    JSON.stringify(Object.keys(worker ?? {}))
+      !== JSON.stringify(['types', 'deno', 'bun', 'node', 'browser', 'default'])
+    || worker?.types !== './lib/worker-entry.d.ts'
+    || worker?.deno !== './lib/worker-entry.deno.js'
+    || worker?.bun !== './lib/worker-entry.bun.js'
+    || worker?.node !== './lib/worker-entry.node.js'
+    || worker?.browser !== './lib/worker-entry.js'
+    || worker?.default !== './lib/worker-entry.js'
+  ) {
+    fail(`${label} must expose the exact browser, Node, Bun, and Deno worker entrypoint`);
   }
   const internalTools = manifest.exports?.['./internal/tools'];
   if (
@@ -399,12 +413,6 @@ export function assertWasixTypescriptNpmArchive(archive) {
   const expectedFiles = new Set(
     WASIX_TYPESCRIPT_REQUIRED_PACKAGE_FILES.map((name) => `package/${name}`),
   );
-  for (const removed of [
-    'package/lib/node-lock-identity.js',
-    'package/lib/node-lock-identity.d.ts',
-  ]) {
-    if (entries.has(removed)) fail(`${path.basename(file)} retained deleted output ${removed}`);
-  }
   for (const [name, entry] of entries) {
     if (entry.isSymbolicLink) fail(`${path.basename(file)} contains symbolic link ${name}`);
     if (entry.isFile && !expectedFiles.has(name)) {

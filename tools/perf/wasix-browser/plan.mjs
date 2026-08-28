@@ -12,11 +12,12 @@ import {
 export const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 export const defaultBrowserPlanFile = resolve(
   repositoryRoot,
-  'benchmarks/wasix/browser-pglite-memory-v1.json',
+  'benchmarks/wasix/browser-pglite-memory-v2.json',
 );
 
-const PLAN_SCHEMA = 'oliphaunt-wasix-browser-benchmark-plan-v1';
-const RESULT_SCHEMA = 'oliphaunt-wasix-browser-engine-result-v1';
+const PLAN_SCHEMA = 'oliphaunt-wasix-browser-benchmark-plan-v2';
+const RESULT_SCHEMA = 'oliphaunt-wasix-browser-engine-result-v2';
+const PLAN_ID = 'browser-pglite-memory-v2';
 const CANDIDATE_PACKAGE = '@oliphaunt/wasix-ts';
 const COMPARISON_PACKAGE = '@electric-sql/pglite';
 const COMPARISON_VERSION = '0.5.4';
@@ -109,9 +110,21 @@ const RUNTIME_BUILD = {
   linkerFlags: '',
   backendTiming: '0',
 };
-const TOPOLOGIES = {
+const SURFACE_COMPARISONS = {
   direct: ['wasixDirect', 'pgliteDirect'],
   worker: ['wasixWorker', 'pgliteWorker'],
+};
+const CANDIDATE_EXECUTION_SURFACES = {
+  direct: {
+    entrypoint: '@oliphaunt/wasix-ts',
+    callingContract: 'async',
+    executionOwner: 'caller',
+  },
+  worker: {
+    entrypoint: '@oliphaunt/wasix-ts/worker',
+    callingContract: 'async',
+    executionOwner: 'sdk-worker',
+  },
 };
 
 export async function loadBrowserPlan(file = defaultBrowserPlanFile) {
@@ -128,35 +141,37 @@ export async function loadBrowserPlan(file = defaultBrowserPlanFile) {
 
 export function validateBrowserPlan(plan) {
   requireRecord(plan, 'plan');
-  requireExactKeys(
-    plan,
-    ['schema', 'id', 'description', 'engines', 'profiles', 'measurement', 'gate', 'postgres'],
-    'plan',
-  );
   requireEqual(plan.schema, PLAN_SCHEMA, 'plan.schema');
-  requireEqual(plan.id, 'browser-pglite-memory-v1', 'plan.id');
-  requireNonEmptyString(plan.description, 'plan.description');
+  validatePlanEnvelope(plan);
+
   const engines = requireRecord(plan.engines, 'plan.engines');
   requireExactKeys(engines, ['candidate', 'comparison'], 'plan.engines');
   const candidate = requireRecord(engines.candidate, 'plan.engines.candidate');
   const comparison = requireRecord(engines.comparison, 'plan.engines.comparison');
   requireExactKeys(
     candidate,
-    ['package', 'storage', 'directBoundary', 'workerBoundary', 'dependencies', 'runtimeBuild'],
+    ['package', 'storage', 'surfaces', 'dependencies', 'runtimeBuild'],
     'plan.engines.candidate',
   );
   requireEqual(candidate.package, CANDIDATE_PACKAGE, 'plan.engines.candidate.package');
   requireEqual(candidate.storage, 'memory', 'plan.engines.candidate.storage');
-  requireEqual(
-    candidate.directBoundary,
-    'browser-caller-realm',
-    'plan.engines.candidate.directBoundary',
+  requireExactRecord(
+    requireRecord(candidate.surfaces, 'plan.engines.candidate.surfaces').direct,
+    {
+      engine: 'wasixDirect',
+      ...CANDIDATE_EXECUTION_SURFACES.direct,
+    },
+    'plan.engines.candidate.surfaces.direct',
   );
-  requireEqual(
-    candidate.workerBoundary,
-    'package-owned-web-worker',
-    'plan.engines.candidate.workerBoundary',
+  requireExactRecord(
+    candidate.surfaces.worker,
+    {
+      engine: 'wasixWorker',
+      ...CANDIDATE_EXECUTION_SURFACES.worker,
+    },
+    'plan.engines.candidate.surfaces.worker',
   );
+  requireExactKeys(candidate.surfaces, ['direct', 'worker'], 'plan.engines.candidate.surfaces');
   requireExactRecord(
     candidate.dependencies,
     { fzstd: '0.1.1' },
@@ -167,24 +182,80 @@ export function validateBrowserPlan(plan) {
     RUNTIME_BUILD,
     'plan.engines.candidate.runtimeBuild',
   );
-  requireExactRecord(
+
+  requireExactKeys(
     comparison,
-    {
-      package: COMPARISON_PACKAGE,
-      version: COMPARISON_VERSION,
-      integrity: COMPARISON_INTEGRITY,
-      homepage: 'https://pglite.dev',
-      sourceRepository: 'https://github.com/electric-sql/pglite',
-      sourceCommit: COMPARISON_COMMIT,
-      installedTreeHashSchema: 'oliphaunt-path-size-content-sha256-v1',
-      installedTreeSha256: COMPARISON_TREE_SHA256,
-      storage: 'memory',
-      directBoundary: 'browser-caller-realm',
-      workerBoundary: 'official-pglite-web-worker',
-    },
+    [
+      'package',
+      'version',
+      'integrity',
+      'homepage',
+      'sourceRepository',
+      'sourceCommit',
+      'installedTreeHashSchema',
+      'installedTreeSha256',
+      'storage',
+      'surfaces',
+    ],
     'plan.engines.comparison',
   );
+  for (const [field, expected] of Object.entries({
+    package: COMPARISON_PACKAGE,
+    version: COMPARISON_VERSION,
+    integrity: COMPARISON_INTEGRITY,
+    homepage: 'https://pglite.dev',
+    sourceRepository: 'https://github.com/electric-sql/pglite',
+    sourceCommit: COMPARISON_COMMIT,
+    installedTreeHashSchema: 'oliphaunt-path-size-content-sha256-v1',
+    installedTreeSha256: COMPARISON_TREE_SHA256,
+    storage: 'memory',
+  })) {
+    requireEqual(comparison[field], expected, `plan.engines.comparison.${field}`);
+  }
+  const comparisonSurfaces = requireRecord(
+    comparison.surfaces,
+    'plan.engines.comparison.surfaces',
+  );
+  requireExactKeys(
+    comparisonSurfaces,
+    ['callerRealm', 'worker'],
+    'plan.engines.comparison.surfaces',
+  );
+  requireExactRecord(
+    comparisonSurfaces.callerRealm,
+    {
+      engine: 'pgliteDirect',
+      entrypoint: '@electric-sql/pglite',
+      callingContract: 'async',
+      executionOwner: 'caller',
+    },
+    'plan.engines.comparison.surfaces.callerRealm',
+  );
+  requireExactRecord(
+    comparisonSurfaces.worker,
+    {
+      engine: 'pgliteWorker',
+      entrypoint: '@electric-sql/pglite/worker',
+      callingContract: 'async',
+      executionOwner: 'caller-provided-worker',
+    },
+    'plan.engines.comparison.surfaces.worker',
+  );
 
+  validateCommonPlan(plan);
+}
+
+function validatePlanEnvelope(plan) {
+  requireExactKeys(
+    plan,
+    ['schema', 'id', 'description', 'engines', 'profiles', 'measurement', 'gate', 'postgres'],
+    'plan',
+  );
+  requireEqual(plan.id, PLAN_ID, 'plan.id');
+  requireNonEmptyString(plan.description, 'plan.description');
+}
+
+function validateCommonPlan(plan) {
   const profiles = requireRecord(plan.profiles, 'plan.profiles');
   requireExactKeys(profiles, ['quick', 'full'], 'plan.profiles');
   requireExactRecord(profiles.quick, QUICK_PROFILE, 'plan.profiles.quick');
@@ -205,7 +276,7 @@ export function validateBrowserPlan(plan) {
     [
       'maxGeomeanRatio',
       'requiresCorrectness',
-      'requiresBothTopologies',
+      'requiresBothExecutionSurfaces',
       'metric',
       'metrics',
       'excluded',
@@ -214,7 +285,11 @@ export function validateBrowserPlan(plan) {
   );
   requireEqual(gate.maxGeomeanRatio, 0.8, 'plan.gate.maxGeomeanRatio');
   requireEqual(gate.requiresCorrectness, true, 'plan.gate.requiresCorrectness');
-  requireEqual(gate.requiresBothTopologies, true, 'plan.gate.requiresBothTopologies');
+  requireEqual(
+    gate.requiresBothExecutionSurfaces,
+    true,
+    'plan.gate.requiresBothExecutionSurfaces',
+  );
   requireEqual(
     gate.metric,
     'geometric-mean-of-median-paired-oliphaunt-over-pglite-ratios-lower-is-better',
@@ -259,8 +334,8 @@ export function summarizeBrowserResult(planSource, result) {
   const plan = planSource.plan;
   validateBrowserResult(plan, result);
   const correctness = summarizeCorrectness(plan, result);
-  const topologies = Object.fromEntries(
-    Object.entries(TOPOLOGIES).map(([topology, [candidate, comparison]]) => {
+  const comparisons = Object.fromEntries(
+    Object.entries(SURFACE_COMPARISONS).map(([surface, [candidate, comparison]]) => {
       const metrics = plan.gate.metrics.map((id) => {
         const candidateSamplesMs = metricSamples(result, candidate, id);
         const comparisonSamplesMs = metricSamples(result, comparison, id);
@@ -285,19 +360,21 @@ export function summarizeBrowserResult(planSource, result) {
         plan.gate.maxGeomeanRatio,
         correctness.passed,
       );
-      return [topology, { metrics, ...aggregate }];
+      return [surface, { metrics, ...aggregate }];
     }),
   );
   const qualificationEligible = plan.profiles[result.mode].qualificationEligible;
-  const performancePassed = Object.values(topologies).every((topology) => topology.gate.passed);
+  const performancePassed = Object.values(comparisons).every(
+    (comparison) => comparison.gate.passed,
+  );
   return {
     correctness,
-    topologies,
+    comparisons,
     gate: {
       required: qualificationEligible,
       passed: qualificationEligible ? performancePassed && correctness.passed : null,
       maxGeomeanRatio: plan.gate.maxGeomeanRatio,
-      requiresBothTopologies: true,
+      requiresBothExecutionSurfaces: true,
       metric: plan.gate.metric,
       excluded: plan.gate.excluded,
     },
@@ -320,9 +397,9 @@ export function browserPlanSummary(source) {
 }
 
 export function browserMarkdownReport(report) {
-  const topologySections = Object.entries(report.summary.topologies)
-    .map(([name, topology]) => {
-      const rows = topology.metrics
+  const comparisonSections = Object.entries(report.summary.comparisons)
+    .map(([name, comparison]) => {
+      const rows = comparison.metrics
         .map(
           (metric) =>
             `| \`${metric.id}\` | ${metric.candidateMedianMs.toFixed(3)} | ` +
@@ -330,13 +407,13 @@ export function browserMarkdownReport(report) {
         )
         .join('\n');
       const gateLabel = report.summary.gate.required
-        ? `Comfortable-win gate: **${topology.gate.passed ? 'PASS' : 'FAIL'}**`
-        : `Comfortable-win statistic: **${topology.gate.passed ? 'would pass' : 'would fail'} (advisory quick profile)**`;
-      return `## ${name[0].toUpperCase()}${name.slice(1)} topology
+        ? `Comfortable-win gate: **${comparison.gate.passed ? 'PASS' : 'FAIL'}**`
+        : `Comfortable-win statistic: **${comparison.gate.passed ? 'would pass' : 'would fail'} (advisory quick profile)**`;
+      return `## ${name[0].toUpperCase()}${name.slice(1)} comparison
 
 - ${gateLabel}
-- Geometric-mean ratio: **${topology.geomeanRatio.toFixed(4)}** (required <= ${topology.gate.maxGeomeanRatio.toFixed(2)})
-- Observed aggregate win: **${topology.gate.observedWinPercent.toFixed(2)}%**
+- Geometric-mean ratio: **${comparison.geomeanRatio.toFixed(4)}** (required <= ${comparison.gate.maxGeomeanRatio.toFixed(2)})
+- Observed aggregate win: **${comparison.gate.observedWinPercent.toFixed(2)}%**
 
 | Metric (lower is better) | Oliphaunt median ms | PGlite median ms | Median paired ratio |
 | --- | ---: | ---: | ---: |
@@ -355,9 +432,9 @@ ${rows}`;
 - Indexed-insert WAL parity: **${report.summary.correctness.indexedInsertWal.passed ? 'PASS' : 'FAIL'}**
 - Overall qualification: **${report.summary.gate.required ? (report.summary.gate.passed ? 'PASS' : 'FAIL') : 'NOT GATED (quick profile)'}**
 
-${topologySections}
+${comparisonSections}
 
-First cold open, duplicated workload-open time, close, and insert decomposition remain in the JSON report but are not speed-gated. Close is descriptive because the public APIs make different worker-reclamation guarantees. The gate requires the geometric mean of median same-run Oliphaunt/PGlite ratios to be at most 0.80 independently in both matched topologies, after workload assertions and PostgreSQL durability/WAL parity pass.
+First cold open, duplicated workload-open time, close, and insert decomposition remain in the JSON report but are not speed-gated. Close is descriptive because the public APIs make different worker-reclamation guarantees. The gate requires the geometric mean of median same-run Oliphaunt/PGlite ratios to be at most 0.80 independently for the caller-owned root and explicit SDK-owned Worker execution surfaces, after workload assertions and PostgreSQL durability/WAL parity pass.
 `;
 }
 
@@ -381,6 +458,11 @@ function validateBrowserResult(plan, result) {
   }
   requireEqual(configuration.rows, plan.measurement.rows, 'result.configuration.rows');
   requireEqual(configuration.storage, plan.measurement.storage, 'result.configuration.storage');
+  requireNestedExactRecord(
+    configuration.executionSurfaces,
+    CANDIDATE_EXECUTION_SURFACES,
+    'result.configuration.executionSurfaces',
+  );
   requireEqual(result.correctness?.assertionsPassed, true, 'result correctness');
   requireEqual(result.environment?.crossOriginIsolated, true, 'cross-origin isolation');
 
@@ -402,7 +484,7 @@ function validateBrowserResult(plan, result) {
 function summarizeCorrectness(plan, result) {
   const settings = plan.postgres.settings;
   const durability = Object.fromEntries(
-    Object.entries(TOPOLOGIES).map(([topology, [candidate, comparison]]) => {
+    Object.entries(SURFACE_COMPARISONS).map(([surface, [candidate, comparison]]) => {
       const candidateProfile = result.postgresProfiles[candidate];
       const comparisonProfile = result.postgresProfiles[comparison];
       const candidateValid = profileMatches(candidateProfile, settings, plan.postgres.major);
@@ -411,7 +493,7 @@ function summarizeCorrectness(plan, result) {
         (setting) => candidateProfile?.[setting] === comparisonProfile?.[setting],
       );
       return [
-        topology,
+        surface,
         { passed: candidateValid && comparisonValid && parity, candidateProfile, comparisonProfile },
       ];
     }),
@@ -420,12 +502,12 @@ function summarizeCorrectness(plan, result) {
 
   const wal = result.insertDiagnostic.summary.indexedInsertWalBytes;
   const indexedInsertWal = Object.fromEntries(
-    Object.entries(TOPOLOGIES).map(([topology, [candidate, comparison]]) => {
+    Object.entries(SURFACE_COMPARISONS).map(([surface, [candidate, comparison]]) => {
       const candidateBytes = positiveNumber(wal[candidate], `${candidate} WAL bytes`);
       const comparisonBytes = positiveNumber(wal[comparison], `${comparison} WAL bytes`);
       const deltaPercent = (Math.abs(candidateBytes - comparisonBytes) / comparisonBytes) * 100;
       return [
-        topology,
+        surface,
         {
           passed: deltaPercent <= plan.postgres.indexedInsertWalTolerancePercent,
           candidateBytes,
@@ -494,6 +576,15 @@ function requireExactRecord(value, expected, label) {
   requireExactKeys(record, Object.keys(expected), label);
   for (const [field, expectedValue] of Object.entries(expected)) {
     requireEqual(record[field], expectedValue, `${label}.${field}`);
+  }
+  return record;
+}
+
+function requireNestedExactRecord(value, expected, label) {
+  const record = requireRecord(value, label);
+  requireExactKeys(record, Object.keys(expected), label);
+  for (const [field, expectedValue] of Object.entries(expected)) {
+    requireExactRecord(record[field], expectedValue, `${label}.${field}`);
   }
   return record;
 }

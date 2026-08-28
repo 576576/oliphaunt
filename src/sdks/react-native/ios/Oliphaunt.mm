@@ -21,6 +21,9 @@
 #include <string>
 #include <vector>
 
+NSString * const OliphauntProtocolStreamCallbackAbortedErrorDomain =
+    @"dev.oliphaunt.reactnative.ios.protocolStreamCallbackAborted";
+
 #ifdef RCT_NEW_ARCH_ENABLED
 class OliphauntChunkAcknowledgement final {
  public:
@@ -491,14 +494,27 @@ static facebook::jsi::Value OliphauntCreateError(
       .getPropertyAsFunction(runtime, "Error")
       .callAsConstructor(runtime, facebook::jsi::String::createFromUtf8(runtime, message));
 }
+
+static facebook::jsi::Value OliphauntCreateProtocolCallbackAbortedError(
+    facebook::jsi::Runtime &runtime,
+    const std::string &message)
+{
+  auto value = OliphauntCreateError(runtime, message);
+  auto object = value.asObject(runtime);
+  object.setProperty(runtime, "__oliphauntProtocolCallbackAborted", true);
+  return object;
+}
 #endif
+
+@interface Oliphaunt ()
+- (void)closeIfGeneration:(double)generation;
+@end
 
 @implementation Oliphaunt {
   NSMutableDictionary<NSNumber *, OliphauntAdapterDatabase *> *_sessions;
   dispatch_queue_t _methodQueue;
   uint64_t _nativeDirectClaim;
   BOOL _invalidated;
-  uint64_t _nextHandle;
 }
 
 RCT_EXPORT_MODULE(Oliphaunt)
@@ -513,7 +529,6 @@ RCT_EXPORT_MODULE(Oliphaunt)
   if (self = [super init]) {
     _sessions = [NSMutableDictionary new];
     _methodQueue = dispatch_queue_create("dev.oliphaunt.reactnative.ios.module", DISPATCH_QUEUE_SERIAL);
-    _nextHandle = 1;
   }
   return self;
 }
@@ -544,7 +559,6 @@ RCT_EXPORT_MODULE(Oliphaunt)
                           reject:(RCTPromiseRejectBlock)reject
 {
   NSDictionary *configCopy = [config copy] ?: @{};
-  __block NSNumber *handle = nil;
   @synchronized (self) {
     if (_invalidated) {
       reject(
@@ -553,14 +567,6 @@ RCT_EXPORT_MODULE(Oliphaunt)
           nil);
       return;
     }
-    if (_nextHandle > static_cast<uint64_t>(kOliphauntMaxSafeIntegerHandle)) {
-      reject(
-          @"liboliphaunt_open_failed",
-          @"React Native Oliphaunt handle space is exhausted",
-          nil);
-      return;
-    }
-    handle = @(_nextHandle++);
   }
   OliphauntAcquireNativeDirect(^(uint64_t claim, NSError *_Nullable admissionError) {
     if (admissionError != nil) {
@@ -571,6 +577,17 @@ RCT_EXPORT_MODULE(Oliphaunt)
           admissionError);
       return;
     }
+    if (claim > static_cast<uint64_t>(kOliphauntMaxSafeIntegerHandle)) {
+      OliphauntReleaseNativeDirect(claim);
+      reject(
+          @"liboliphaunt_open_failed",
+          @"React Native Oliphaunt generation space is exhausted",
+          nil);
+      return;
+    }
+    // The opaque JS handle is the process-wide ownership generation, so stale
+    // finalizers can only name the exact session they originally owned.
+    NSNumber *handle = @(claim);
 
     __block BOOL invalidatedBeforeOpen = NO;
     @synchronized (self) {
@@ -728,6 +745,30 @@ RCT_EXPORT_MODULE(Oliphaunt)
   transport.setProperty(runtime, "version", 1);
   transport.setProperty(
       runtime,
+      "closeIfGeneration",
+      facebook::jsi::Function::createFromHostFunction(
+          runtime,
+          facebook::jsi::PropNameID::forAscii(runtime, "liboliphauntCloseIfGeneration"),
+          1,
+          [weakSelf](
+              facebook::jsi::Runtime &runtime,
+              const facebook::jsi::Value &,
+              const facebook::jsi::Value *args,
+              size_t count) -> facebook::jsi::Value {
+            if (count != 1) {
+              throw facebook::jsi::JSError(
+                  runtime,
+                  "liboliphaunt JSI closeIfGeneration expects a generation");
+            }
+            double generation = OliphauntCopyHandleArgument(runtime, args[0]);
+            Oliphaunt *strongSelf = weakSelf;
+            if (strongSelf != nil) {
+              [strongSelf closeIfGeneration:generation];
+            }
+            return facebook::jsi::Value::undefined();
+          }));
+  transport.setProperty(
+      runtime,
       "execProtocolRaw",
       facebook::jsi::Function::createFromHostFunction(
           runtime,
@@ -873,7 +914,7 @@ RCT_EXPORT_MODULE(Oliphaunt)
                     auto acknowledgement = std::make_shared<OliphauntChunkAcknowledgement>();
                     OliphauntRegisterChunkAcknowledgement(acknowledgement);
                     try {
-                      chunkCallback->call([strongSelf, bytes = std::move(bytes), acknowledgement, reject, settled](
+                      chunkCallback->call([strongSelf, bytes = std::move(bytes), acknowledgement](
                                               facebook::jsi::Runtime &runtime,
                                               facebook::jsi::Function &chunkFunction) mutable {
                         @synchronized (strongSelf) {
@@ -892,32 +933,12 @@ RCT_EXPORT_MODULE(Oliphaunt)
                                 runtime,
                                 "__oliphauntProtocolChunkFailure");
                             if (failureMarker.isBool() && failureMarker.getBool()) {
-                              auto failure = std::make_shared<facebook::jsi::Value>(
-                                  runtime,
-                                  resultObject.getProperty(runtime, "error"));
-                              if (!settled->exchange(true)) {
-                                reject->call([failure](
-                                                 facebook::jsi::Runtime &runtime,
-                                                 facebook::jsi::Function &rejectFunction) {
-                                  rejectFunction.call(
-                                      runtime,
-                                      facebook::jsi::Value(runtime, *failure));
-                                });
-                              }
                               acknowledgement->reject("protocol stream callback failed");
                               return;
                             }
                           }
                           acknowledgement->resolve();
                         } catch (const facebook::jsi::JSError &error) {
-                          if (!settled->exchange(true)) {
-                            auto value = std::make_shared<facebook::jsi::Value>(runtime, error.value());
-                            reject->call([value](
-                                             facebook::jsi::Runtime &runtime,
-                                             facebook::jsi::Function &rejectFunction) {
-                              rejectFunction.call(runtime, facebook::jsi::Value(runtime, *value));
-                            });
-                          }
                           acknowledgement->reject(error.what());
                         } catch (const std::exception &error) {
                           acknowledgement->reject(error.what());
@@ -946,8 +967,14 @@ RCT_EXPORT_MODULE(Oliphaunt)
                     if (error != nil) {
                       const char *errorMessage = error.localizedDescription.UTF8String;
                       std::string message = errorMessage != nullptr ? errorMessage : "liboliphaunt stream failed";
-                      reject->call([message](facebook::jsi::Runtime &runtime, facebook::jsi::Function &rejectFunction) {
-                        rejectFunction.call(runtime, OliphauntCreateError(runtime, message));
+                      BOOL callbackAborted =
+                          [error.domain isEqualToString:OliphauntProtocolStreamCallbackAbortedErrorDomain];
+                      reject->call([message, callbackAborted](facebook::jsi::Runtime &runtime, facebook::jsi::Function &rejectFunction) {
+                        rejectFunction.call(
+                            runtime,
+                            callbackAborted
+                                ? OliphauntCreateProtocolCallbackAbortedError(runtime, message)
+                                : OliphauntCreateError(runtime, message));
                       });
                       return;
                     }
@@ -1124,6 +1151,50 @@ RCT_EXPORT_MODULE(Oliphaunt)
   runtime.global().setProperty(runtime, "__oliphauntReactNativeJsi", std::move(transport));
 }
 #endif
+
+- (void)closeIfGeneration:(double)generation
+{
+  NSNumber *key = OliphauntHandleKey(generation);
+  if (key == nil) {
+    return;
+  }
+  OliphauntAdapterDatabase *database = [self sessionForHandle:generation];
+  if (database == nil) {
+    return;
+  }
+  __block uint64_t claim = 0;
+  @synchronized (self) {
+    claim = _nativeDirectClaim;
+  }
+  if (claim == 0 || claim != key.unsignedLongLongValue) {
+    return;
+  }
+
+  OliphauntNativeDirectCleanupAdmission cleanupAdmission =
+      OliphauntBeginNativeDirectCleanup(claim, database, nullptr);
+  if (cleanupAdmission != OliphauntNativeDirectCleanupStarted) {
+    return;
+  }
+  @synchronized (self) {
+    if (_sessions[key] != database || _nativeDirectClaim != claim) {
+      OliphauntFinishNativeDirectCleanup(
+          claim,
+          database,
+          OliphauntNativeDirectOwnerError(
+              @"React Native nativeDirect generation changed before forgotten cleanup",
+              nil),
+          YES);
+      return;
+    }
+    [_sessions removeObjectForKey:key];
+    _nativeDirectClaim = 0;
+  }
+  [database closeWithCompletion:^(NSError *_Nullable error) {
+    // No JavaScript owner remains to retry a failed close. Retain the exact
+    // generation process-wide so the next open recovers it before admission.
+    OliphauntFinishNativeDirectCleanup(claim, database, error, YES);
+  }];
+}
 
 - (void)close:(double)handle
       resolve:(RCTPromiseResolveBlock)resolve

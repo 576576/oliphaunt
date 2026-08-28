@@ -4,16 +4,23 @@ import { test } from 'vitest';
 import {
   PostgresError,
   assertSuccessfulQueryResponse,
+  binary,
   extendedQuery,
-  parseQueryResponse,
+  parseDescribeResponse,
+  parseExecResponse,
+  parseQueryRawResponse,
+  parseSimpleQueryRawResponse,
+  postgresOids,
+  text,
   toUint8Array,
+  typedNull,
 } from '../query.js';
 
 test('extendedQuery serializes text, binary, and null parameters', () => {
   const bytes = extendedQuery('SELECT $1, $2, $3', [
-    'text',
-    null,
-    { format: 'binary', value: new Uint8Array([1, 2, 3]) },
+    text('text', postgresOids.text),
+    typedNull(postgresOids.text),
+    binary(new Uint8Array([1, 2, 3]), postgresOids.bytea),
   ]);
   const messages = splitFrontendMessages(bytes);
 
@@ -47,8 +54,8 @@ test('extendedQuery rejects invalid frontend inputs', () => {
   assert.deepEqual([...toUint8Array([4, 5, 6])], [4, 5, 6]);
 });
 
-test('parseQueryResponse validates result ordering and accessors', () => {
-  const result = parseQueryResponse(
+test('parseSimpleQueryRawResponse validates result ordering and accessors', () => {
+  const result = parseSimpleQueryRawResponse(
     Uint8Array.from([
       ...backend(0x53, [...cstring('server_version'), ...cstring('18.4')]),
       ...backend(0x54, rowDescription([{ name: 'value', format: 0 }])),
@@ -60,16 +67,15 @@ test('parseQueryResponse validates result ordering and accessors', () => {
 
   assert.equal(result.rowCount, 1);
   assert.equal(result.commandTag, 'SELECT 1');
-  assert.equal(result.fieldIndex('value'), 0);
   assert.equal(result.getText(0, 'value'), 'hello');
   assert.throws(() => result.getText(0, 'missing'), /no column/);
   assert.throws(() => result.getText(3, 'value'), /no row/);
   assert.throws(() => result.rows[0]!.text(99), /no column/);
 });
 
-test('parseQueryResponse surfaces PostgreSQL errors and malformed backend traffic', () => {
+test('parseSimpleQueryRawResponse surfaces PostgreSQL errors and malformed backend traffic', () => {
   const error = thrownBy(() =>
-    parseQueryResponse(
+    parseSimpleQueryRawResponse(
       Uint8Array.from([
         ...backend(0x45, [
           0x53,
@@ -86,37 +92,39 @@ test('parseQueryResponse surfaces PostgreSQL errors and malformed backend traffi
   assert.ok(error instanceof PostgresError);
   assert.equal(error.severity, 'ERROR');
   assert.equal(error.sqlstate, '42601');
-  assert.equal(error.postgresMessage, 'syntax error');
-  assert.match(error.message, /ERROR \[42601\]: syntax error/);
+  assert.equal(error.message, 'syntax error');
 
-  assert.throws(() => parseQueryResponse(Uint8Array.from([0x5a, 0, 0, 0, 3])), /length 3/);
+  assert.throws(() => parseSimpleQueryRawResponse(Uint8Array.from([0x5a, 0, 0, 0, 3])), /length 3/);
   assert.throws(
-    () => parseQueryResponse(Uint8Array.from([...backend(0x44, dataRow(['orphan']))])),
+    () => parseSimpleQueryRawResponse(Uint8Array.from([...backend(0x44, dataRow(['orphan']))])),
     /before RowDescription/,
   );
   assert.throws(
     () =>
-      parseQueryResponse(
+      parseSimpleQueryRawResponse(
         Uint8Array.from([
           ...backend(0x54, rowDescription([{ name: 'one', format: 0 }])),
           ...backend(0x54, rowDescription([{ name: 'two', format: 0 }])),
           ...backend(0x5a, [0x49]),
         ]),
       ),
-    /multiple result sets/,
+    /two RowDescriptions/,
   );
-  assert.throws(() => parseQueryResponse(Uint8Array.from([...backend(0x47, [])])), /COPY/);
-  assert.throws(() => parseQueryResponse(Uint8Array.from([...backend(0x99, [])])), /0x99/);
+  assert.throws(() => parseSimpleQueryRawResponse(Uint8Array.from([...backend(0x47, [])])), /COPY/);
+  assert.throws(() => parseSimpleQueryRawResponse(Uint8Array.from([...backend(0x99, [])])), /0x99/);
   assert.throws(
-    () => parseQueryResponse(Uint8Array.from([...backend(0x5a, [0x00])])),
+    () => parseSimpleQueryRawResponse(Uint8Array.from([...backend(0x5a, [0x00])])),
     /invalid transaction status/,
   );
   assert.throws(
-    () => parseQueryResponse(Uint8Array.from([...backend(0x5a, [0x49]), ...backend(0x49, [])])),
+    () =>
+      parseSimpleQueryRawResponse(
+        Uint8Array.from([...backend(0x5a, [0x49]), ...backend(0x49, [])]),
+      ),
     /bytes after ReadyForQuery/,
   );
   assert.throws(
-    () => parseQueryResponse(Uint8Array.from([...backend(0x49, [])])),
+    () => parseSimpleQueryRawResponse(Uint8Array.from([...backend(0x49, [])])),
     /before ReadyForQuery/,
   );
 });
@@ -137,7 +145,7 @@ test('assertSuccessfulQueryResponse and row decoding reject invalid payloads', (
     PostgresError,
   );
 
-  const result = parseQueryResponse(
+  const result = parseSimpleQueryRawResponse(
     Uint8Array.from([
       ...backend(0x54, rowDescription([{ name: 'bad', format: 0 }])),
       ...backend(0x44, dataRow([new Uint8Array([0xff])])),
@@ -146,6 +154,71 @@ test('assertSuccessfulQueryResponse and row decoding reject invalid payloads', (
     ]),
   );
   assert.throws(() => result.getText(0, 'bad'), /not valid UTF-8/);
+});
+
+test('rejects incomplete and out-of-order structured completions', () => {
+  assert.throws(
+    () => parseSimpleQueryRawResponse(Uint8Array.from(backend(0x5a, [0x49]))),
+    /omitted CommandComplete or EmptyQueryResponse/,
+  );
+  assert.throws(
+    () =>
+      parseSimpleQueryRawResponse(
+        Uint8Array.from([
+          ...backend(0x43, cstring('SELECT 1')),
+          ...backend(0x44, dataRow(['late'])),
+          ...backend(0x5a, [0x49]),
+        ]),
+      ),
+    /DataRow arrived after statement completion/,
+  );
+  assert.throws(
+    () =>
+      parseDescribeResponse(
+        Uint8Array.from([...backend(0x74, i16(0)), ...backend(0x6e, []), ...backend(0x5a, [0x49])]),
+      ),
+    /before ParseComplete|omitted ParseComplete/,
+  );
+  assert.equal(
+    parseExecResponse(
+      Uint8Array.from([
+        ...backend(0x43, cstring('UPDATE 1')),
+        ...backend(0x49, []),
+        ...backend(0x43, cstring('DELETE 2')),
+        ...backend(0x5a, [0x49]),
+      ]),
+    ).statements.length,
+    2,
+  );
+  for (const completion of [backend(0x43, cstring('UPDATE 1')), backend(0x49, [])]) {
+    assert.throws(
+      () => parseQueryRawResponse(Uint8Array.from([...completion, ...backend(0x5a, [0x49])])),
+      /before the extended-query result description/,
+    );
+  }
+  assert.throws(
+    () =>
+      parseQueryRawResponse(
+        Uint8Array.from([
+          ...backend(0x32, []),
+          ...backend(0x6e, []),
+          ...backend(0x43, cstring('UPDATE 1')),
+          ...backend(0x5a, [0x49]),
+        ]),
+      ),
+    /BindComplete arrived before ParseComplete/,
+  );
+  assert.throws(
+    () =>
+      parseExecResponse(
+        Uint8Array.from([
+          ...backend(0x31, []),
+          ...backend(0x43, cstring('UPDATE 1')),
+          ...backend(0x5a, [0x49]),
+        ]),
+      ),
+    /simple-query response contained ParseComplete/,
+  );
 });
 
 type FrontendMessage = {

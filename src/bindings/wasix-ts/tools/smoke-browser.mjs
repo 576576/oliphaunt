@@ -249,7 +249,7 @@ try {
         }
         const summary = summarizeBrowserResult(planSource, result);
         const report = {
-          schema: 'oliphaunt-wasix-browser-benchmark-report-v1',
+          schema: 'oliphaunt-wasix-browser-benchmark-report-v2',
           createdAt: new Date().toISOString(),
           plan: browserPlanSummary(planSource),
           provenance: {
@@ -263,8 +263,8 @@ try {
           summary,
         };
         await writeBenchmarkReport(benchmarkOutput, report);
-        const direct = summary.topologies.direct;
-        const worker = summary.topologies.worker;
+        const direct = summary.comparisons.direct;
+        const worker = summary.comparisons.worker;
         console.log(
           `wasix-ts browser benchmark: ${summary.passed ? 'PASS' : 'FAIL'} ` +
             `direct=${direct.geomeanRatio.toFixed(4)} worker=${worker.geomeanRatio.toFixed(4)} ` +
@@ -316,6 +316,7 @@ async function stagePackedBrowserConsumer(scratch) {
     ['examples/browser-wasix/index.html', 'index.html'],
     ['examples/browser-wasix/package-smoke.ts', 'main.ts'],
     ['examples/browser-wasix/direct-pg-dump-smoke.ts', 'direct-pg-dump-smoke.ts'],
+    ['examples/browser-wasix/structured-api-smoke.ts', 'structured-api-smoke.ts'],
     ['src/shared/fixtures/postgres/logical-tools.json', 'logical-tools.json'],
     ['src/shared/fixtures/postgres/logical-tools-seed.sql', 'logical-tools-seed.sql'],
     ['src/shared/fixtures/postgres/logical-tools-verify.sql', 'logical-tools-verify.sql'],

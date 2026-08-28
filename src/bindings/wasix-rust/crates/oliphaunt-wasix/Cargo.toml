@@ -3,7 +3,7 @@ name = "oliphaunt-wasix"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.93"
-description = "Embedded Postgres for Rust tests and local apps. No Docker, works with SQLx and any Postgres client."
+description = "Embedded PostgreSQL 18 for Rust with synchronous and asynchronous APIs."
 readme = "README.md"
 repository = "https://github.com/f0rr0/oliphaunt"
 homepage = "https://oliphaunt.dev"
@@ -37,7 +37,11 @@ extension-citext = ["extensions", "liboliphaunt-wasix-portable/extension-citext"
 extension-cube = ["extensions", "liboliphaunt-wasix-portable/extension-cube"]
 extension-dict-int = ["extensions", "liboliphaunt-wasix-portable/extension-dict-int"]
 extension-dict-xsyn = ["extensions", "liboliphaunt-wasix-portable/extension-dict-xsyn"]
-extension-earthdistance = ["extensions", "liboliphaunt-wasix-portable/extension-earthdistance"]
+extension-earthdistance = [
+  "extensions",
+  "extension-cube",
+  "liboliphaunt-wasix-portable/extension-earthdistance",
+]
 extension-file-fdw = ["extensions", "liboliphaunt-wasix-portable/extension-file-fdw"]
 extension-fuzzystrmatch = ["extensions", "liboliphaunt-wasix-portable/extension-fuzzystrmatch"]
 extension-hstore = ["extensions", "liboliphaunt-wasix-portable/extension-hstore"]
@@ -100,7 +104,7 @@ filetime = "0.2"
 liboliphaunt-wasix-portable = { version = "=0.1.1", path = "../../../../runtimes/liboliphaunt/wasix/crates/assets" }
 oliphaunt-wasix-tools = { version = "=0.1.1", path = "../../../../runtimes/liboliphaunt/wasix/crates/tools", optional = true }
 oliphaunt-icu = { version = "=0.1.1", path = "../../../../runtimes/liboliphaunt/icu", optional = true }
-tokio = { version = "1", features = ["io-util", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync"] }
 wasmer = { version = "=7.2.1", default-features = false, features = [
   "sys",
   "headless",
