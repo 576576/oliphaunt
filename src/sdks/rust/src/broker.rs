@@ -766,6 +766,13 @@ fn spawn_broker(
     if let BootstrapStrategy::InitdbToolingOnly { initdb } = &config.storage.bootstrap {
         command.env("OLIPHAUNT_INITDB", initdb);
     }
+    // Suwayomi patch: hide the broker console window when the parent is a GUI
+    // process without a console (see CREATE_NO_WINDOW note in server.rs).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     command.spawn().map_err(|err| {
         Error::Engine(format!(
             "spawn native broker {}: {err}",

@@ -414,6 +414,14 @@ fn start_postgres(
         )?)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // Suwayomi patch: the parent (tray/server) is a GUI process without a
+    // console, so a console child (postgres.exe) would be assigned a brand-new
+    // console window. CREATE_NO_WINDOW (0x08000000) hides it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     command
         .spawn()
         .map_err(|err| Error::Engine(format!("start native server postgres: {err}")))
