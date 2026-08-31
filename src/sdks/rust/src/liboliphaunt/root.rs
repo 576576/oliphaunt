@@ -265,6 +265,13 @@ fn stable_root_lock_path(key: &Path) -> Result<PathBuf> {
 }
 
 fn stable_root_lock_dir(key: &Path) -> Option<PathBuf> {
+    // Suwayomi patch: prefer the data directory itself when it already exists
+    // (the server pre-creates pglite-data), so the root lock file
+    // `.oliphaunt-root-<hash>.lock` lives inside pglite-data instead of the
+    // release root. Falls back to the first existing ancestor otherwise.
+    if key.is_dir() {
+        return Some(key.to_path_buf());
+    }
     let mut cursor = key.parent()?;
     loop {
         if cursor.is_dir() {
