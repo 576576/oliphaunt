@@ -290,6 +290,14 @@ impl NativeServerSession {
         if pg_ctl.is_file() {
             let mut command = Command::new(&pg_ctl);
             configure_native_tool_env(&mut command, &self.root.runtime_dir);
+            // Suwayomi patch: same as the postgres spawn below — the parent is
+            // a GUI process without a console, so pg_ctl.exe would flash a
+            // console window during shutdown. CREATE_NO_WINDOW hides it.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
             let status = command
                 .arg("-D")
                 .arg(&self.root.pgdata)
