@@ -41,6 +41,14 @@ pub(super) fn install_cached_runtime(
         install_required_runtime_tool(tools_dir, runtime_dir, tool, "native tools")?;
     }
 
+    // Windows: the PostgreSQL binaries copied above (postgres.exe etc.) link
+    // against sibling DLLs in the source bin/ (libpq.dll, libiconv-2.dll,
+    // ...). install_required_runtime_tool only copies the executables, so a
+    // freshly materialized cache bin lacks them and the first initdb/startup
+    // fails with STATUS_DLL_NOT_FOUND (0xc0000135). Copy every bin/*.dll so
+    // the first open succeeds instead of erroring once and being retried.
+    install_runtime_bin_dlls(install_dir, runtime_dir)?;
+
     install_native_share_tree(
         install_dir,
         extension_artifact_dirs,
@@ -55,6 +63,36 @@ pub(super) fn install_cached_runtime(
         runtime_dir,
         extensions,
     )
+}
+
+/// Copy `bin/*.dll` from the native install into the materialized runtime
+/// cache `bin/`. Missing source dir is not an error (Unix builds have no
+/// sibling DLLs to copy).
+fn install_runtime_bin_dlls(install_dir: &Path, runtime_dir: &Path) -> Result<()> {
+    let source_bin = install_dir.join("bin");
+    if !source_bin.is_dir() {
+        return Ok(());
+    }
+    let target_bin = runtime_dir.join("bin");
+    fs::create_dir_all(&target_bin).map_err(|err| {
+        Error::Engine(format!(
+            "create native runtime bin dir {}: {err}",
+            target_bin.display()
+        ))
+    })?;
+    for entry in fs::read_dir(&source_bin).map_err(|err| {
+        Error::Engine(format!("read native runtime bin dir {}: {err}", source_bin.display()))
+    })? {
+        let entry = entry.map_err(|err| Error::Engine(format!("read native runtime bin entry: {err}")))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+            let file_name = path.file_name().ok_or_else(|| {
+                Error::Engine("native runtime bin entry has no file name".to_owned())
+            })?;
+            copy_file_preserving_permissions(&path, &target_bin.join(file_name))?;
+        }
+    }
+    Ok(())
 }
 
 fn install_required_runtime_tool(
